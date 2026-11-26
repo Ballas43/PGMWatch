@@ -9,7 +9,7 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "@companion-module/base": "^1.11.0",
+    "@companion-module/base": "~1.11.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {
