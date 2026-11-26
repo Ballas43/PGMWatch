@@ -316,6 +316,10 @@ impl MseChannelHub {
                 let _ = c.kill();
                 let _ = c.wait();
             }
+            if let Ok(mut state) = self.buffer_state.lock() {
+                state.init = None;
+                state.current_gop.clear();
+            }
             self.init_notify.notify_waiters();
         }
     }
@@ -329,6 +333,11 @@ impl MseChannelHub {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
         loop {
+            // Register waiter before checking init/closed to prevent lost-wakeup races on notify_waiters().
+            let notified = self.init_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             if let Ok(state) = self.buffer_state.lock()
                 && let Some((ref init_segment, ref codec)) = state.init
             {
@@ -349,7 +358,7 @@ impl MseChannelHub {
             if now >= deadline {
                 anyhow::bail!("Timed out waiting for fMP4 init segment");
             }
-            let _ = tokio::time::timeout(deadline - now, self.init_notify.notified()).await;
+            let _ = tokio::time::timeout(deadline - now, notified).await;
         }
     }
 }

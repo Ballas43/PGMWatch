@@ -2,19 +2,33 @@ function pad2(n: number): string {
   return String(n).padStart(2, "0");
 }
 
+let cachedShortTzFormatter: Intl.DateTimeFormat | null | undefined;
+
+function getShortTzFormatter(): Intl.DateTimeFormat | null {
+  if (cachedShortTzFormatter !== undefined) return cachedShortTzFormatter;
+  try {
+    cachedShortTzFormatter = new Intl.DateTimeFormat(undefined, {
+      timeZoneName: "short",
+    });
+  } catch {
+    cachedShortTzFormatter = null;
+  }
+  return cachedShortTzFormatter;
+}
+
 /**
  * Returns the browser's short timezone abbreviation (e.g., "PST", "WIB", "GMT+8"),
  * falling back to "Local" if unavailable.
  */
 export function getShortTimeZoneName(date: Date = new Date()): string {
-  try {
-    const parts = new Intl.DateTimeFormat(undefined, {
-      timeZoneName: "short",
-    }).formatToParts(date);
-    const tzPart = parts.find((p) => p.type === "timeZoneName")?.value?.trim();
-    if (tzPart) return tzPart;
-  } catch {
-    // Ignore Intl fallback errors on restricted runtimes
+  const fmt = getShortTzFormatter();
+  if (fmt) {
+    try {
+      const tzPart = fmt.formatToParts(date).find((p) => p.type === "timeZoneName")?.value?.trim();
+      if (tzPart) return tzPart;
+    } catch {
+      // Ignore Intl fallback errors on restricted runtimes
+    }
   }
   return "Local";
 }

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   attachStereoRmsTap,
+  getSharedAudioContext,
   StereoMeterSample,
   StereoRmsTap,
   unlockSharedAudioContext,
@@ -117,7 +118,11 @@ export function usePflAudio() {
         if (tap && ctx && ctx.state === "running" && activeSourcesRef.current.size > 0) {
           setPflMeter(tap.readDb());
         } else if (ctx && ctx.state === "running" && allowedChannelRef.current === allowedChannel) {
-          setPflMeter({ leftDb: -100, rightDb: -100 });
+          setPflMeter((prev) =>
+            prev && prev.leftDb === -100 && prev.rightDb === -100
+              ? prev
+              : { leftDb: -100, rightDb: -100 }
+          );
         }
       }
       rafId = window.requestAnimationFrame(tick);
@@ -141,8 +146,13 @@ export function usePflAudio() {
     (channelId: string, sampleRate: number, channels: number, pcmB64: string) => {
       // Strictly ignore packets if PFL is muted, off, or belonging to another channel
       if (mutedRef.current || allowedChannelRef.current !== channelId) return;
-      const ctx = ctxRef.current;
-      if (!ctx) return;
+      let ctx = ctxRef.current;
+      if (!ctx) {
+        ctx = getSharedAudioContext();
+        if (!ctx) return;
+        ctxRef.current = ctx;
+        nextTimeRef.current = ctx.currentTime;
+      }
       if (ctx.state === "suspended") {
         void ctx.resume();
         return;

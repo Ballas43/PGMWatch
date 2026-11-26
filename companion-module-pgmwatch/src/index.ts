@@ -61,12 +61,24 @@ function tallyRgbForState(state: string): [number, number, number] {
 }
 
 function normalizeHost(raw: string | undefined): string {
-  const cleaned = (raw ?? "127.0.0.1")
-    .trim()
+  const trimmed = (raw ?? "127.0.0.1").trim();
+  if (!trimmed) return "127.0.0.1";
+  try {
+    const parsed = new URL(trimmed.includes("://") ? trimmed : `http://${trimmed}`);
+    if (parsed.hostname) return parsed.hostname;
+  } catch {
+    // Fall back to basic sanitization if URL parsing fails
+  }
+  const cleaned = trimmed
     .replace(/^wss?:\/\//i, "")
     .replace(/^https?:\/\//i, "")
-    .replace(/\/+$/, "");
+    .replace(/\/.*$/, "")
+    .replace(/:\d+$/, "");
   return cleaned || "127.0.0.1";
+}
+
+function fmtDb(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value) ? value.toFixed(1) : "--.-";
 }
 
 function dbfsToPct(dbfs: number): number {
@@ -146,7 +158,15 @@ class PgmWatchCompanion extends InstanceBase<Config> {
     const port = Number(this.config.port) || 8787;
     const url = `ws://${host}:${port}/ws`;
     this.updateStatus(InstanceStatus.Connecting);
-    const ws = new WebSocket(url);
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(url);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log("error", `Invalid PGMWatch WebSocket URL (${url}): ${msg}`);
+      this.updateStatus(InstanceStatus.BadConfig, `Invalid host/port: ${msg}`);
+      return;
+    }
     this.ws = ws;
 
     ws.on("open", () => {
@@ -191,33 +211,39 @@ class PgmWatchCompanion extends InstanceBase<Config> {
 
   private flushMeterUpdates(): void {
     this.lastMeterCheckAt = Date.now();
-    if (this.snapshot && this.pendingMeterChannels.size > 0) {
-      const updates: Record<string, string | number> = {};
-      for (const cid of this.pendingMeterChannels) {
-        const ch = this.snapshot.channels.find((c) => c.config.id === cid);
-        if (!ch) continue;
-        Object.assign(updates, this.buildChannelAudioVars(ch));
+    try {
+      if (this.snapshot && this.pendingMeterChannels.size > 0) {
+        const updates: Record<string, string | number> = {};
+        for (const cid of this.pendingMeterChannels) {
+          const ch = this.snapshot.channels.find((c) => c.config.id === cid);
+          if (!ch || !ch.audio) continue;
+          Object.assign(updates, this.buildChannelAudioVars(ch));
+        }
+        this.pendingMeterChannels.clear();
+        if (Object.keys(updates).length > 0) {
+          this.setVariableValues(updates);
+        }
       }
-      this.pendingMeterChannels.clear();
-      if (Object.keys(updates).length > 0) {
-        this.setVariableValues(updates);
+      if (this.subscribedPngFeedbacks.size > 0) {
+        this.checkFeedbacks("channel_vu_png");
       }
-    }
-    if (this.subscribedPngFeedbacks.size > 0) {
-      this.checkFeedbacks("channel_vu_png");
+    } catch (err) {
+      this.log("warn", `Failed updating PGMWatch meter variables: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
   private buildChannelAudioVars(ch: SnapshotChannel): Record<string, string | number> {
     const cid = ch.config.id;
-    const avgLufs = ch.audio.integrated_lufs ?? ch.audio.short_term_lufs;
+    const avgLufs = ch.audio?.integrated_lufs ?? ch.audio?.short_term_lufs;
+    const leftDb = ch.audio?.left_rms_dbfs;
+    const rightDb = ch.audio?.right_rms_dbfs;
     return {
-      [`ch_${cid}_lufs`]: avgLufs.toFixed(1),
-      [`ch_${cid}_left_db`]: ch.audio.left_rms_dbfs.toFixed(1),
-      [`ch_${cid}_right_db`]: ch.audio.right_rms_dbfs.toFixed(1),
-      [`ch_${cid}_left_pct`]: dbfsToPct(ch.audio.left_rms_dbfs),
-      [`ch_${cid}_right_pct`]: dbfsToPct(ch.audio.right_rms_dbfs),
-      [`ch_${cid}_vu_bar`]: formatVuTextBar(ch.audio.left_rms_dbfs, ch.audio.right_rms_dbfs),
+      [`ch_${cid}_lufs`]: fmtDb(avgLufs),
+      [`ch_${cid}_left_db`]: fmtDb(leftDb),
+      [`ch_${cid}_right_db`]: fmtDb(rightDb),
+      [`ch_${cid}_left_pct`]: dbfsToPct(leftDb),
+      [`ch_${cid}_right_pct`]: dbfsToPct(rightDb),
+      [`ch_${cid}_vu_bar`]: formatVuTextBar(leftDb, rightDb),
     };
   }
 
@@ -610,6 +636,7 @@ class PgmWatchCompanion extends InstanceBase<Config> {
 
   private rebuildPresets(): void {
     if (!this.snapshot) return;
+    const label = this.label || "PGMWatch";
     const presets: CompanionPresetDefinitions = {};
 
     for (const grp of this.snapshot.show.groups) {
@@ -619,7 +646,7 @@ class PgmWatchCompanion extends InstanceBase<Config> {
         category: "Overview — Language Groups",
         name: grp.name,
         style: {
-          text: `${grp.language_code}\n$(pgmwatch:group_${gid}_ccv)`,
+          text: `${grp.language_code}\n$(${label}:group_${gid}_ccv)`,
           size: "14",
           color: combineRgb(237, 237, 237),
           bgcolor: combineRgb(25, 25, 27),
@@ -696,7 +723,7 @@ class PgmWatchCompanion extends InstanceBase<Config> {
       category: "Overview — Controls",
       name: "End Active Segment",
       style: {
-        text: "END\n$(pgmwatch:active_match)",
+        text: `END\n$(${label}:active_match)`,
         size: "14",
         color: combineRgb(237, 237, 237),
         bgcolor: combineRgb(35, 35, 37),
@@ -712,7 +739,7 @@ class PgmWatchCompanion extends InstanceBase<Config> {
         category: `Group Detail — ${ch.config.group_id}`,
         name: `${ch.config.name} VU/Listen (Text)`,
         style: {
-          text: `${ch.config.name}\n$(pgmwatch:ch_${cid}_vu_bar)\n$(pgmwatch:ch_${cid}_lufs) LUFS`,
+          text: `${ch.config.name}\n$(${label}:ch_${cid}_vu_bar)\n$(${label}:ch_${cid}_lufs) LUFS`,
           size: "7",
           color: combineRgb(237, 237, 237),
           bgcolor: combineRgb(20, 20, 21),
@@ -733,7 +760,7 @@ class PgmWatchCompanion extends InstanceBase<Config> {
         category: `Group Detail — ${ch.config.group_id}`,
         name: `${ch.config.name} VU/Listen (Image)`,
         style: {
-          text: `${ch.config.name}\n$(pgmwatch:ch_${cid}_lufs) LUFS`,
+          text: `${ch.config.name}\n$(${label}:ch_${cid}_lufs) LUFS`,
           size: "7",
           color: combineRgb(237, 237, 237),
           bgcolor: combineRgb(20, 20, 21),

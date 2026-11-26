@@ -72,18 +72,18 @@ export function CcvTimelineChart({
   const showCombined = mode === "combined" || mode === "streams_total";
   const showStreams = mode === "streams" || mode === "streams_total";
 
-  const candidateVals: number[] = [100];
+  let maxVal = 100;
   for (const pt of timeline) {
-    if (showCombined) {
-      candidateVals.push(pt.combined_ccv);
+    if (showCombined && pt.combined_ccv > maxVal) {
+      maxVal = pt.combined_ccv;
     }
     if (showStreams) {
       for (const s of visibleSeries) {
-        candidateVals.push(pt.per_channel_ccv?.[s.id] ?? 0);
+        const v = pt.per_channel_ccv?.[s.id] ?? 0;
+        if (v > maxVal) maxVal = v;
       }
     }
   }
-  const maxVal = Math.max(...candidateVals);
   const yTicks = [0, 0.25, 0.5, 0.75, 1].map((t) => Math.round(maxVal * t));
 
   const xFor = (i: number) =>

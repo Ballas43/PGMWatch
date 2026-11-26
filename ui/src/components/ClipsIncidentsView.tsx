@@ -158,22 +158,29 @@ export function ClipsIncidentsView({ snapshot, onAck, onRefresh }: ClipsIncident
     }
   };
 
-  const handleDeleteSingleClip = async (filename: string) => {
-    const res = await fetch(`/api/clips/${encodeURIComponent(filename)}/delete`, {
-      method: "POST",
-    });
-    if (!res.ok) {
-      setActionError(`Failed to delete clip (HTTP ${res.status})`);
-      return;
+  const handleDeleteSingleClip = async (filename: string): Promise<boolean> => {
+    setActionError(null);
+    try {
+      const res = await fetch(`/api/clips/${encodeURIComponent(filename)}/delete`, {
+        method: "POST",
+      });
+      if (!res.ok) {
+        setActionError(`Failed to delete clip (HTTP ${res.status})`);
+        return false;
+      }
+      const data = (await res.json()) as {
+        freed_bytes?: number;
+        stats?: ClipStorageStats;
+      };
+      if (data.stats) setClipStats(data.stats);
+      else await loadClipStats();
+      showNotice(`Deleted ${filename} (${formatClipBytes(data.freed_bytes ?? 0)} freed)`);
+      onRefresh?.();
+      return true;
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Network error deleting clip");
+      return false;
     }
-    const data = (await res.json()) as {
-      freed_bytes?: number;
-      stats?: ClipStorageStats;
-    };
-    if (data.stats) setClipStats(data.stats);
-    else await loadClipStats();
-    showNotice(`Deleted ${filename} (${formatClipBytes(data.freed_bytes ?? 0)} freed)`);
-    onRefresh?.();
   };
 
   const storedFilesCount = clipStats?.clip_count ?? incidentClipCount;

@@ -739,7 +739,12 @@ pub(super) async fn get_channel_fmp4_stream(
             }
         }
     };
-    if !validate_stream_url(&media.stream_url) {
+    if !validate_stream_url(&media.stream_url)
+        || media
+            .audio_url
+            .as_deref()
+            .is_some_and(|u| !validate_stream_url(u))
+    {
         return (StatusCode::BAD_REQUEST, "Unsafe resolved media URL").into_response();
     }
     let sub = match st.mse_hubs.subscribe(&id, &media, Arc::clone(&st.job_guard)).await {

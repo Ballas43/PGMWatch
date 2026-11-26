@@ -77,15 +77,18 @@ function Copy-AppPayload([string]$TargetDir, [bool]$FastUpdate) {
     }
     $CompTarget = Join-Path $TargetDir "companion-module-pgmwatch"
     Copy-Item -Force (Join-Path $Root "companion-module-pgmwatch\package.json") $CompTarget
-    if (Test-Path (Join-Path $Root "companion-module-pgmwatch\dist")) {
-        Copy-Item -Recurse -Force (Join-Path $Root "companion-module-pgmwatch\dist") (Join-Path $CompTarget "dist")
-    }
-    if (Test-Path (Join-Path $Root "companion-module-pgmwatch\companion")) {
-        Copy-Item -Recurse -Force (Join-Path $Root "companion-module-pgmwatch\companion") (Join-Path $CompTarget "companion")
+    foreach ($subDir in @("dist", "companion")) {
+        $srcSub = Join-Path $Root "companion-module-pgmwatch\$subDir"
+        $dstSub = Join-Path $CompTarget $subDir
+        if (Test-Path $srcSub) {
+            if (Test-Path $dstSub) { Remove-Item -Recurse -Force $dstSub }
+            Copy-Item -Recurse -Force $srcSub $dstSub
+        }
     }
     # Bundle flat production node_modules (dereferenced from pnpm) so Companion Developer Modules work offline in the portable zip
     $CompNodeModules = Join-Path $CompTarget "node_modules"
-    if ((-not $FastUpdate) -or (-not (Test-Path (Join-Path $CompNodeModules "ws")))) {
+    if ((-not $FastUpdate) -or (-not (Test-Path (Join-Path $CompNodeModules "@companion-module\base\package.json")))) {
+        if (Test-Path $CompNodeModules) { Remove-Item -Recurse -Force $CompNodeModules }
         New-Item -ItemType Directory -Force -Path $CompNodeModules | Out-Null
         $SrcMods = Join-Path $Root "companion-module-pgmwatch\node_modules"
         $SrcHoisted = Join-Path $SrcMods ".pnpm\node_modules"

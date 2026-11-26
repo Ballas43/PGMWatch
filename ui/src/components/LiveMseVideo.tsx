@@ -274,17 +274,34 @@ export const LiveMseVideo = memo(function LiveMseVideo({
           }
           const firstStart = v.buffered.start(0);
           const lastIdx = v.buffered.length - 1;
-          const start = v.buffered.start(lastIdx);
-          const end = v.buffered.end(lastIdx);
+          const liveStart = v.buffered.start(lastIdx);
+          const liveEnd = v.buffered.end(lastIdx);
 
-          if (v.currentTime < start - 0.05) {
-            // Jump across any timeline gap directly into the active live buffered range.
-            v.currentTime = Math.max(start, end - 1.3);
+          // Find which buffered range currently contains currentTime (if any).
+          let containingIdx = -1;
+          for (let i = 0; i < v.buffered.length; i++) {
+            if (
+              v.currentTime >= v.buffered.start(i) - 0.05 &&
+              v.currentTime <= v.buffered.end(i) + 0.05
+            ) {
+              containingIdx = i;
+              break;
+            }
+          }
+
+          const stalledBeforeGap =
+            containingIdx >= 0 &&
+            containingIdx < lastIdx &&
+            v.currentTime >= v.buffered.end(containingIdx) - 0.15;
+
+          if (containingIdx === -1 || stalledBeforeGap) {
+            // Only jump when outside all buffered ranges or stalled at the end of an earlier range before a gap.
+            v.currentTime = Math.max(liveStart, liveEnd - Math.min(1.3, (liveEnd - liveStart) * 0.5));
             if (v.playbackRate !== 1.0) v.playbackRate = 1.0;
           } else {
-            const lag = end - v.currentTime;
+            const lag = liveEnd - v.currentTime;
             if (lag > 8.0) {
-              v.currentTime = Math.max(start, end - 1.5);
+              v.currentTime = Math.max(liveStart, liveEnd - 1.5);
               if (v.playbackRate !== 1.0) v.playbackRate = 1.0;
             } else if (lag > 4.0) {
               if (v.playbackRate !== 1.04) v.playbackRate = 1.04;
@@ -364,7 +381,10 @@ export const LiveMseVideo = memo(function LiveMseVideo({
             while (sb.updating) {
               await waitUpdateEnd(sb);
             }
-            if (unmounted || mediaSource.readyState !== "open") return;
+            if (unmounted) return;
+            if (mediaSource.readyState !== "open") {
+              throw new Error(`MediaSource transitioned to ${mediaSource.readyState}`);
+            }
             const copy = new Uint8Array(chunk.byteLength);
             copy.set(chunk);
             sb.appendBuffer(copy);

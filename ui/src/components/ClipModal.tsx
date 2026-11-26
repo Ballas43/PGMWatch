@@ -5,7 +5,7 @@ interface ClipModalProps {
   clipFilename: string | null;
   title: string;
   onClose: () => void;
-  onDeleteClip?: (filename: string) => Promise<void>;
+  onDeleteClip?: (filename: string) => Promise<boolean>;
 }
 
 export function ClipModal({ clipFilename, title, onClose, onDeleteClip }: ClipModalProps) {
@@ -34,8 +34,12 @@ export function ClipModal({ clipFilename, title, onClose, onDeleteClip }: ClipMo
     }
     setDeleting(true);
     try {
-      await onDeleteClip(clipFilename);
-      onClose();
+      const ok = await onDeleteClip(clipFilename);
+      if (ok) {
+        onClose();
+      } else {
+        setConfirmDelete(false);
+      }
     } finally {
       setDeleting(false);
     }
