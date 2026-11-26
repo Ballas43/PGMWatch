@@ -34,9 +34,9 @@ if (-not $SkipUi) {
 }
 
 # 4. Build Bitfocus Companion TypeScript module if dist is missing or full build
-if (-not $SkipUi -or -not (Test-Path (Join-Path $Root "companion-module\dist"))) {
-    Write-Host "`n=== Building Companion module (companion-module/) ==="
-    pnpm --dir companion-module build
+if (-not $SkipUi -or -not (Test-Path (Join-Path $Root "companion-module-pgmwatch\dist"))) {
+    Write-Host "`n=== Building Companion module (companion-module-pgmwatch/) ==="
+    pnpm --dir companion-module-pgmwatch build
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 

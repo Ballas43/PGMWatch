@@ -21,7 +21,7 @@ $ZipPath = Join-Path $Root "dist\PGMWatch-Portable.zip"
 
 function Copy-AppPayload([string]$TargetDir, [bool]$FastUpdate) {
     New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
-    foreach ($sub in @("bin", "sidecar-stats", "companion-module")) {
+    foreach ($sub in @("bin", "sidecar-stats", "companion-module-pgmwatch")) {
         New-Item -ItemType Directory -Force -Path (Join-Path $TargetDir $sub) | Out-Null
     }
 
@@ -75,18 +75,19 @@ function Copy-AppPayload([string]$TargetDir, [bool]$FastUpdate) {
     } else {
         Copy-Item -Recurse -Force (Join-Path $Root "sidecar-stats\*") (Join-Path $TargetDir "sidecar-stats")
     }
-    Copy-Item -Force (Join-Path $Root "companion-module\package.json") (Join-Path $TargetDir "companion-module")
-    if (Test-Path (Join-Path $Root "companion-module\dist")) {
-        Copy-Item -Recurse -Force (Join-Path $Root "companion-module\dist") (Join-Path $TargetDir "companion-module\dist")
+    $CompTarget = Join-Path $TargetDir "companion-module-pgmwatch"
+    Copy-Item -Force (Join-Path $Root "companion-module-pgmwatch\package.json") $CompTarget
+    if (Test-Path (Join-Path $Root "companion-module-pgmwatch\dist")) {
+        Copy-Item -Recurse -Force (Join-Path $Root "companion-module-pgmwatch\dist") (Join-Path $CompTarget "dist")
     }
-    if (Test-Path (Join-Path $Root "companion-module\companion")) {
-        Copy-Item -Recurse -Force (Join-Path $Root "companion-module\companion") (Join-Path $TargetDir "companion-module\companion")
+    if (Test-Path (Join-Path $Root "companion-module-pgmwatch\companion")) {
+        Copy-Item -Recurse -Force (Join-Path $Root "companion-module-pgmwatch\companion") (Join-Path $CompTarget "companion")
     }
     # Bundle flat production node_modules (dereferenced from pnpm) so Companion Developer Modules work offline in the portable zip
-    $CompNodeModules = Join-Path $TargetDir "companion-module\node_modules"
+    $CompNodeModules = Join-Path $CompTarget "node_modules"
     if ((-not $FastUpdate) -or (-not (Test-Path (Join-Path $CompNodeModules "ws")))) {
         New-Item -ItemType Directory -Force -Path $CompNodeModules | Out-Null
-        $SrcMods = Join-Path $Root "companion-module\node_modules"
+        $SrcMods = Join-Path $Root "companion-module-pgmwatch\node_modules"
         $SrcHoisted = Join-Path $SrcMods ".pnpm\node_modules"
         foreach ($dep in @("@companion-module", "ws")) {
             $depSrc = Join-Path $SrcMods $dep

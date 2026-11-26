@@ -27,5 +27,5 @@ Bundled Runtime Components (Windows Portable Distribution)
 
 5. Rust Crates & Frontend / Node Dependencies
    - Cargo workspace dependencies (Cargo.lock) and npm dependencies
-     (ui/pnpm-lock.yaml, companion-module/pnpm-lock.yaml, sidecar-stats/package-lock.json)
+     (ui/pnpm-lock.yaml, companion-module-pgmwatch/pnpm-lock.yaml, sidecar-stats/package-lock.json)
      are licensed under MIT, Apache-2.0, BSD, ISC, MPL-2.0, or OFL-1.1.

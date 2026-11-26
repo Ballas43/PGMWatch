@@ -5,8 +5,8 @@
 /ui/dist/
 /ui/node_modules/
 /sidecar-stats/node_modules/
-/companion-module/dist/
-/companion-module/node_modules/
+/companion-module-pgmwatch/dist/
+/companion-module-pgmwatch/node_modules/
 *.tsbuildinfo
 
 # Local downloaded toolchains & portable runtime binaries

@@ -5,7 +5,7 @@ Connects Bitfocus Companion to **PGMWatch** over its local WebSocket API (`ws://
 ## Setup
 
 1. Start `PGMWatch.exe`.
-2. In Bitfocus Companion, open **Settings -> Developer modules path** and point it to the parent folder containing `companion-module` (or copy the `companion-module` folder directly into your Companion Developer Modules folder).
+2. In Bitfocus Companion, open **Settings -> Developer modules path** and point it to the parent folder containing `companion-module-pgmwatch` (or copy the `companion-module-pgmwatch` folder directly into your Companion Developer Modules folder).
 3. Add a **PGMWatch** connection:
    - **PGMWatch Host**: `127.0.0.1` (or the LAN IP of the PGMWatch host PC if `[server] bind_host` allows LAN)
    - **Port**: `8787`
