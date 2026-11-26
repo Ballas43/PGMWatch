@@ -3,6 +3,7 @@ import {
   CompanionFeedbackDefinitions,
   CompanionPresetDefinitions,
   CompanionVariableDefinition,
+  DropdownChoice,
   InstanceBase,
   InstanceStatus,
   runEntrypoint,
@@ -59,10 +60,22 @@ function tallyRgbForState(state: string): [number, number, number] {
   }
 }
 
+function normalizeHost(raw: string | undefined): string {
+  const cleaned = (raw ?? "127.0.0.1")
+    .trim()
+    .replace(/^wss?:\/\//i, "")
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/+$/, "");
+  return cleaned || "127.0.0.1";
+}
+
 class PgmWatchCompanion extends InstanceBase<Config> {
   private ws: WebSocket | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private meterTimer: NodeJS.Timeout | null = null;
+  private lastMeterCheckAt = 0;
   private snapshot: SnapshotPayload | null = null;
+  private lastStructureKey = "";
   private config: Config = { host: "127.0.0.1", port: 8787 };
 
   async init(config: Config): Promise<void> {
@@ -74,13 +87,20 @@ class PgmWatchCompanion extends InstanceBase<Config> {
   }
 
   async destroy(): Promise<void> {
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.ws?.close();
+    this.clearTimers();
+    const oldWs = this.ws;
+    this.ws = null;
+    oldWs?.close();
   }
 
   async configUpdated(config: Config): Promise<void> {
     this.config = config;
-    this.ws?.close();
+    this.snapshot = null;
+    this.lastStructureKey = "";
+    this.clearTimers();
+    const oldWs = this.ws;
+    this.ws = null;
+    oldWs?.close();
     this.connectWs();
   }
 
@@ -91,36 +111,80 @@ class PgmWatchCompanion extends InstanceBase<Config> {
     ];
   }
 
+  private clearTimers(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.meterTimer) {
+      clearTimeout(this.meterTimer);
+      this.meterTimer = null;
+    }
+  }
+
   private connectWs(): void {
-    const url = `ws://${this.config.host || "127.0.0.1"}:${this.config.port || 8787}/ws`;
+    this.clearTimers();
+    const host = normalizeHost(this.config.host);
+    const port = Number(this.config.port) || 8787;
+    const url = `ws://${host}:${port}/ws`;
     this.updateStatus(InstanceStatus.Connecting);
     const ws = new WebSocket(url);
     this.ws = ws;
 
     ws.on("open", () => {
+      if (this.ws !== ws) return;
       this.updateStatus(InstanceStatus.Ok);
       ws.send(JSON.stringify({ cmd: "request_snapshot" }));
     });
 
     ws.on("message", (raw) => {
+      if (this.ws !== ws) return;
       try {
         const msg = JSON.parse(raw.toString());
         if (msg.event === "snapshot" && msg.snapshot) {
           this.snapshot = msg.snapshot;
-          this.updateVariablesAndPresets();
-          this.checkFeedbacks("channel_tally", "channel_vu_png", "group_rollup");
+          this.syncStateFromSnapshot();
+        } else if (msg.event === "meter" && msg.channel_id && msg.audio && this.snapshot) {
+          const ch = this.snapshot.channels.find((c) => c.config.id === msg.channel_id);
+          if (ch) {
+            ch.audio = msg.audio;
+            this.scheduleMeterFeedback();
+          }
         }
-      } catch {}
+      } catch {
+        // Ignore malformed payloads
+      }
     });
 
     ws.on("close", () => {
+      if (this.ws !== ws) return;
+      this.ws = null;
       this.updateStatus(InstanceStatus.Disconnected);
       this.reconnectTimer = setTimeout(() => this.connectWs(), 3000);
     });
 
-    ws.on("error", () => {
-      this.updateStatus(InstanceStatus.ConnectionFailure);
+    ws.on("error", (err) => {
+      if (this.ws !== ws) return;
+      this.log("warn", `PGMWatch WebSocket error: ${err.message}`);
+      this.updateStatus(InstanceStatus.ConnectionFailure, err.message);
     });
+  }
+
+  private scheduleMeterFeedback(): void {
+    const now = Date.now();
+    const elapsed = now - this.lastMeterCheckAt;
+    if (elapsed >= 90) {
+      this.lastMeterCheckAt = now;
+      this.checkFeedbacks("channel_vu_png");
+      return;
+    }
+    if (!this.meterTimer) {
+      this.meterTimer = setTimeout(() => {
+        this.meterTimer = null;
+        this.lastMeterCheckAt = Date.now();
+        this.checkFeedbacks("channel_vu_png");
+      }, 90 - elapsed);
+    }
   }
 
   private sendCmd(payload: Record<string, unknown>): void {
@@ -129,56 +193,173 @@ class PgmWatchCompanion extends InstanceBase<Config> {
     }
   }
 
+  private getChannelChoices(): DropdownChoice[] {
+    const channels = this.snapshot?.channels ?? [];
+    if (channels.length === 0) {
+      return [{ id: "", label: "(Connect to PGMWatch to load channels)" }];
+    }
+    return channels.map((c) => ({
+      id: c.config.id,
+      label: `${c.config.name} (${c.config.group_id})`,
+    }));
+  }
+
+  private getGroupChoices(includeGlobal: boolean): DropdownChoice[] {
+    const groups = this.snapshot?.show.groups ?? [];
+    const items: DropdownChoice[] = includeGlobal
+      ? [{ id: "", label: "Global (All Groups)" }]
+      : [];
+    for (const g of groups) {
+      items.push({ id: g.id, label: `${g.language_code} — ${g.name}` });
+    }
+    if (items.length === 0) {
+      items.push({ id: "", label: "(Connect to PGMWatch to load groups)" });
+    }
+    return items;
+  }
+
   private initActions(): void {
+    const chChoices = this.getChannelChoices();
+    const defaultCh = chChoices[0]?.id ?? "";
+    const grpWithGlobal = this.getGroupChoices(true);
+    const channelOrAllChoices: DropdownChoice[] = [
+      { id: "", label: "All Channels" },
+      ...(this.snapshot?.channels ?? []).map((c) => ({
+        id: c.config.id,
+        label: `${c.config.name} (${c.config.group_id})`,
+      })),
+    ];
+
     const actions: CompanionActionDefinitions = {
       ack_channel: {
         name: "Acknowledge Channel Fault",
-        options: [{ type: "textinput", id: "channel_id", label: "Channel ID", default: "" }],
-        callback: (ev) => this.sendCmd({ cmd: "ack", channel_id: ev.options.channel_id }),
+        options: [
+          {
+            type: "dropdown",
+            id: "channel_id",
+            label: "Channel",
+            choices: chChoices,
+            default: defaultCh,
+            allowCustom: true,
+          },
+        ],
+        callback: (ev) => {
+          const cid = String(ev.options.channel_id ?? "").trim();
+          if (cid) this.sendCmd({ cmd: "ack", channel_id: cid });
+        },
       },
       force_clip: {
         name: "Force 5s Evidence Clip",
-        options: [{ type: "textinput", id: "channel_id", label: "Channel ID", default: "" }],
-        callback: (ev) => this.sendCmd({ cmd: "force_clip", channel_id: ev.options.channel_id }),
+        options: [
+          {
+            type: "dropdown",
+            id: "channel_id",
+            label: "Channel",
+            choices: chChoices,
+            default: defaultCh,
+            allowCustom: true,
+          },
+        ],
+        callback: (ev) => {
+          const cid = String(ev.options.channel_id ?? "").trim();
+          if (cid) this.sendCmd({ cmd: "force_clip", channel_id: cid });
+        },
       },
       toggle_pfl: {
-        name: "Toggle PFL Audio Listen",
-        options: [{ type: "textinput", id: "channel_id", label: "Channel ID", default: "" }],
-        callback: (ev) => this.sendCmd({ cmd: "toggle_pfl", channel_id: ev.options.channel_id }),
+        name: "Toggle Listen (PFL Audio)",
+        options: [
+          {
+            type: "dropdown",
+            id: "channel_id",
+            label: "Channel",
+            choices: chChoices,
+            default: defaultCh,
+            allowCustom: true,
+          },
+        ],
+        callback: (ev) => {
+          const cid = String(ev.options.channel_id ?? "").trim();
+          if (cid) this.sendCmd({ cmd: "toggle_pfl", channel_id: cid });
+        },
       },
       toggle_intermission: {
-        name: "Toggle Intermission Mode",
+        name: "Hold Mode (Global or Group)",
         options: [
-          { type: "textinput", id: "group_id", label: "Group ID (blank = Global)", default: "" },
-          { type: "checkbox", id: "active", label: "Active", default: true },
+          {
+            type: "dropdown",
+            id: "group_id",
+            label: "Scope",
+            choices: grpWithGlobal,
+            default: "",
+            allowCustom: true,
+          },
+          {
+            type: "dropdown",
+            id: "mode",
+            label: "Action",
+            choices: [
+              { id: "toggle", label: "Toggle" },
+              { id: "on", label: "Enable Hold" },
+              { id: "off", label: "Resume (End Hold)" },
+            ],
+            default: "toggle",
+          },
         ],
-        callback: (ev) =>
+        callback: (ev) => {
+          const gid = String(ev.options.group_id ?? "").trim();
+          const mode = ev.options.mode ? String(ev.options.mode) : undefined;
+          let nextActive: boolean;
+          if (mode === "on") {
+            nextActive = true;
+          } else if (mode === "off") {
+            nextActive = false;
+          } else if (mode === "toggle") {
+            if (gid) {
+              const grp = this.snapshot?.show.groups.find((g) => g.id === gid);
+              nextActive = !(grp?.intermission_active ?? false);
+            } else {
+              nextActive = !(this.snapshot?.global_intermission ?? false);
+            }
+          } else {
+            nextActive = Boolean(ev.options.active ?? true);
+          }
           this.sendCmd({
             cmd: "set_intermission",
-            group_id: ev.options.group_id ? String(ev.options.group_id) : null,
-            active: Boolean(ev.options.active),
-          }),
+            group_id: gid ? gid : null,
+            active: nextActive,
+          });
+        },
       },
       start_match: {
-        name: "Start Match Marker",
-        options: [{ type: "textinput", id: "label", label: "Match Label", default: "Match 1" }],
-        callback: (ev) => this.sendCmd({ cmd: "start_match", label: String(ev.options.label || "Match") }),
+        name: "Start Segment Marker",
+        options: [{ type: "textinput", id: "label", label: "Segment Label", default: "Segment 1" }],
+        callback: (ev) =>
+          this.sendCmd({ cmd: "start_match", label: String(ev.options.label || "Segment") }),
       },
       end_match: {
-        name: "End Active Match Marker",
+        name: "End Active Segment Marker",
         options: [],
         callback: () => this.sendCmd({ cmd: "end_match" }),
       },
       reset_lufs: {
-        name: "Reset Channel Avg LUFS",
-        options: [{ type: "textinput", id: "channel_id", label: "Channel ID (blank = all)", default: "" }],
+        name: "Reset Channel Avg Loudness (LUFS)",
+        options: [
+          {
+            type: "dropdown",
+            id: "channel_id",
+            label: "Channel",
+            choices: channelOrAllChoices,
+            default: "",
+            allowCustom: true,
+          },
+        ],
         callback: (ev) => {
           const cid = String(ev.options.channel_id ?? "").trim();
           this.sendCmd({ cmd: "reset_lufs", channel_id: cid ? cid : null });
         },
       },
       reset_all_lufs: {
-        name: "Reset All Avg LUFS",
+        name: "Reset All Avg Loudness (LUFS)",
         options: [],
         callback: () => this.sendCmd({ cmd: "reset_lufs", channel_id: null }),
       },
@@ -187,11 +368,25 @@ class PgmWatchCompanion extends InstanceBase<Config> {
   }
 
   private initFeedbacks(): void {
+    const chChoices = this.getChannelChoices();
+    const defaultCh = chChoices[0]?.id ?? "";
+    const grpChoices = this.getGroupChoices(false);
+    const defaultGrp = grpChoices[0]?.id ?? "";
+
     const feedbacks: CompanionFeedbackDefinitions = {
       channel_tally: {
         type: "advanced",
         name: "Channel Tally Color",
-        options: [{ type: "textinput", id: "channel_id", label: "Channel ID", default: "" }],
+        options: [
+          {
+            type: "dropdown",
+            id: "channel_id",
+            label: "Channel",
+            choices: chChoices,
+            default: defaultCh,
+            allowCustom: true,
+          },
+        ],
         callback: (fb) => {
           const ch = this.snapshot?.channels.find((c) => c.config.id === fb.options.channel_id);
           const [r, g, b] = tallyRgbForState(ch?.alert_state || "OFFLINE");
@@ -201,7 +396,16 @@ class PgmWatchCompanion extends InstanceBase<Config> {
       channel_vu_png: {
         type: "advanced",
         name: "Channel Live Stereo VU png64",
-        options: [{ type: "textinput", id: "channel_id", label: "Channel ID", default: "" }],
+        options: [
+          {
+            type: "dropdown",
+            id: "channel_id",
+            label: "Channel",
+            choices: chChoices,
+            default: defaultCh,
+            allowCustom: true,
+          },
+        ],
         callback: (fb) => {
           const ch = this.snapshot?.channels.find((c) => c.config.id === fb.options.channel_id);
           if (!ch) return {};
@@ -216,8 +420,21 @@ class PgmWatchCompanion extends InstanceBase<Config> {
       group_rollup: {
         type: "advanced",
         name: "Language Group Roll-Up Tally",
-        options: [{ type: "textinput", id: "group_id", label: "Group ID", default: "" }],
+        options: [
+          {
+            type: "dropdown",
+            id: "group_id",
+            label: "Group",
+            choices: grpChoices,
+            default: defaultGrp,
+            allowCustom: true,
+          },
+        ],
         callback: (fb) => {
+          const grp = this.snapshot?.show.groups.find((g) => g.id === fb.options.group_id);
+          if (grp?.intermission_active) {
+            return { bgcolor: combineRgb(229, 169, 59), color: combineRgb(15, 15, 16) };
+          }
           const members =
             this.snapshot?.channels.filter((c) => c.config.group_id === fb.options.group_id) || [];
           const states = members.map((m) => m.alert_state);
@@ -232,43 +449,112 @@ class PgmWatchCompanion extends InstanceBase<Config> {
           return { bgcolor: combineRgb(r, g, b), color: combineRgb(15, 15, 16) };
         },
       },
+      global_hold: {
+        type: "boolean",
+        name: "Global Hold Mode Active",
+        defaultStyle: {
+          bgcolor: combineRgb(229, 169, 59),
+          color: combineRgb(15, 15, 16),
+          text: "HOLD\nACTIVE",
+        },
+        options: [],
+        callback: () => Boolean(this.snapshot?.global_intermission),
+      },
+      channel_pfl: {
+        type: "boolean",
+        name: "Channel Listen (PFL) Active",
+        defaultStyle: {
+          bgcolor: combineRgb(59, 130, 246),
+          color: combineRgb(255, 255, 255),
+        },
+        options: [
+          {
+            type: "dropdown",
+            id: "channel_id",
+            label: "Channel",
+            choices: chChoices,
+            default: defaultCh,
+            allowCustom: true,
+          },
+        ],
+        callback: (fb) =>
+          Boolean(
+            this.snapshot?.channels.find((c) => c.config.id === fb.options.channel_id)?.pfl_active
+          ),
+      },
     };
     this.setFeedbackDefinitions(feedbacks);
   }
 
   private initVariables(): void {
     const vars: CompanionVariableDefinition[] = [
-      { variableId: "combined_ccv", name: "Combined CCV" },
-      { variableId: "combined_pcv", name: "Combined PCV" },
-      { variableId: "active_match", name: "Active Match" },
+      { variableId: "combined_ccv", name: "Live Viewers (Combined)" },
+      { variableId: "combined_pcv", name: "Peak Viewers (Combined)" },
+      { variableId: "active_match", name: "Active Segment" },
+      { variableId: "global_hold", name: "Global Hold Mode" },
     ];
     this.setVariableDefinitions(vars);
   }
 
-  private updateVariablesAndPresets(): void {
+  private syncStateFromSnapshot(): void {
     if (!this.snapshot) return;
-    const vars: CompanionVariableDefinition[] = [
-      { variableId: "combined_ccv", name: "Combined CCV" },
-      { variableId: "combined_pcv", name: "Combined PCV" },
-      { variableId: "active_match", name: "Active Match" },
-    ];
+
+    const structureKey = JSON.stringify({
+      g: this.snapshot.show.groups.map((g) => [g.id, g.name, g.language_code]),
+      c: this.snapshot.channels.map((c) => [c.config.id, c.config.group_id, c.config.name]),
+    });
+    const structureChanged = structureKey !== this.lastStructureKey;
+
+    if (structureChanged) {
+      this.lastStructureKey = structureKey;
+      this.initActions();
+      this.initFeedbacks();
+
+      const vars: CompanionVariableDefinition[] = [
+        { variableId: "combined_ccv", name: "Live Viewers (Combined)" },
+        { variableId: "combined_pcv", name: "Peak Viewers (Combined)" },
+        { variableId: "active_match", name: "Active Segment" },
+        { variableId: "global_hold", name: "Global Hold Mode" },
+      ];
+      for (const grp of this.snapshot.show.groups) {
+        vars.push({ variableId: `group_${grp.id}_ccv`, name: `${grp.name} Live Viewers` });
+      }
+      for (const ch of this.snapshot.channels) {
+        const cid = ch.config.id;
+        vars.push({ variableId: `ch_${cid}_lufs`, name: `${ch.config.name} Avg Loudness (LUFS)` });
+        vars.push({ variableId: `ch_${cid}_state`, name: `${ch.config.name} Alert State` });
+      }
+      this.setVariableDefinitions(vars);
+      this.rebuildPresets();
+    }
+
     const values: Record<string, string | number> = {
       combined_ccv: this.snapshot.combined_ccv,
       combined_pcv: this.snapshot.combined_pcv,
       active_match: this.snapshot.active_match?.label ?? "None",
+      global_hold: this.snapshot.global_intermission ? "ACTIVE" : "OFF",
     };
+    for (const grp of this.snapshot.show.groups) {
+      const groupCcv = this.snapshot.channels
+        .filter((c) => c.config.group_id === grp.id && c.ccv.status === "VALUE" && c.ccv.value !== null)
+        .reduce((acc, c) => acc + (c.ccv.value || 0), 0);
+      values[`group_${grp.id}_ccv`] = groupCcv;
+    }
+    for (const ch of this.snapshot.channels) {
+      const avgLufs = ch.audio.integrated_lufs ?? ch.audio.short_term_lufs;
+      values[`ch_${ch.config.id}_lufs`] = avgLufs.toFixed(1);
+      values[`ch_${ch.config.id}_state`] = ch.alert_state;
+    }
+    this.setVariableValues(values);
+    this.checkFeedbacks("channel_tally", "channel_vu_png", "group_rollup", "global_hold", "channel_pfl");
+  }
 
+  private rebuildPresets(): void {
+    if (!this.snapshot) return;
     const presets: CompanionPresetDefinitions = {};
 
-    // Level 1: Overview Page (Language Group Roll-ups + Match Markers + Intermission)
     for (const grp of this.snapshot.show.groups) {
       const gid = grp.id;
-      const groupCcv = this.snapshot.channels
-        .filter((c) => c.config.group_id === gid && c.ccv.status === "VALUE" && c.ccv.value !== null)
-        .reduce((acc, c) => acc + (c.ccv.value || 0), 0);
-      vars.push({ variableId: `group_${gid}_ccv`, name: `${grp.name} CCV` });
-      values[`group_${gid}_ccv`] = groupCcv;
-
       presets[`overview_group_${gid}`] = {
         type: "button",
         category: "Overview — Language Groups",
@@ -281,12 +567,7 @@ class PgmWatchCompanion extends InstanceBase<Config> {
         },
         steps: [
           {
-            down: [
-              {
-                actionId: "toggle_intermission",
-                options: { group_id: gid, active: !grp.intermission_active },
-              },
-            ],
+            down: [{ actionId: "toggle_intermission", options: { group_id: gid, mode: "toggle" } }],
             up: [],
           },
         ],
@@ -294,12 +575,41 @@ class PgmWatchCompanion extends InstanceBase<Config> {
       };
     }
 
+    presets["overview_global_hold"] = {
+      type: "button",
+      category: "Overview — Controls",
+      name: "Global Hold Mode",
+      style: {
+        text: "HOLD\nMODE",
+        size: "14",
+        color: combineRgb(237, 237, 237),
+        bgcolor: combineRgb(35, 35, 37),
+      },
+      steps: [
+        {
+          down: [{ actionId: "toggle_intermission", options: { group_id: "", mode: "toggle" } }],
+          up: [],
+        },
+      ],
+      feedbacks: [
+        {
+          feedbackId: "global_hold",
+          options: {},
+          style: {
+            bgcolor: combineRgb(229, 169, 59),
+            color: combineRgb(15, 15, 16),
+            text: "HOLD\nACTIVE",
+          },
+        },
+      ],
+    };
+
     presets["overview_reset_all_lufs"] = {
       type: "button",
-      category: "Overview — Audio",
-      name: "Reset All Avg LUFS",
+      category: "Overview — Controls",
+      name: "Reset All Avg Loudness",
       style: {
-        text: "RESET ALL\nAVG LUFS",
+        text: "RESET ALL\nLOUDNESS",
         size: "14",
         color: combineRgb(237, 237, 237),
         bgcolor: combineRgb(35, 35, 37),
@@ -308,27 +618,55 @@ class PgmWatchCompanion extends InstanceBase<Config> {
       feedbacks: [],
     };
 
-    // Level 2: Group Detail Page (Live png64 VU/Avg LUFS, Ack, Clip, Reset LUFS, PFL)
+    presets["overview_start_segment"] = {
+      type: "button",
+      category: "Overview — Controls",
+      name: "Start Segment",
+      style: {
+        text: "START\nSEGMENT",
+        size: "14",
+        color: combineRgb(237, 237, 237),
+        bgcolor: combineRgb(35, 35, 37),
+      },
+      steps: [{ down: [{ actionId: "start_match", options: { label: "Segment 1" } }], up: [] }],
+      feedbacks: [],
+    };
+
+    presets["overview_end_segment"] = {
+      type: "button",
+      category: "Overview — Controls",
+      name: "End Active Segment",
+      style: {
+        text: "END\n$(pgmwatch:active_match)",
+        size: "14",
+        color: combineRgb(237, 237, 237),
+        bgcolor: combineRgb(35, 35, 37),
+      },
+      steps: [{ down: [{ actionId: "end_match", options: {} }], up: [] }],
+      feedbacks: [],
+    };
+
     for (const ch of this.snapshot.channels) {
       const cid = ch.config.id;
-      const avgLufs = ch.audio.integrated_lufs ?? ch.audio.short_term_lufs;
-      vars.push({ variableId: `ch_${cid}_lufs`, name: `${ch.config.name} Avg LUFS` });
-      values[`ch_${cid}_lufs`] = avgLufs.toFixed(1);
-
       presets[`detail_vu_${cid}`] = {
         type: "button",
         category: `Group Detail — ${ch.config.group_id}`,
-        name: `${ch.config.name} VU/PFL`,
+        name: `${ch.config.name} VU/Listen`,
         style: {
-          text: `${ch.config.name}\n$(pgmwatch:ch_${cid}_lufs) Avg LUFS`,
+          text: `${ch.config.name}\n$(pgmwatch:ch_${cid}_lufs) LUFS`,
           size: "7",
           color: combineRgb(237, 237, 237),
           bgcolor: combineRgb(20, 20, 21),
         },
-        steps: [
-          { down: [{ actionId: "toggle_pfl", options: { channel_id: cid } }], up: [] },
+        steps: [{ down: [{ actionId: "toggle_pfl", options: { channel_id: cid } }], up: [] }],
+        feedbacks: [
+          { feedbackId: "channel_vu_png", options: { channel_id: cid } },
+          {
+            feedbackId: "channel_pfl",
+            options: { channel_id: cid },
+            style: { color: combineRgb(147, 197, 253) },
+          },
         ],
-        feedbacks: [{ feedbackId: "channel_vu_png", options: { channel_id: cid } }],
       };
 
       presets[`detail_ack_${cid}`] = {
@@ -362,7 +700,7 @@ class PgmWatchCompanion extends InstanceBase<Config> {
       presets[`detail_reset_lufs_${cid}`] = {
         type: "button",
         category: `Group Detail — ${ch.config.group_id}`,
-        name: `${ch.config.name} Reset Avg LUFS`,
+        name: `${ch.config.name} Reset Loudness`,
         style: {
           text: `RST LUFS\n${ch.config.name}`,
           size: "14",
@@ -374,8 +712,6 @@ class PgmWatchCompanion extends InstanceBase<Config> {
       };
     }
 
-    this.setVariableDefinitions(vars);
-    this.setVariableValues(values);
     this.setPresetDefinitions(presets);
   }
 }

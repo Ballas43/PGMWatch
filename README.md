@@ -105,7 +105,7 @@ Broadcast control rooms and live-event producers often monitor dozens of concurr
 * **Anti-Bootloop Breaker & Job Guard**: Locks any worker that hits 2 GPU faults in 60 seconds into `LIGHT` CPU mode, and binds all child processes (`pgmwatch-worker.exe`, `ffmpeg.exe`, extractors) to a Windows Job Object so closing `PGMWatch.exe` cleans up everything cleanly.
 
 ### Integrations
-* **Bitfocus Companion Module (`companion-module/`)**: WebSocket control module for Stream Deck / tally / intermission / PFL workflows.
+* **Bitfocus Companion Module (`companion-module/`)**: WebSocket control module for Stream Deck / tally / Hold Mode / 5s clips / PFL workflows. Point Companion's **Settings → Developer modules path** to the parent folder containing `companion-module/` (default host `127.0.0.1`, port `8787`) — channel & group dropdowns, variables, and button presets populate automatically on connect.
 * **TikTok LIVE Stats Sidecar (`sidecar-stats/`)**: Node.js viewer-mode connector for real-time TikTok concurrent viewers, likes, shares, and gifts.
 
 ---

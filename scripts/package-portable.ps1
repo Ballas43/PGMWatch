@@ -79,6 +79,30 @@ function Copy-AppPayload([string]$TargetDir, [bool]$FastUpdate) {
     if (Test-Path (Join-Path $Root "companion-module\dist")) {
         Copy-Item -Recurse -Force (Join-Path $Root "companion-module\dist") (Join-Path $TargetDir "companion-module\dist")
     }
+    if (Test-Path (Join-Path $Root "companion-module\companion")) {
+        Copy-Item -Recurse -Force (Join-Path $Root "companion-module\companion") (Join-Path $TargetDir "companion-module\companion")
+    }
+    # Bundle flat production node_modules (dereferenced from pnpm) so Companion Developer Modules work offline in the portable zip
+    $CompNodeModules = Join-Path $TargetDir "companion-module\node_modules"
+    if ((-not $FastUpdate) -or (-not (Test-Path (Join-Path $CompNodeModules "ws")))) {
+        New-Item -ItemType Directory -Force -Path $CompNodeModules | Out-Null
+        $SrcMods = Join-Path $Root "companion-module\node_modules"
+        $SrcHoisted = Join-Path $SrcMods ".pnpm\node_modules"
+        foreach ($dep in @("@companion-module", "ws")) {
+            $depSrc = Join-Path $SrcMods $dep
+            if (Test-Path $depSrc) {
+                Copy-Item -Recurse -Force $depSrc (Join-Path $CompNodeModules $dep)
+            }
+        }
+        if (Test-Path $SrcHoisted) {
+            Get-ChildItem $SrcHoisted | Where-Object { $_.Name -notin @(".bin", "undici-types") } | ForEach-Object {
+                $dst = Join-Path $CompNodeModules $_.Name
+                if (-not (Test-Path $dst)) {
+                    Copy-Item -Recurse -Force $_.FullName $dst
+                }
+            }
+        }
+    }
 }
 
 # Update dist/PGMWatch in place so user's saved dist/PGMWatch/data (sentinel.db, presets, profiles, clips) is NEVER deleted

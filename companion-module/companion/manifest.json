@@ -1,0 +1,28 @@
+{
+  "$schema": "../node_modules/@companion-module/base/assets/manifest.schema.json",
+  "id": "pgmwatch",
+  "name": "PGMWatch",
+  "shortname": "PGMWatch",
+  "description": "Broadcast confidence monitor, 48 kHz audio DSP, evidence clips, and viewer accounting control",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "repository": "git+https://github.com/Ballas43/PGMWatch.git",
+  "bugs": "https://github.com/Ballas43/PGMWatch/issues",
+  "maintainers": [
+    {
+      "name": "Ballas43",
+      "email": "timotiusaustin@gmail.com",
+      "github": "Ballas43"
+    }
+  ],
+  "legacyIds": [],
+  "runtime": {
+    "type": "node22",
+    "api": "nodejs-ipc",
+    "apiVersion": "0.0.0",
+    "entrypoint": "../dist/index.js"
+  },
+  "manufacturer": "PGMWatch",
+  "products": ["PGMWatch Broadcast Monitor"],
+  "keywords": ["broadcast", "monitor", "audio", "loudness", "tally", "pgm"]
+}
