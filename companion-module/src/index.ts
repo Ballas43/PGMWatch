@@ -90,6 +90,7 @@ class PgmWatchCompanion extends InstanceBase<Config> {
   private meterTimer: NodeJS.Timeout | null = null;
   private lastMeterCheckAt = 0;
   private pendingMeterChannels = new Set<string>();
+  private subscribedPngFeedbacks = new Set<string>();
   private snapshot: SnapshotPayload | null = null;
   private lastStructureKey = "";
   private config: Config = { host: "127.0.0.1", port: 8787 };
@@ -202,7 +203,9 @@ class PgmWatchCompanion extends InstanceBase<Config> {
         this.setVariableValues(updates);
       }
     }
-    this.checkFeedbacks("channel_vu_png");
+    if (this.subscribedPngFeedbacks.size > 0) {
+      this.checkFeedbacks("channel_vu_png");
+    }
   }
 
   private buildChannelAudioVars(ch: SnapshotChannel): Record<string, string | number> {
@@ -452,6 +455,12 @@ class PgmWatchCompanion extends InstanceBase<Config> {
             allowCustom: true,
           },
         ],
+        subscribe: (fb) => {
+          this.subscribedPngFeedbacks.add(fb.id);
+        },
+        unsubscribe: (fb) => {
+          this.subscribedPngFeedbacks.delete(fb.id);
+        },
         callback: (fb) => {
           const ch = this.snapshot?.channels.find((c) => c.config.id === fb.options.channel_id);
           if (!ch) return {};
@@ -701,9 +710,30 @@ class PgmWatchCompanion extends InstanceBase<Config> {
       presets[`detail_vu_${cid}`] = {
         type: "button",
         category: `Group Detail — ${ch.config.group_id}`,
-        name: `${ch.config.name} VU/Listen`,
+        name: `${ch.config.name} VU/Listen (Text)`,
         style: {
           text: `${ch.config.name}\n$(pgmwatch:ch_${cid}_vu_bar)\n$(pgmwatch:ch_${cid}_lufs) LUFS`,
+          size: "7",
+          color: combineRgb(237, 237, 237),
+          bgcolor: combineRgb(20, 20, 21),
+        },
+        steps: [{ down: [{ actionId: "toggle_pfl", options: { channel_id: cid } }], up: [] }],
+        feedbacks: [
+          { feedbackId: "channel_tally", options: { channel_id: cid } },
+          {
+            feedbackId: "channel_pfl",
+            options: { channel_id: cid },
+            style: { bgcolor: combineRgb(37, 99, 235), color: combineRgb(255, 255, 255) },
+          },
+        ],
+      };
+
+      presets[`detail_vu_png_${cid}`] = {
+        type: "button",
+        category: `Group Detail — ${ch.config.group_id}`,
+        name: `${ch.config.name} VU/Listen (Image)`,
+        style: {
+          text: `${ch.config.name}\n$(pgmwatch:ch_${cid}_lufs) LUFS`,
           size: "7",
           color: combineRgb(237, 237, 237),
           bgcolor: combineRgb(20, 20, 21),
