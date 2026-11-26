@@ -241,12 +241,13 @@ export const LiveMseVideo = memo(function LiveMseVideo({
           const elapsed = performance.now() - sessionStartAt;
 
           if (!playbackStarted) {
-            // Buffer a small lookahead before playing so fragment boundaries never underrun/stutter
-            if (span < 0.9 && !(elapsed > 1500 && span >= 0.35)) {
+            // Buffer a small lookahead before playing so fragment boundaries never underrun/stutter,
+            // then seek straight to the live edge of the buffered window instead of replaying old GOP frames.
+            if (span < 0.7 && !(elapsed > 1400 && span >= 0.35)) {
               return;
             }
-            const target = Math.max(start, end - Math.min(1.1, span * 0.45));
-            if (v.currentTime < start || Math.abs(v.currentTime - target) > 0.25) {
+            const target = Math.max(start, end - Math.min(0.55, span * 0.35));
+            if (v.currentTime < start || Math.abs(v.currentTime - target) > 0.2) {
               v.currentTime = target;
             }
             playbackStarted = true;
@@ -275,16 +276,16 @@ export const LiveMseVideo = memo(function LiveMseVideo({
           const end = v.buffered.end(v.buffered.length - 1);
 
           if (v.currentTime < start - 0.05) {
-            v.currentTime = Math.max(start, end - 1.5);
+            v.currentTime = Math.max(start, end - 0.7);
             if (v.playbackRate !== 1.0) v.playbackRate = 1.0;
           } else {
             const lag = end - v.currentTime;
-            if (lag > 10.0) {
-              v.currentTime = Math.max(start, end - 1.8);
+            if (lag > 7.0) {
+              v.currentTime = Math.max(start, end - 0.8);
               if (v.playbackRate !== 1.0) v.playbackRate = 1.0;
-            } else if (lag > 4.5) {
-              if (v.playbackRate !== 1.04) v.playbackRate = 1.04;
-            } else if (lag <= 2.4 && v.playbackRate !== 1.0) {
+            } else if (lag > 3.2) {
+              if (v.playbackRate !== 1.06) v.playbackRate = 1.06;
+            } else if (lag <= 1.6 && v.playbackRate !== 1.0) {
               v.playbackRate = 1.0;
             }
           }

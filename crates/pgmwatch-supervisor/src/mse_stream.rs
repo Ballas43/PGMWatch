@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex as AsyncMutex, Notify};
 
 const MAX_ATOM_BYTES: usize = 16 * 1024 * 1024;
-const IDLE_SHUTDOWN_SECS: u64 = 4;
-const MAX_GOP_PREBUFFER_CHUNKS: usize = 96;
+const IDLE_SHUTDOWN_SECS: u64 = 2;
+const MAX_GOP_PREBUFFER_CHUNKS: usize = 15;
 
 fn find_ffmpeg_bin() -> String {
     if let Ok(exe) = std::env::current_exe()
@@ -141,6 +141,10 @@ fn append_fmp4_input_args(args: &mut Vec<String>, url: &str, header_str: &str) {
     if url.contains(".m3u8") || url.contains(".mpd") {
         args.push("-http_persistent".into());
         args.push("0".into());
+        if url.contains(".m3u8") {
+            // Start on the newest HLS segment instead of FFmpeg's default (-3 segments behind live)
+            args.extend(["-live_start_index", "-1"].map(String::from));
+        }
     } else {
         args.extend(["-reconnect", "1", "-reconnect_streamed", "1"].map(String::from));
     }
@@ -153,7 +157,7 @@ fn append_fmp4_input_args(args: &mut Vec<String>, url: &str, header_str: &str) {
             "-readrate",
             "1.0",
             "-readrate_initial_burst",
-            "2.5",
+            "1.5",
             "-readrate_catchup",
             "1.25",
             "-i",
