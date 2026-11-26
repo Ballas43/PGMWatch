@@ -1,0 +1,52 @@
+# PGMWatch configuration (Windows portable distribution)
+
+[server]
+bind_host = "127.0.0.1"
+port = 8787
+open_browser_on_start = true
+# Optional outbound NIC IPv4 binding to isolate stream ingress from Dante / production NICs
+outbound_bind_ip = ""
+
+[media]
+# auto | d3d11va | cli_ffmpeg | cpu_light
+gpu_mode = "auto"
+# Optional explicit DXGI LUID hex string for MASTER vs SIMULCAST GPU pinning (e.g. "0x00010ab4")
+master_gpu_luid = ""
+simulcast_gpu_luid = ""
+# extra surfaces added to D3D11VA pool to avoid static pool exhaustion
+extra_hw_frames = 6
+# thumbnail rate in nominal operation (FPS)
+thumbnail_fps = 1.5
+# maximum FIFO disk usage for 5-second evidence clips in GB
+clip_quota_gb = 10.0
+
+[governor]
+vram_admit_max_pct = 75.0
+ram_admit_max_pct = 92.0
+wan_cap_mbps = 250.0
+wan_admit_max_pct = 85.0
+vram_stage1_pct = 80.0
+vram_stage2_pct = 88.0
+decode_latency_stage1_pct = 85.0
+decode_latency_stage2_pct = 100.0
+worker_memory_limit_mb = 512
+
+[extraction]
+# anonymous | fallback_auth
+auth_mode = "anonymous"
+max_concurrent_extractors = 6
+enable_bgutil_pot = false
+bgutil_pot_port = 4416
+# Optional custom path to msedge.exe; auto-detected when empty
+msedge_path = ""
+
+[alerts]
+recovery_hysteresis_secs = 3
+critical_escalation_secs = 5
+clip_cooldown_secs = 30
+chat_spike_unique_viewers = 10
+chat_spike_window_secs = 15
+
+[storage]
+data_dir = "data"
+db_batch_interval_ms = 1000

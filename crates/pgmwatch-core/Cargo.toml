@@ -1,0 +1,17 @@
+[package]
+name = "pgmwatch-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+toml = "0.8"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono"] }
+rust_xlsxwriter = "0.103"

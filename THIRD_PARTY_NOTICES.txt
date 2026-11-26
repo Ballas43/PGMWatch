@@ -1,0 +1,31 @@
+PGMWatch — Third-Party Licenses & Notices
+==========================================
+
+PGMWatch itself is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+See LICENSE for the full text and https://github.com/Ballas43/PGMWatch for Corresponding Source.
+
+Bundled Runtime Components (Windows Portable Distribution)
+----------------------------------------------------------
+
+1. FFmpeg 9.0 Shared Libraries (avcodec-63.dll, avdevice-63.dll, avfilter-12.dll,
+   avformat-63.dll, avutil-61.dll, swresample-7.dll, swscale-10.dll, ffmpeg.exe)
+   - License: GNU Lesser General Public License v3.0 (LGPL-3.0)
+   - Full License Text: FFMPEG-LICENSE.txt (in the portable distribution root)
+   - Upstream Project & Source: https://ffmpeg.org/
+
+2. yt-dlp (bin/yt-dlp.exe)
+   - License: The Unlicense
+   - Upstream Project: https://github.com/yt-dlp/yt-dlp
+
+3. Streamlink (bin/streamlink/)
+   - License: BSD 2-Clause License
+   - Upstream Project: https://streamlink.github.io/
+
+4. Node.js (bin/node.exe)
+   - License: MIT License
+   - Upstream Project: https://nodejs.org/
+
+5. Rust Crates & Frontend / Node Dependencies
+   - Cargo workspace dependencies (Cargo.lock) and npm dependencies
+     (ui/pnpm-lock.yaml, companion-module/pnpm-lock.yaml, sidecar-stats/package-lock.json)
+     are licensed under MIT, Apache-2.0, BSD, ISC, MPL-2.0, or OFL-1.1.

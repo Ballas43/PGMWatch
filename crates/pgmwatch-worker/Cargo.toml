@@ -1,0 +1,25 @@
+[package]
+name = "pgmwatch-worker"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+ffmpeg-ffi = ["dep:ffmpeg-sys-next"]
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+pgmwatch-core = { path = "../pgmwatch-core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap = { version = "4", features = ["derive"] }
+ebur128 = "0.1"
+rustfft = "6.4"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+ffmpeg-sys-next = { version = "9.1", optional = true }

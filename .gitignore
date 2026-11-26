@@ -1,0 +1,32 @@
+# Build artifacts & local runtime data
+/target/
+/dist/
+/node_modules/
+/ui/dist/
+/ui/node_modules/
+/sidecar-stats/node_modules/
+/companion-module/dist/
+/companion-module/node_modules/
+*.tsbuildinfo
+
+# Local downloaded toolchains & portable runtime binaries
+/vendor/
+/runtime/
+/data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Local media recordings, clips & sensitive auth/cookies
+*.mp4
+*.mkv
+*.webm
+.env
+.env.*
+*.cookies
+cookies.txt
+
+# OS & editor junk
+.DS_Store
+Thumbs.db
