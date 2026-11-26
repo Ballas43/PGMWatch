@@ -69,11 +69,27 @@ function normalizeHost(raw: string | undefined): string {
   return cleaned || "127.0.0.1";
 }
 
+function dbfsToPct(dbfs: number): number {
+  if (!Number.isFinite(dbfs)) return 0;
+  return Math.round(Math.max(0, Math.min(100, ((dbfs + 60) / 60) * 100)));
+}
+
+function formatMeterRow(label: string, dbfs: number): string {
+  const pct = dbfsToPct(dbfs);
+  const filled = Math.round((pct / 100) * 7);
+  return `${label} ${"▮".repeat(filled)}${"▯".repeat(7 - filled)}`;
+}
+
+function formatVuTextBar(leftDbfs: number, rightDbfs: number): string {
+  return `${formatMeterRow("L", leftDbfs)}\n${formatMeterRow("R", rightDbfs)}`;
+}
+
 class PgmWatchCompanion extends InstanceBase<Config> {
   private ws: WebSocket | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private meterTimer: NodeJS.Timeout | null = null;
   private lastMeterCheckAt = 0;
+  private pendingMeterChannels = new Set<string>();
   private snapshot: SnapshotPayload | null = null;
   private lastStructureKey = "";
   private config: Config = { host: "127.0.0.1", port: 8787 };
@@ -120,6 +136,7 @@ class PgmWatchCompanion extends InstanceBase<Config> {
       clearTimeout(this.meterTimer);
       this.meterTimer = null;
     }
+    this.pendingMeterChannels.clear();
   }
 
   private connectWs(): void {
@@ -148,6 +165,7 @@ class PgmWatchCompanion extends InstanceBase<Config> {
           const ch = this.snapshot.channels.find((c) => c.config.id === msg.channel_id);
           if (ch) {
             ch.audio = msg.audio;
+            this.pendingMeterChannels.add(ch.config.id);
             this.scheduleMeterFeedback();
           }
         }
@@ -170,19 +188,47 @@ class PgmWatchCompanion extends InstanceBase<Config> {
     });
   }
 
+  private flushMeterUpdates(): void {
+    this.lastMeterCheckAt = Date.now();
+    if (this.snapshot && this.pendingMeterChannels.size > 0) {
+      const updates: Record<string, string | number> = {};
+      for (const cid of this.pendingMeterChannels) {
+        const ch = this.snapshot.channels.find((c) => c.config.id === cid);
+        if (!ch) continue;
+        Object.assign(updates, this.buildChannelAudioVars(ch));
+      }
+      this.pendingMeterChannels.clear();
+      if (Object.keys(updates).length > 0) {
+        this.setVariableValues(updates);
+      }
+    }
+    this.checkFeedbacks("channel_vu_png");
+  }
+
+  private buildChannelAudioVars(ch: SnapshotChannel): Record<string, string | number> {
+    const cid = ch.config.id;
+    const avgLufs = ch.audio.integrated_lufs ?? ch.audio.short_term_lufs;
+    return {
+      [`ch_${cid}_lufs`]: avgLufs.toFixed(1),
+      [`ch_${cid}_left_db`]: ch.audio.left_rms_dbfs.toFixed(1),
+      [`ch_${cid}_right_db`]: ch.audio.right_rms_dbfs.toFixed(1),
+      [`ch_${cid}_left_pct`]: dbfsToPct(ch.audio.left_rms_dbfs),
+      [`ch_${cid}_right_pct`]: dbfsToPct(ch.audio.right_rms_dbfs),
+      [`ch_${cid}_vu_bar`]: formatVuTextBar(ch.audio.left_rms_dbfs, ch.audio.right_rms_dbfs),
+    };
+  }
+
   private scheduleMeterFeedback(): void {
     const now = Date.now();
     const elapsed = now - this.lastMeterCheckAt;
     if (elapsed >= 90) {
-      this.lastMeterCheckAt = now;
-      this.checkFeedbacks("channel_vu_png");
+      this.flushMeterUpdates();
       return;
     }
     if (!this.meterTimer) {
       this.meterTimer = setTimeout(() => {
         this.meterTimer = null;
-        this.lastMeterCheckAt = Date.now();
-        this.checkFeedbacks("channel_vu_png");
+        this.flushMeterUpdates();
       }, 90 - elapsed);
     }
   }
@@ -522,6 +568,11 @@ class PgmWatchCompanion extends InstanceBase<Config> {
       for (const ch of this.snapshot.channels) {
         const cid = ch.config.id;
         vars.push({ variableId: `ch_${cid}_lufs`, name: `${ch.config.name} Avg Loudness (LUFS)` });
+        vars.push({ variableId: `ch_${cid}_left_db`, name: `${ch.config.name} Left Level (dBFS)` });
+        vars.push({ variableId: `ch_${cid}_right_db`, name: `${ch.config.name} Right Level (dBFS)` });
+        vars.push({ variableId: `ch_${cid}_left_pct`, name: `${ch.config.name} Left Meter % (0-100)` });
+        vars.push({ variableId: `ch_${cid}_right_pct`, name: `${ch.config.name} Right Meter % (0-100)` });
+        vars.push({ variableId: `ch_${cid}_vu_bar`, name: `${ch.config.name} Text VU Bar` });
         vars.push({ variableId: `ch_${cid}_state`, name: `${ch.config.name} Alert State` });
       }
       this.setVariableDefinitions(vars);
@@ -541,8 +592,7 @@ class PgmWatchCompanion extends InstanceBase<Config> {
       values[`group_${grp.id}_ccv`] = groupCcv;
     }
     for (const ch of this.snapshot.channels) {
-      const avgLufs = ch.audio.integrated_lufs ?? ch.audio.short_term_lufs;
-      values[`ch_${ch.config.id}_lufs`] = avgLufs.toFixed(1);
+      Object.assign(values, this.buildChannelAudioVars(ch));
       values[`ch_${ch.config.id}_state`] = ch.alert_state;
     }
     this.setVariableValues(values);
@@ -653,7 +703,7 @@ class PgmWatchCompanion extends InstanceBase<Config> {
         category: `Group Detail — ${ch.config.group_id}`,
         name: `${ch.config.name} VU/Listen`,
         style: {
-          text: `${ch.config.name}\n$(pgmwatch:ch_${cid}_lufs) LUFS`,
+          text: `${ch.config.name}\n$(pgmwatch:ch_${cid}_vu_bar)\n$(pgmwatch:ch_${cid}_lufs) LUFS`,
           size: "7",
           color: combineRgb(237, 237, 237),
           bgcolor: combineRgb(20, 20, 21),

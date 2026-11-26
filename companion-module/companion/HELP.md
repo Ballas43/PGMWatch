@@ -16,4 +16,11 @@ Once connected, presets and dropdown options automatically populate from your ac
 
 - **Overview — Language Groups**: Shows group code + live viewers (`$(pgmwatch:group_<id>_ccv)`), rolls up worst tally color, and toggles **Group Hold Mode** on press.
 - **Overview — Controls**: **Global Hold Mode** toggle, **Reset All Avg Loudness**, **Start Segment**, and **End Segment**.
-- **Group Detail — `<group>`**: Per-channel **VU / Listen (PFL)** (live 72x72 stereo RMS bar + tally border), **Ack**, **5s Clip**, and **Reset Loudness** buttons.
+- **Group Detail — `<group>`**: Per-channel **VU / Listen (PFL)** (live meter + LUFS text; pressing toggles Listen), **Ack**, **5s Clip**, and **Reset Loudness** buttons.
+
+## Live Audio Meters in Companion v5
+
+Companion v5 replaced legacy bitmap/pixel-buffer (`png64` / `imageBuffer`) feedbacks with native **Gauge / Progress Bar** layers:
+
+- Every **VU/Listen** preset includes a live 10 Hz text bar (`$(pgmwatch:ch_<id>_vu_bar)`) that animates immediately in Companion v5.
+- For smooth vector meters in Companion v5, add a **Gauge** element to any button and bind its value (`0–100`) to `$(pgmwatch:ch_<id>_left_pct)` and `$(pgmwatch:ch_<id>_right_pct)` (or `-60–0` dBFS via `ch_<id>_left_db` / `ch_<id>_right_db`).
