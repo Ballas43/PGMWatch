@@ -235,19 +235,19 @@ export const LiveMseVideo = memo(function LiveMseVideo({
         const tryStartPlayback = () => {
           const v = videoRef.current;
           if (!v || unmounted || v.buffered.length === 0) return;
-          const start = v.buffered.start(0);
-          const end = v.buffered.end(v.buffered.length - 1);
+          const lastIdx = v.buffered.length - 1;
+          const start = v.buffered.start(lastIdx);
+          const end = v.buffered.end(lastIdx);
           const span = end - start;
           const elapsed = performance.now() - sessionStartAt;
 
           if (!playbackStarted) {
-            // Buffer a small lookahead before playing so fragment boundaries never underrun/stutter,
-            // then seek straight to the live edge of the buffered window instead of replaying old GOP frames.
-            if (span < 0.7 && !(elapsed > 1400 && span >= 0.35)) {
+            // Buffer enough lookahead (~0.9s) so audio/video fragment boundaries never underrun/stutter.
+            if (span < 0.9 && !(elapsed > 1500 && span >= 0.45)) {
               return;
             }
-            const target = Math.max(start, end - Math.min(0.55, span * 0.35));
-            if (v.currentTime < start || Math.abs(v.currentTime - target) > 0.2) {
+            const target = Math.max(start, end - Math.min(1.2, span * 0.45));
+            if (v.currentTime < start || Math.abs(v.currentTime - target) > 0.25) {
               v.currentTime = target;
             }
             playbackStarted = true;
@@ -272,27 +272,30 @@ export const LiveMseVideo = memo(function LiveMseVideo({
             tryStartPlayback();
             return;
           }
-          const start = v.buffered.start(0);
-          const end = v.buffered.end(v.buffered.length - 1);
+          const firstStart = v.buffered.start(0);
+          const lastIdx = v.buffered.length - 1;
+          const start = v.buffered.start(lastIdx);
+          const end = v.buffered.end(lastIdx);
 
           if (v.currentTime < start - 0.05) {
-            v.currentTime = Math.max(start, end - 0.7);
+            // Jump across any timeline gap directly into the active live buffered range.
+            v.currentTime = Math.max(start, end - 1.3);
             if (v.playbackRate !== 1.0) v.playbackRate = 1.0;
           } else {
             const lag = end - v.currentTime;
-            if (lag > 7.0) {
-              v.currentTime = Math.max(start, end - 0.8);
+            if (lag > 8.0) {
+              v.currentTime = Math.max(start, end - 1.5);
               if (v.playbackRate !== 1.0) v.playbackRate = 1.0;
-            } else if (lag > 3.2) {
-              if (v.playbackRate !== 1.06) v.playbackRate = 1.06;
-            } else if (lag <= 1.6 && v.playbackRate !== 1.0) {
+            } else if (lag > 4.0) {
+              if (v.playbackRate !== 1.04) v.playbackRate = 1.04;
+            } else if (lag <= 2.2 && v.playbackRate !== 1.0) {
               v.playbackRate = 1.0;
             }
           }
 
-          if (sb && !sb.updating && v.currentTime > start + 16) {
+          if (sb && !sb.updating && v.currentTime > firstStart + 16) {
             try {
-              sb.remove(start, v.currentTime - 10);
+              sb.remove(firstStart, v.currentTime - 10);
             } catch {}
           }
         };

@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex as AsyncMutex, Notify};
 
 const MAX_ATOM_BYTES: usize = 16 * 1024 * 1024;
-const IDLE_SHUTDOWN_SECS: u64 = 2;
-const MAX_GOP_PREBUFFER_CHUNKS: usize = 15;
+const IDLE_SHUTDOWN_SECS: u64 = 4;
+const MAX_GOP_PREBUFFER_CHUNKS: usize = 96;
 
 fn find_ffmpeg_bin() -> String {
     if let Ok(exe) = std::env::current_exe()
@@ -142,8 +142,9 @@ fn append_fmp4_input_args(args: &mut Vec<String>, url: &str, header_str: &str) {
         args.push("-http_persistent".into());
         args.push("0".into());
         if url.contains(".m3u8") {
-            // Start on the newest HLS segment instead of FFmpeg's default (-3 segments behind live)
-            args.extend(["-live_start_index", "-1"].map(String::from));
+            // Start 2 segments from live edge: avoids FFmpeg's -3 lag while keeping 1 segment of
+            // lookahead so split video+audio HLS inputs stay synchronized without starving on reload.
+            args.extend(["-live_start_index", "-2"].map(String::from));
         }
     } else {
         args.extend(["-reconnect", "1", "-reconnect_streamed", "1"].map(String::from));
@@ -157,7 +158,7 @@ fn append_fmp4_input_args(args: &mut Vec<String>, url: &str, header_str: &str) {
             "-readrate",
             "1.0",
             "-readrate_initial_burst",
-            "1.5",
+            "2.5",
             "-readrate_catchup",
             "1.25",
             "-i",
@@ -206,6 +207,8 @@ fn build_ffmpeg_fmp4_args(media: &ResolvedMedia) -> Vec<String> {
             "2",
             "-b:a",
             "128k",
+            "-max_muxing_queue_size",
+            "1024",
             "-avoid_negative_ts",
             "make_zero",
             "-f",
@@ -425,10 +428,13 @@ fn pump_fmp4_boxes(mut stdout: std::process::ChildStdout, hub: &MseChannelHub) {
                             if is_key {
                                 state.current_gop.clear();
                                 state.current_gop.push(bytes.clone());
-                            } else if !state.current_gop.is_empty()
-                                && state.current_gop.len() < MAX_GOP_PREBUFFER_CHUNKS
-                            {
-                                state.current_gop.push(bytes.clone());
+                            } else if !state.current_gop.is_empty() {
+                                if state.current_gop.len() < MAX_GOP_PREBUFFER_CHUNKS {
+                                    state.current_gop.push(bytes.clone());
+                                } else {
+                                    // Never leave a truncated mid-GOP prebuffer that would create a timeline hole.
+                                    state.current_gop.clear();
+                                }
                             }
                             let _ = hub.tx.send(bytes);
                         }
