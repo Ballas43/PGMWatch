@@ -39,6 +39,7 @@ pub struct ChatComplaintRule<'a> {
 pub struct PlatformStatsCaches<'a> {
     pub tiktok: &'a HashMap<String, ChannelStatsUpdate>,
     pub chat_rates: &'a HashMap<String, f64>,
+    pub twitch_gifts: &'a HashMap<String, f64>,
     pub mode_b: &'a HashMap<String, ChannelStatsUpdate>,
     pub facebook_cookie: Option<&'a str>,
 }
@@ -152,10 +153,13 @@ pub async fn collect_platform_stats(
     }
 
     let chat_rate = caches.chat_rates.get(channel_id).copied();
+    let twitch_gift = caches.twitch_gifts.get(channel_id).copied();
 
     match platform {
         Platform::Youtube => fetch_youtube_public_stats(client, channel_id, url, chat_rate).await,
-        Platform::Twitch => fetch_twitch_public_stats(client, channel_id, url, chat_rate).await,
+        Platform::Twitch => {
+            fetch_twitch_public_stats(client, channel_id, url, chat_rate, twitch_gift).await
+        }
         Platform::Facebook => {
             let pub_stats =
                 fetch_facebook_public_stats(client, channel_id, url, caches.facebook_cookie).await;
@@ -461,6 +465,7 @@ async fn fetch_twitch_public_stats(
     channel_id: &str,
     url: &str,
     chat_rate: Option<f64>,
+    gifts_count: Option<f64>,
 ) -> ChannelStatsUpdate {
     let Some(login) = extract_twitch_login(url) else {
         return unavailable_stats(channel_id, "Invalid Twitch login URL");
@@ -499,7 +504,9 @@ async fn fetch_twitch_public_stats(
                 .map(|v| TriStateMetric::value(v, 100.0))
                 .unwrap_or_else(|| TriStateMetric::unavailable("Live chat stream connecting")),
             shares: TriStateMetric::na(),
-            gifts_count: TriStateMetric::na(),
+            gifts_count: gifts_count
+                .map(|v| TriStateMetric::value(v, 100.0))
+                .unwrap_or_else(|| TriStateMetric::unavailable("Live chat stream connecting")),
             extras,
         }
     } else {
@@ -594,21 +601,23 @@ fn parse_facebook_html_stats(channel_id: &str, html: &str) -> Option<ChannelStat
         .map(|v| TriStateMetric::value(v, 90.0))
         .unwrap_or_else(TriStateMetric::na);
 
-    let chat_rate_per_min = ["comment_count"]
+    let mut extras = HashMap::new();
+    if let Some(comments) = ["comment_count"]
         .iter()
         .find_map(|key| extract_json_field_number(html, key))
-        .map(|v| TriStateMetric::value(v, 85.0))
-        .unwrap_or_else(TriStateMetric::na);
+    {
+        extras.insert("comment_count".into(), serde_json::json!(comments.round() as i64));
+    }
 
     Some(ChannelStatsUpdate {
         channel_id: channel_id.to_string(),
         ccv: TriStateMetric::value(ccv, 95.0),
         total_views,
         likes,
-        chat_rate_per_min,
+        chat_rate_per_min: TriStateMetric::na(),
         shares,
         gifts_count: TriStateMetric::na(),
-        extras: HashMap::new(),
+        extras,
     })
 }
 
@@ -826,7 +835,8 @@ mod tests {
         assert_eq!(parsed.total_views.value, Some(154.0));
         assert_eq!(parsed.likes.value, Some(33.0));
         assert_eq!(parsed.shares.value, Some(7.0));
-        assert_eq!(parsed.chat_rate_per_min.value, Some(19.0));
+        assert_eq!(parsed.chat_rate_per_min.status, MetricStatus::Na);
+        assert_eq!(parsed.extras.get("comment_count"), Some(&serde_json::json!(19)));
 
         let escaped = r#"{\"viewer_count\": 42, \"video_view_count\": 901, \"reaction_count\": {\"count\": 128}, \"share_count\": {\"count\": 14}}"#;
         let parsed_escaped = parse_facebook_html_stats("ch-fb-2", escaped).expect("escaped FB JSON should parse");

@@ -192,6 +192,7 @@ impl SupervisorState {
         self.master_lufs_timeline.write().await.clear();
         self.tiktok_cache.write().await.clear();
         self.chat_rates.write().await.clear();
+        self.twitch_gifts.write().await.clear();
         self.chat_spike_cooldown.lock().await.clear();
         self.mode_b_cache.write().await.clear();
         {

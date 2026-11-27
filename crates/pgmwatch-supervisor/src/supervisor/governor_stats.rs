@@ -62,7 +62,9 @@ fn pick_shed_victim(candidates: &[ShedCandidate]) -> Option<(String, FeedTier)> 
 }
 
 pub(super) fn build_stats_http_client(bind_ip: &str) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15));
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36");
     if let Some(ip) = (!bind_ip.trim().is_empty())
         .then(|| bind_ip.trim().parse::<std::net::IpAddr>().ok())
         .flatten()
@@ -522,6 +524,7 @@ impl SupervisorState {
             .collect();
         let tt_cache = self.tiktok_cache.read().await.clone();
         let chat_rates = self.chat_rates.read().await.clone();
+        let twitch_gifts = self.twitch_gifts.read().await.clone();
         let bucket = floor_to_minute_utc(Utc::now());
 
         let msedge_path = self.cfg.read().await.extraction.msedge_path.clone();
@@ -605,6 +608,7 @@ impl SupervisorState {
         let stat_caches = PlatformStatsCaches {
             tiktok: &tt_cache,
             chat_rates: &chat_rates,
+            twitch_gifts: &twitch_gifts,
             mode_b: &mode_b_map,
             facebook_cookie: fb_cookie_header.as_deref(),
         };
@@ -618,7 +622,11 @@ impl SupervisorState {
             {
                 let map = self.channels.read().await;
                 map.get(&ch.id)
-                    .filter(|m| m.ccv.status == MetricStatus::Value)
+                    .filter(|m| {
+                        m.ccv.status == MetricStatus::Value
+                            && (ch.platform != Platform::Youtube
+                                || m.likes.status == MetricStatus::Value)
+                    })
                     .map(|m| ChannelStatsUpdate {
                         channel_id: ch.id.clone(),
                         ccv: m.ccv.clone(),

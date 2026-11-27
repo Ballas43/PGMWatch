@@ -124,27 +124,31 @@ impl SupervisorState {
                                     likes: likes
                                         .map(|v| TriStateMetric::value(v, 100.0))
                                         .unwrap_or_else(|| {
-                                            if ccv.is_some() {
-                                                TriStateMetric::value(0.0, 100.0)
-                                            } else {
-                                                TriStateMetric::unavailable("Awaiting TikTok like count")
-                                            }
+                                            TriStateMetric::unavailable(
+                                                "TikTok live event stream rate-limited (REST fallback)",
+                                            )
                                         }),
                                     chat_rate_per_min: chat_count
                                         .map(|v| TriStateMetric::value(v, 95.0))
-                                        .unwrap_or_else(TriStateMetric::na),
+                                        .unwrap_or_else(|| {
+                                            TriStateMetric::unavailable(
+                                                "TikTok live event stream rate-limited (REST fallback)",
+                                            )
+                                        }),
                                     shares: shares
                                         .map(|v| TriStateMetric::value(v, 100.0))
                                         .unwrap_or_else(|| {
-                                            if ccv.is_some() {
-                                                TriStateMetric::value(0.0, 100.0)
-                                            } else {
-                                                TriStateMetric::unavailable("Awaiting TikTok share count")
-                                            }
+                                            TriStateMetric::unavailable(
+                                                "TikTok live event stream rate-limited (REST fallback)",
+                                            )
                                         }),
                                     gifts_count: gifts
                                         .map(|v| TriStateMetric::value(v, 100.0))
-                                        .unwrap_or_else(|| TriStateMetric::unavailable("Awaiting TikTok gift count")),
+                                        .unwrap_or_else(|| {
+                                            TriStateMetric::unavailable(
+                                                "TikTok live event stream rate-limited (REST fallback)",
+                                            )
+                                        }),
                                     extras: HashMap::new(),
                                 };
                                 let became_valued = {

@@ -50,8 +50,8 @@ function startRestPoll(channelId, username, sessionId) {
           total_views: Number.isFinite(totalViews) && totalViews > 0 ? totalViews : null,
           likes: typeof rawLikes === "number" && rawLikes > 0 ? rawLikes : null,
           shares: typeof rawShares === "number" && rawShares > 0 ? rawShares : null,
-          gifts: 0,
-          chat_count: 0,
+          gifts: null,
+          chat_count: null,
         });
       }
     } catch {
@@ -111,11 +111,19 @@ function subscribeRoom(channelId, username, sessionId) {
 
   let ccv = null;
   let totalViews = null;
-  let likes = null;
-  let shares = null;
+  let likes = 0;
+  let shares = 0;
   let gifts = 0;
-  let chatCount = 0;
+  const chatTimestamps = [];
   let isCurrent = () => connections.get(channelId) === conn;
+
+  const currentChatRatePerMin = () => {
+    const cutoff = Date.now() - 60000;
+    while (chatTimestamps.length > 0 && chatTimestamps[0] < cutoff) {
+      chatTimestamps.shift();
+    }
+    return chatTimestamps.length;
+  };
 
   const opts = {
     processInitialData: true,
@@ -135,7 +143,7 @@ function subscribeRoom(channelId, username, sessionId) {
       likes,
       shares,
       gifts,
-      chat_count: chatCount,
+      chat_count: currentChatRatePerMin(),
     });
   };
 
@@ -172,7 +180,7 @@ function subscribeRoom(channelId, username, sessionId) {
     if (!isCurrent()) return;
     const text = String(data?.comment || "").trim();
     if (!text) return;
-    chatCount += 1;
+    chatTimestamps.push(Date.now());
     emit({
       type: "chat",
       channel_id: channelId,

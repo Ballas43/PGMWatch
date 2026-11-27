@@ -54,22 +54,65 @@ impl ChatRateTracker {
 
 pub fn parse_twitch_irc_privmsg(line: &str) -> Option<(String, String)> {
     let trimmed = line.trim();
-    if !trimmed.starts_with(':') {
+    // Strip optional IRCv3 `@tag=val;... ` prefix requested via `CAP REQ :twitch.tv/tags`.
+    let body = if let Some(rest) = trimmed.strip_prefix('@') {
+        rest.split_once(' ')?.1.trim_start()
+    } else {
+        trimmed
+    };
+    if !body.starts_with(':') {
         return None;
     }
-    let bang = trimmed.find('!')?;
-    let viewer_id = trimmed[1..bang].trim();
+    let bang = body.find('!')?;
+    let viewer_id = body[1..bang].trim();
     if viewer_id.is_empty() {
         return None;
     }
-    let priv_idx = trimmed.find(" PRIVMSG #")?;
-    let after_priv = &trimmed[priv_idx + " PRIVMSG #".len()..];
+    let priv_idx = body.find(" PRIVMSG #")?;
+    let after_priv = &body[priv_idx + " PRIVMSG #".len()..];
     let colon_idx = after_priv.find(" :")?;
     let text = after_priv[colon_idx + 2..].trim();
     if text.is_empty() {
         return None;
     }
     Some((viewer_id.to_string(), text.to_string()))
+}
+
+/// Counts live Twitch gift events from IRCv3 tagged lines:
+/// - `USERNOTICE` with `msg-id=subgift` or `msg-id=anonsubgift` -> 1 gifted sub
+///   (we skip `submysterygift` because Twitch immediately emits individual `subgift` lines for each recipient)
+/// - `PRIVMSG` with `bits=<N>` where `N > 0` -> 1 cheer/bits gift event
+pub fn parse_twitch_irc_gift_count(line: &str) -> u64 {
+    let trimmed = line.trim();
+    let Some(rest) = trimmed.strip_prefix('@') else {
+        return 0;
+    };
+    let Some((tags_str, irc_body)) = rest.split_once(' ') else {
+        return 0;
+    };
+
+    if irc_body.contains(" USERNOTICE #") {
+        for kv in tags_str.split(';') {
+            if let Some(val) = kv.strip_prefix("msg-id=")
+                && matches!(val, "subgift" | "anonsubgift")
+            {
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    if irc_body.contains(" PRIVMSG #") {
+        for kv in tags_str.split(';') {
+            if let Some(val) = kv.strip_prefix("bits=")
+                && val.parse::<u64>().is_ok_and(|n| n > 0)
+            {
+                return 1;
+            }
+        }
+    }
+
+    0
 }
 
 pub fn extract_youtube_chat_bootstrap(html: &str) -> Option<(String, String)> {
@@ -293,6 +336,7 @@ impl SupervisorState {
                         handle.abort();
                     }
                     state.chat_rates.write().await.remove(&id);
+                    state.twitch_gifts.write().await.remove(&id);
                 }
 
                 for (id, (plat, url)) in desired {
@@ -327,12 +371,24 @@ async fn run_twitch_chat_loop(state: Arc<SupervisorState>, channel_id: String, u
     let mut tracker = ChatRateTracker::new();
     let nick = format!("justinfan{}", 10000 + (std::process::id() % 89999));
 
+    let mut total_gifts: u64 = 0;
+
     loop {
         if let Ok((mut ws, _)) = connect_async("wss://irc-ws.chat.twitch.tv:443").await {
+            let _ = ws
+                .send(Message::Text(
+                    "CAP REQ :twitch.tv/tags twitch.tv/commands".into(),
+                ))
+                .await;
             let _ = ws.send(Message::Text(format!("NICK {nick}").into())).await;
             let _ = ws.send(Message::Text(format!("JOIN #{login}").into())).await;
-            // Register channel as connected with initial 0 rate
+            // Register channel as connected with initial 0 rate & gift count
             state.chat_rates.write().await.insert(channel_id.clone(), 0.0);
+            state
+                .twitch_gifts
+                .write()
+                .await
+                .insert(channel_id.clone(), total_gifts as f64);
 
             while let Some(Ok(msg)) = ws.next().await {
                 if let Message::Text(txt) = msg {
@@ -340,6 +396,15 @@ async fn run_twitch_chat_loop(state: Arc<SupervisorState>, channel_id: String, u
                         if line.starts_with("PING") {
                             let _ = ws.send(Message::Text("PONG :tmi.twitch.tv".into())).await;
                             continue;
+                        }
+                        let gift_delta = parse_twitch_irc_gift_count(line);
+                        if gift_delta > 0 {
+                            total_gifts = total_gifts.saturating_add(gift_delta);
+                            state
+                                .twitch_gifts
+                                .write()
+                                .await
+                                .insert(channel_id.clone(), total_gifts as f64);
                         }
                         if let Some((viewer, body)) = parse_twitch_irc_privmsg(line) {
                             let now = Instant::now();
@@ -436,7 +501,31 @@ mod tests {
             parse_twitch_irc_privmsg(line),
             Some(("viewer123".to_string(), "no audio!!".to_string()))
         );
+        let tagged = "@badge-info=;badges=subscriber/3;bits=100;color=#FF0000 :viewer99!viewer99@viewer99.tmi.twitch.tv PRIVMSG #hok_esports :Cheer100 nice play!";
+        assert_eq!(
+            parse_twitch_irc_privmsg(tagged),
+            Some(("viewer99".to_string(), "Cheer100 nice play!".to_string()))
+        );
         assert_eq!(parse_twitch_irc_privmsg("PING :tmi.twitch.tv"), None);
+    }
+
+    #[test]
+    fn test_parse_twitch_irc_gift_count() {
+        let subgift = "@badge-info=;msg-id=subgift;msg-param-months=1 :tmi.twitch.tv USERNOTICE #hok_esports";
+        assert_eq!(parse_twitch_irc_gift_count(subgift), 1);
+
+        let anon = "@msg-id=anonsubgift;room-id=123 :tmi.twitch.tv USERNOTICE #hok_esports";
+        assert_eq!(parse_twitch_irc_gift_count(anon), 1);
+
+        // Mystery gift header is ignored because Twitch immediately sends individual subgift lines.
+        let mystery = "@msg-id=submysterygift;msg-param-mass-gift-count=5 :tmi.twitch.tv USERNOTICE #hok_esports";
+        assert_eq!(parse_twitch_irc_gift_count(mystery), 0);
+
+        let cheer = "@bits=500;display-name=Fan :fan!fan@fan.tmi.twitch.tv PRIVMSG #hok_esports :Cheer500";
+        assert_eq!(parse_twitch_irc_gift_count(cheer), 1);
+
+        let normal = "@display-name=Fan :fan!fan@fan.tmi.twitch.tv PRIVMSG #hok_esports :hello";
+        assert_eq!(parse_twitch_irc_gift_count(normal), 0);
     }
 
     #[test]
