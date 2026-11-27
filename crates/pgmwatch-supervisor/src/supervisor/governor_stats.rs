@@ -617,10 +617,17 @@ impl SupervisorState {
             .map(|(k, (v, _))| (k.clone(), v.clone()))
             .collect();
 
+        let fb_cookies_path = self
+            .profiles_dir
+            .join(crate::resolver::auth_cookies_slug(Platform::Facebook));
+        let fb_cookie_header =
+            crate::stats::load_cookie_header_for_domain(&fb_cookies_path, "facebook.com");
+
         let stat_caches = PlatformStatsCaches {
             tiktok: &tt_cache,
             chat_rates: &chat_rates,
             mode_b: &mode_b_map,
+            facebook_cookie: fb_cookie_header.as_deref(),
         };
         let mut new_samples = Vec::with_capacity(configs.len());
 

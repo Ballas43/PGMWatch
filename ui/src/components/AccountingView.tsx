@@ -7,6 +7,7 @@ import { formatTriStateCompact } from "../utils/telemetry";
 import { CcvTimelineChart } from "./CcvTimelineChart";
 import { InfoTip } from "./InfoTip";
 import { ManualOverrideForm } from "./ManualOverrideForm";
+import { PlatformAuthPanel } from "./PlatformAuthPanel";
 
 function isoToLocalInput(iso?: string | null): string {
   if (!iso) return "";
@@ -153,6 +154,13 @@ export function AccountingView({ snapshot, onRefresh }: AccountingViewProps) {
           <span>{resetting ? "Resetting..." : confirmReset ? "Click Again to Confirm Reset" : "Reset Graph"}</span>
         </button>
       </div>
+
+      <PlatformAuthPanel
+        onSynced={() => {
+          void loadAccounting();
+          onRefresh();
+        }}
+      />
 
       <section className="rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-card)] px-4 py-3">
         <div className="flex flex-wrap items-center justify-between gap-2">

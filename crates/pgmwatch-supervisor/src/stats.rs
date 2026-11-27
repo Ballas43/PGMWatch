@@ -40,6 +40,63 @@ pub struct PlatformStatsCaches<'a> {
     pub tiktok: &'a HashMap<String, ChannelStatsUpdate>,
     pub chat_rates: &'a HashMap<String, f64>,
     pub mode_b: &'a HashMap<String, ChannelStatsUpdate>,
+    pub facebook_cookie: Option<&'a str>,
+}
+
+/// Reads a Netscape `cookies.txt` file and builds a `Cookie: k=v; ...` header for matching domain suffix.
+pub fn load_cookie_header_for_domain(cookies_path: &Path, domain_suffix: &str) -> Option<String> {
+    let content = std::fs::read_to_string(cookies_path).ok()?;
+    let suffix = domain_suffix.trim_start_matches('.').to_ascii_lowercase();
+    let mut pairs = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = trimmed.split('\t').collect();
+        if cols.len() < 7 {
+            continue;
+        }
+        let dom = cols[0].trim_start_matches('.').to_ascii_lowercase();
+        if dom == suffix || dom.ends_with(&format!(".{suffix}")) {
+            let name = cols[5].trim();
+            let val = cols[6].trim();
+            if !name.is_empty() && !val.is_empty() {
+                pairs.push(format!("{name}={val}"));
+            }
+        }
+    }
+    if pairs.is_empty() {
+        None
+    } else {
+        Some(pairs.join("; "))
+    }
+}
+
+/// Extracts a single named cookie value (e.g. `sessionid` for TikTok) from a Netscape `cookies.txt`.
+pub fn extract_cookie_value(cookies_path: &Path, domain_suffix: &str, cookie_name: &str) -> Option<String> {
+    let content = std::fs::read_to_string(cookies_path).ok()?;
+    let suffix = domain_suffix.trim_start_matches('.').to_ascii_lowercase();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = trimmed.split('\t').collect();
+        if cols.len() < 7 {
+            continue;
+        }
+        let dom = cols[0].trim_start_matches('.').to_ascii_lowercase();
+        if (dom == suffix || dom.ends_with(&format!(".{suffix}")))
+            && cols[5].trim().eq_ignore_ascii_case(cookie_name)
+        {
+            let val = cols[6].trim();
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
 }
 
 impl ChatComplaintSensor {
@@ -100,7 +157,8 @@ pub async fn collect_platform_stats(
         Platform::Youtube => fetch_youtube_public_stats(client, channel_id, url, chat_rate).await,
         Platform::Twitch => fetch_twitch_public_stats(client, channel_id, url, chat_rate).await,
         Platform::Facebook => {
-            let pub_stats = fetch_facebook_public_stats(client, channel_id, url).await;
+            let pub_stats =
+                fetch_facebook_public_stats(client, channel_id, url, caches.facebook_cookie).await;
             if pub_stats.ccv.status == MetricStatus::Value {
                 pub_stats
             } else if let Some(cached) = caches.mode_b.get(channel_id) {
@@ -300,20 +358,28 @@ async fn fetch_tiktok_public_stats(
     };
 
     if let Some(ccv) = parse_tiktok_public_ccv(&html) {
+        let total_views = ["totalUser", "total_user", "enterCount", "enter_count"]
+            .iter()
+            .find_map(|k| extract_json_field_number(&html, k))
+            .filter(|&v| v > 0.0)
+            .map(|v| TriStateMetric::value(v, 100.0))
+            .unwrap_or_else(|| TriStateMetric::unavailable("TikTok total views awaiting sidecar"));
         let likes = ["likeCount", "like_count"]
             .iter()
             .find_map(|k| extract_json_field_number(&html, k))
+            .filter(|&v| v > 0.0)
             .map(|v| TriStateMetric::value(v, 100.0))
             .unwrap_or_else(|| TriStateMetric::unavailable("TikTok likes awaiting sidecar"));
         let shares = ["shareCount", "share_count"]
             .iter()
             .find_map(|k| extract_json_field_number(&html, k))
+            .filter(|&v| v > 0.0)
             .map(|v| TriStateMetric::value(v, 100.0))
             .unwrap_or_else(|| TriStateMetric::unavailable("TikTok shares awaiting sidecar"));
         ChannelStatsUpdate {
             channel_id: channel_id.to_string(),
             ccv: TriStateMetric::value(ccv, 100.0),
-            total_views: TriStateMetric::na(),
+            total_views,
             likes,
             chat_rate_per_min: TriStateMetric::unavailable("TikTok sidecar reconnecting"),
             shares,
@@ -550,8 +616,9 @@ async fn fetch_facebook_public_stats(
     client: &reqwest::Client,
     channel_id: &str,
     url: &str,
+    cookie_header: Option<&str>,
 ) -> ChannelStatsUpdate {
-    let Ok(resp) = client
+    let mut req = client
         .get(url)
         .header(
             "User-Agent",
@@ -562,10 +629,11 @@ async fn fetch_facebook_public_stats(
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         )
         .header("Accept-Language", "en-US,en;q=0.9")
-        .header("Sec-Fetch-Mode", "navigate")
-        .send()
-        .await
-    else {
+        .header("Sec-Fetch-Mode", "navigate");
+    if let Some(cookie) = cookie_header.filter(|s| !s.is_empty()) {
+        req = req.header("Cookie", cookie);
+    }
+    let Ok(resp) = req.send().await else {
         return unavailable_stats(channel_id, "Facebook stats request failed");
     };
 
@@ -605,6 +673,8 @@ pub enum SidecarEvent {
     Stats {
         channel_id: String,
         ccv: Option<f64>,
+        #[serde(default)]
+        total_views: Option<f64>,
         likes: Option<f64>,
         #[serde(default)]
         shares: Option<f64>,
@@ -696,12 +766,13 @@ impl TikTokSidecarClient {
         }
     }
 
-    pub async fn subscribe(&mut self, channel_id: &str, username: &str) {
+    pub async fn subscribe(&mut self, channel_id: &str, username: &str, session_id: Option<&str>) {
         if let Some(ref mut stdin) = self.stdin {
             let line = serde_json::json!({
                 "cmd": "subscribe",
                 "channel_id": channel_id,
-                "username": username
+                "username": username,
+                "session_id": session_id
             })
             .to_string();
             let _ = stdin.write_all(line.as_bytes()).await;

@@ -28,12 +28,12 @@ function scheduleReconnect(channelId) {
   const timer = setTimeout(() => {
     pendingTimers.delete(channelId);
     const cur = desiredRooms.get(channelId);
-    if (cur) subscribeRoom(channelId, cur.username);
+    if (cur) subscribeRoom(channelId, cur.username, cur.sessionId);
   }, baseMs + jitterMs);
   pendingTimers.set(channelId, timer);
 }
 
-function subscribeRoom(channelId, username) {
+function subscribeRoom(channelId, username, sessionId) {
   if (!TikTokLiveConnection) {
     emit({
       type: "error",
@@ -57,16 +57,34 @@ function subscribeRoom(channelId, username) {
   }
 
   let ccv = null;
+  let totalViews = null;
   let likes = null;
   let shares = null;
   let gifts = 0;
   let chatCount = 0;
   let isCurrent = () => connections.get(channelId) === conn;
 
-  const conn = new TikTokLiveConnection(cleanUser, {
+  const opts = {
     processInitialData: true,
     enableExtendedGiftInfo: false,
-  });
+  };
+  if (sessionId && String(sessionId).trim()) {
+    opts.sessionId = String(sessionId).trim();
+  }
+  const conn = new TikTokLiveConnection(cleanUser, opts);
+
+  const emitStats = () => {
+    emit({
+      type: "stats",
+      channel_id: channelId,
+      ccv,
+      total_views: totalViews,
+      likes,
+      shares,
+      gifts,
+      chat_count: chatCount,
+    });
+  };
 
   conn.on("roomUser", (data) => {
     if (!isCurrent()) return;
@@ -74,27 +92,27 @@ function subscribeRoom(channelId, username) {
     if (Number.isFinite(nextCcv)) {
       ccv = nextCcv;
     }
-    emit({ type: "stats", channel_id: channelId, ccv, likes, shares, gifts, chat_count: chatCount });
+    emitStats();
   });
 
   conn.on("like", (data) => {
     if (!isCurrent()) return;
     if (typeof data?.totalLikeCount === "number") {
       likes = data.totalLikeCount;
-      emit({ type: "stats", channel_id: channelId, ccv, likes, shares, gifts, chat_count: chatCount });
+      emitStats();
     }
   });
 
   conn.on("share", () => {
     if (!isCurrent()) return;
     shares = (shares ?? 0) + 1;
-    emit({ type: "stats", channel_id: channelId, ccv, likes, shares, gifts, chat_count: chatCount });
+    emitStats();
   });
 
   conn.on("gift", (data) => {
     if (!isCurrent()) return;
     gifts += Number(data?.repeatCount ?? 1);
-    emit({ type: "stats", channel_id: channelId, ccv, likes, shares, gifts, chat_count: chatCount });
+    emitStats();
   });
 
   conn.on("chat", (data) => {
@@ -126,23 +144,28 @@ function subscribeRoom(channelId, username) {
       if (desired) desired.attempts = 0;
       const ri = st?.roomInfo?.data || st?.roomInfo || {};
       const initialCcv = Number(ri?.user_count ?? ri?.stats?.user_count);
-      const initialLikes = Number(ri?.like_count ?? ri?.stats?.like_count);
-      const initialShares = Number(ri?.stats?.share_count ?? ri?.share_count);
+      const initialViews = Number(ri?.stats?.total_user ?? ri?.stats?.enter_count);
+      const rawLikes = ri?.like_count ?? ri?.stats?.like_count;
+      const rawShares = ri?.stats?.share_count ?? ri?.share_count;
       let changed = false;
       if (Number.isFinite(initialCcv)) {
         ccv = initialCcv;
         changed = true;
       }
-      if (Number.isFinite(initialLikes)) {
-        likes = initialLikes;
+      if (Number.isFinite(initialViews) && initialViews > 0) {
+        totalViews = initialViews;
         changed = true;
       }
-      if (Number.isFinite(initialShares)) {
-        shares = initialShares;
+      if (typeof rawLikes === "number" && rawLikes > 0) {
+        likes = rawLikes;
+        changed = true;
+      }
+      if (typeof rawShares === "number" && rawShares > 0) {
+        shares = rawShares;
         changed = true;
       }
       if (changed) {
-        emit({ type: "stats", channel_id: channelId, ccv, likes, shares, gifts, chat_count: chatCount });
+        emitStats();
       }
     })
     .catch((err) => {
@@ -164,7 +187,11 @@ rl.on("line", (line) => {
   try {
     const msg = JSON.parse(line);
     if (msg.cmd === "subscribe") {
-      desiredRooms.set(msg.channel_id, { username: msg.username, attempts: 0 });
+      desiredRooms.set(msg.channel_id, {
+        username: msg.username,
+        sessionId: msg.session_id || null,
+        attempts: 0,
+      });
       if (pendingTimers.has(msg.channel_id)) {
         clearTimeout(pendingTimers.get(msg.channel_id));
         pendingTimers.delete(msg.channel_id);
@@ -173,7 +200,7 @@ rl.on("line", (line) => {
       const timer = setTimeout(() => {
         pendingTimers.delete(msg.channel_id);
         const cur = desiredRooms.get(msg.channel_id);
-        if (cur) subscribeRoom(msg.channel_id, cur.username);
+        if (cur) subscribeRoom(msg.channel_id, cur.username, cur.sessionId);
       }, delayMs);
       pendingTimers.set(msg.channel_id, timer);
     } else if (msg.cmd === "unsubscribe") {

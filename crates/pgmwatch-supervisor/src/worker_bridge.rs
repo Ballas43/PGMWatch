@@ -81,9 +81,17 @@ impl SupervisorState {
                             active_rooms.remove(&id);
                             tt_state.tiktok_cache.write().await.remove(&id);
                         }
+                        let tt_cookies = tt_state
+                            .profiles_dir
+                            .join(crate::resolver::auth_cookies_slug(Platform::Tiktok));
+                        let session_id = crate::stats::extract_cookie_value(
+                            &tt_cookies,
+                            "tiktok.com",
+                            "sessionid",
+                        );
                         for (id, user) in desired {
                             if active_rooms.get(&id) != Some(&user) {
-                                client.subscribe(&id, &user).await;
+                                client.subscribe(&id, &user, session_id.as_deref()).await;
                                 active_rooms.insert(id, user);
                             }
                         }
@@ -96,6 +104,7 @@ impl SupervisorState {
                             crate::stats::SidecarEvent::Stats {
                                 channel_id,
                                 ccv,
+                                total_views,
                                 likes,
                                 shares,
                                 gifts,
@@ -106,7 +115,9 @@ impl SupervisorState {
                                     ccv: ccv
                                         .map(|v| TriStateMetric::value(v, 100.0))
                                         .unwrap_or_else(|| TriStateMetric::unavailable("TikTok CCV missing")),
-                                    total_views: TriStateMetric::na(),
+                                    total_views: total_views
+                                        .map(|v| TriStateMetric::value(v, 100.0))
+                                        .unwrap_or_else(|| TriStateMetric::unavailable("Awaiting TikTok total views")),
                                     likes: likes
                                         .map(|v| TriStateMetric::value(v, 100.0))
                                         .unwrap_or_else(|| TriStateMetric::unavailable("Awaiting TikTok like count")),
@@ -133,6 +144,7 @@ impl SupervisorState {
                                     let mut map = tt_state.channels.write().await;
                                     if let Some(m) = map.get_mut(&channel_id) {
                                         m.ccv = upd.ccv;
+                                        m.total_views = upd.total_views;
                                         m.likes = upd.likes;
                                         m.shares = upd.shares;
                                         m.chat_rate_per_min = upd.chat_rate_per_min;

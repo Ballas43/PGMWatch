@@ -859,6 +859,160 @@ pub(super) async fn get_dash_hls_playlist(
     }
 }
 
+fn parse_auth_platform(raw: &str) -> Option<(Platform, &'static str, &'static str)> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "facebook" => Some((Platform::Facebook, "Facebook", "https://www.facebook.com/login")),
+        "tiktok" => Some((Platform::Tiktok, "TikTok", "https://www.tiktok.com/login")),
+        _ => None,
+    }
+}
+
+pub(super) async fn get_platform_auth_status(
+    State(st): State<Arc<SupervisorState>>,
+) -> impl IntoResponse {
+    let channels_platforms: std::collections::HashSet<Platform> = {
+        let map = st.channels.read().await;
+        map.values().map(|m| m.config.platform).collect()
+    };
+
+    let entries = [
+        (
+            "facebook",
+            Platform::Facebook,
+            "Facebook",
+            "Unlocks Reactions (Likes) and Shares on live & event pages",
+        ),
+        (
+            "tiktok",
+            Platform::Tiktok,
+            "TikTok",
+            "Reduces rate limits for live Likes, Shares, and Gifts",
+        ),
+    ];
+
+    let platforms: Vec<serde_json::Value> = entries
+        .into_iter()
+        .map(|(key, plat, label, unlocks)| {
+            let profile_exists = st
+                .profiles_dir
+                .join(crate::resolver::auth_profile_slug(plat))
+                .join("Default")
+                .exists();
+            let cookies_path = st.profiles_dir.join(crate::resolver::auth_cookies_slug(plat));
+            let has_cookies = cookies_path
+                .metadata()
+                .map(|m| m.len() > 64)
+                .unwrap_or(false);
+            serde_json::json!({
+                "platform": key,
+                "label": label,
+                "has_channels": channels_platforms.contains(&plat),
+                "profile_ready": profile_exists,
+                "connected": has_cookies,
+                "unlocks": unlocks,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "platforms": platforms }))
+}
+
+pub(super) async fn post_platform_auth_login(
+    State(st): State<Arc<SupervisorState>>,
+    Path(platform_raw): Path<String>,
+) -> Response {
+    let Some((platform, label, login_url)) = parse_auth_platform(&platform_raw) else {
+        return (StatusCode::BAD_REQUEST, "Unsupported platform for login").into_response();
+    };
+    let configured_msedge = st.cfg.read().await.extraction.msedge_path.clone();
+    let Some(msedge) = detect_msedge_path(&configured_msedge) else {
+        return (StatusCode::BAD_REQUEST, "Microsoft Edge not detected on this PC").into_response();
+    };
+    let slug = crate::resolver::auth_profile_slug(platform);
+    let auth_dir = st.profiles_dir.join(slug);
+    match open_isolated_login_window(&msedge, &auth_dir, login_url) {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "platform": platform_raw,
+            "label": label,
+            "login_url": login_url
+        }))
+        .into_response(),
+        Err(e) => {
+            tracing::error!("Failed to launch Edge login for {label}: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to open Edge login window").into_response()
+        }
+    }
+}
+
+pub(super) async fn post_platform_auth_sync(
+    State(st): State<Arc<SupervisorState>>,
+    Path(platform_raw): Path<String>,
+) -> Response {
+    let Some((platform, label, _)) = parse_auth_platform(&platform_raw) else {
+        return (StatusCode::BAD_REQUEST, "Unsupported platform").into_response();
+    };
+    let configured_msedge = st.cfg.read().await.extraction.msedge_path.clone();
+    let Some(msedge) = detect_msedge_path(&configured_msedge) else {
+        return (StatusCode::BAD_REQUEST, "Microsoft Edge not detected on this PC").into_response();
+    };
+    let auth_dir = st.profiles_dir.join(crate::resolver::auth_profile_slug(platform));
+    if !auth_dir.join("Default").exists() {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("Please click Sign In to {label} first to create a browser session."),
+        )
+            .into_response();
+    }
+    let cookies_path = st.profiles_dir.join(crate::resolver::auth_cookies_slug(platform));
+    match crate::ghost_browser::export_cookies_from_auth_profile(
+        &msedge,
+        &auth_dir,
+        &cookies_path,
+        Arc::clone(&st.job_guard),
+    )
+    .await
+    {
+        Ok(count) if count > 0 => {
+            st.stats_notify.notify_one();
+            if platform == Platform::Tiktok {
+                st.sync_tiktok_subscriptions().await;
+            }
+            Json(serde_json::json!({
+                "ok": true,
+                "cookies_exported": count
+            }))
+            .into_response()
+        }
+        Ok(_) => (
+            StatusCode::BAD_REQUEST,
+            format!("No {label} session cookies found yet. Finish signing in inside the Edge window, then click Sync Session again."),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::warn!("Cookie export failed for {label}: {err}");
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Could not read {label} cookies yet (close the Edge login window first if it is still open)."),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub(super) async fn post_platform_auth_wipe(
+    State(st): State<Arc<SupervisorState>>,
+    Path(platform_raw): Path<String>,
+) -> Response {
+    let Some((platform, _, _)) = parse_auth_platform(&platform_raw) else {
+        return (StatusCode::BAD_REQUEST, "Unsupported platform").into_response();
+    };
+    let _ = wipe_auth_profile(&st.profiles_dir.join(crate::resolver::auth_profile_slug(platform)));
+    let _ = std::fs::remove_file(st.profiles_dir.join(crate::resolver::auth_cookies_slug(platform)));
+    st.stats_notify.notify_one();
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
 pub(super) async fn post_auth_login(
     State(st): State<Arc<SupervisorState>>,
     Path(id): Path<String>,
