@@ -65,6 +65,7 @@ pub struct UrlResolver {
     dash_relay: Arc<DashRelayState>,
     http: reqwest::Client,
     cache: Mutex<ResolverCache>,
+    cookie_sync_gate: Mutex<HashMap<Platform, Instant>>,
 }
 
 pub(crate) fn is_always_live_transport_url(url: &str) -> bool {
@@ -284,6 +285,7 @@ impl UrlResolver {
             dash_relay,
             http,
             cache: Mutex::new(HashMap::new()),
+            cookie_sync_gate: Mutex::new(HashMap::new()),
         }
     }
 
@@ -317,6 +319,18 @@ impl UrlResolver {
             return Ok(None);
         };
         let cookies_path = self.profiles_dir.join(auth_cookies_slug(platform));
+
+        // Serialize headless Edge cookie exports so concurrent resolvers (e.g. 6 YouTube
+        // channels on startup) never launch multiple Edge processes against the same profile
+        // lockfile simultaneously, and reuse freshly synced cookies for 60s.
+        let mut last_sync = self.cookie_sync_gate.lock().await;
+        if let Some(prev) = last_sync.get(&platform)
+            && prev.elapsed() < Duration::from_secs(60)
+            && std::fs::metadata(&cookies_path).is_ok_and(|m| m.len() > 0)
+        {
+            return Ok(Some(cookies_path));
+        }
+
         match export_cookies_from_auth_profile(
             &msedge,
             &auth_profile_dir,
@@ -325,7 +339,10 @@ impl UrlResolver {
         )
         .await
         {
-            Ok(count) if count > 0 => Ok(Some(cookies_path)),
+            Ok(count) if count > 0 => {
+                last_sync.insert(platform, Instant::now());
+                Ok(Some(cookies_path))
+            }
             Ok(_) => Ok(None),
             Err(err) => Err(err.to_string()),
         }
