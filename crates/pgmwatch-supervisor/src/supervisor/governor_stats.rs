@@ -14,6 +14,53 @@ use pgmwatch_core::models::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
+const SHED_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(6);
+
+#[derive(Debug, Clone)]
+struct ShedCandidate {
+    id: String,
+    configured_tier: FeedTier,
+    effective_tier: FeedTier,
+    rx_kbps: f32,
+    priority: u8,
+}
+
+/// 3-stage graceful degradation ladder across all platforms:
+/// 1. Step down `MASTER` channels (1080p60 -> 480p/SD `Simulcast`) FIRST so video stays visible.
+/// 2. Only once all `MASTER` feeds are stepped down, shed `SIMULCAST`-configured feeds to `Light` (audio-only).
+/// 3. Last resort: if still over budget after all `SIMULCAST`-configured feeds are `Light`, shed
+///    stepped-down `MASTER` feeds (`Simulcast` -> `Light`).
+///
+/// Within each stage, pick the highest current bitrate (`rx_kbps`) first so WAN drops fastest.
+fn pick_shed_victim(candidates: &[ShedCandidate]) -> Option<(String, FeedTier)> {
+    // Stage 1: MASTER (1080p60) -> SIMULCAST (<=480p)
+    if let Some(c) = candidates
+        .iter()
+        .filter(|c| c.effective_tier == FeedTier::Master)
+        .max_by_key(|c| (c.rx_kbps.max(0.0) as u64, c.priority))
+    {
+        return Some((c.id.clone(), FeedTier::Simulcast));
+    }
+
+    // Stage 2: SIMULCAST-configured feeds -> LIGHT (audio-only / lowest)
+    if let Some(c) = candidates
+        .iter()
+        .filter(|c| {
+            c.configured_tier == FeedTier::Simulcast && c.effective_tier == FeedTier::Simulcast
+        })
+        .max_by_key(|c| (c.rx_kbps.max(0.0) as u64, c.priority))
+    {
+        return Some((c.id.clone(), FeedTier::Light));
+    }
+
+    // Stage 3: Last resort — stepped-down MASTER feeds -> LIGHT
+    candidates
+        .iter()
+        .filter(|c| c.effective_tier == FeedTier::Simulcast)
+        .max_by_key(|c| (c.rx_kbps.max(0.0) as u64, c.priority))
+        .map(|c| (c.id.clone(), FeedTier::Light))
+}
+
 pub(super) fn build_stats_http_client(bind_ip: &str) -> reqwest::Client {
     let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(6));
     if let Some(ip) = (!bind_ip.trim().is_empty())
@@ -248,6 +295,25 @@ impl SupervisorState {
             (worker_count, shed, wan, max_lat)
         };
 
+        let mse_rx_mbps = {
+            let bytes = self.mse_hubs.take_rx_bytes();
+            let now = std::time::Instant::now();
+            let mut sample = self.mse_rx_sample.lock().await;
+            let elapsed = now.duration_since(sample.0).as_secs_f64();
+            if elapsed >= 0.25 {
+                let instant_mbps = ((bytes as f64) * 8.0 / (elapsed * 1_000_000.0)) as f32;
+                let smoothed = if bytes == 0 && sample.1 < 0.05 {
+                    0.0
+                } else {
+                    sample.1 * 0.4 + instant_mbps * 0.6
+                };
+                *sample = (now, smoothed);
+                smoothed
+            } else {
+                sample.1
+            }
+        };
+
         let (thumb_fps, preferred_luid) = {
             let c = self.cfg.read().await;
             let luid = if !c.media.master_gpu_luid.trim().is_empty() {
@@ -263,7 +329,7 @@ impl SupervisorState {
             gov.evaluate(
                 active_workers,
                 shed_channels,
-                wan_kbps / 1000.0,
+                (wan_kbps / 1000.0) + mse_rx_mbps,
                 max_lat_pct,
                 thumb_fps,
             )
@@ -289,35 +355,36 @@ impl SupervisorState {
         }
 
         if decision.shed_to_light {
-            // Shed highest-bitrate SIMULCAST channel to LIGHT first; if all SIMULCAST feeds are
-            // already LIGHT and WAN/GPU is still overloaded, step MASTER down 1080p60 -> 480p (Simulcast).
-            let victim: Option<(ChannelConfig, FeedTier)> = {
+            let now = std::time::Instant::now();
+            let in_cooldown = self
+                .shed_cooldown_until
+                .lock()
+                .await
+                .is_some_and(|until| now < until);
+            let victim: Option<(ChannelConfig, FeedTier)> = if in_cooldown {
+                None
+            } else {
                 let mut map = self.channels.write().await;
-                let sim_id = map
+                let candidates: Vec<ShedCandidate> = map
                     .values()
-                    .filter(|c| c.effective_tier == FeedTier::Simulcast)
-                    .max_by_key(|c| (c.rx_kbps.max(0.0) as u64, c.config.priority))
-                    .map(|c| c.config.id.clone());
-                if let Some(id) = sim_id {
+                    .filter(|c| c.config.enabled)
+                    .map(|c| ShedCandidate {
+                        id: c.config.id.clone(),
+                        configured_tier: c.config.tier,
+                        effective_tier: c.effective_tier,
+                        rx_kbps: c.rx_kbps,
+                        priority: c.config.priority,
+                    })
+                    .collect();
+                pick_shed_victim(&candidates).and_then(|(id, target_tier)| {
                     map.get_mut(&id).map(|m| {
-                        m.effective_tier = FeedTier::Light;
-                        (m.config.clone(), FeedTier::Light)
+                        m.effective_tier = target_tier;
+                        (m.config.clone(), target_tier)
                     })
-                } else {
-                    let master_id = map
-                        .values()
-                        .filter(|c| c.effective_tier == FeedTier::Master)
-                        .max_by_key(|c| (c.rx_kbps.max(0.0) as u64, c.config.priority))
-                        .map(|c| c.config.id.clone());
-                    master_id.and_then(|id| {
-                        map.get_mut(&id).map(|m| {
-                            m.effective_tier = FeedTier::Simulcast;
-                            (m.config.clone(), FeedTier::Simulcast)
-                        })
-                    })
-                }
+                })
             };
             if let Some((ch, target_tier)) = victim {
+                *self.shed_cooldown_until.lock().await = Some(now + SHED_COOLDOWN);
                 let st = Arc::clone(self);
                 tokio::spawn(async move {
                     let resolved = match st
@@ -635,5 +702,66 @@ impl SupervisorState {
         let sum = summarize_grid(&merged);
         *self.combined_pcv.write().await = sum.combined_pcv;
         *self.hours_watched.write().await = sum.hours_watched;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pick_shed_victim, ShedCandidate};
+    use pgmwatch_core::models::FeedTier;
+
+    #[test]
+    fn test_pick_shed_victim_steps_down_master_to_simulcast_before_shedding_to_light() {
+        let mut channels = vec![
+            ShedCandidate {
+                id: "yt-master-1".into(),
+                configured_tier: FeedTier::Master,
+                effective_tier: FeedTier::Master,
+                rx_kbps: 6200.0,
+                priority: 1,
+            },
+            ShedCandidate {
+                id: "yt-master-2".into(),
+                configured_tier: FeedTier::Master,
+                effective_tier: FeedTier::Master,
+                rx_kbps: 5800.0,
+                priority: 2,
+            },
+            ShedCandidate {
+                id: "fb-sim-1".into(),
+                configured_tier: FeedTier::Simulcast,
+                effective_tier: FeedTier::Simulcast,
+                rx_kbps: 1500.0,
+                priority: 3,
+            },
+        ];
+
+        // Step 1: Highest-bitrate MASTER steps down to Simulcast (480p), NOT straight to Light.
+        assert_eq!(
+            pick_shed_victim(&channels),
+            Some(("yt-master-1".into(), FeedTier::Simulcast))
+        );
+        channels[0].effective_tier = FeedTier::Simulcast;
+        channels[0].rx_kbps = 1100.0;
+
+        // Step 2: Second MASTER steps down to Simulcast BEFORE yt-master-1 or fb-sim-1 is shed to Light.
+        assert_eq!(
+            pick_shed_victim(&channels),
+            Some(("yt-master-2".into(), FeedTier::Simulcast))
+        );
+        channels[1].effective_tier = FeedTier::Simulcast;
+        channels[1].rx_kbps = 1100.0;
+
+        // Step 3: Only after ALL MASTER feeds are stepped down to 480p, shed SIMULCAST-configured feeds to Light.
+        assert_eq!(
+            pick_shed_victim(&channels),
+            Some(("fb-sim-1".into(), FeedTier::Light))
+        );
+        channels[2].effective_tier = FeedTier::Light;
+        channels[2].rx_kbps = 64.0;
+
+        // Step 4: Last resort — stepped-down MASTER feeds shed to Light.
+        let last = pick_shed_victim(&channels);
+        assert!(matches!(last, Some((ref id, FeedTier::Light)) if id == "yt-master-1" || id == "yt-master-2"));
     }
 }

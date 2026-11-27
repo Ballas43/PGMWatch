@@ -2,14 +2,10 @@ use crate::win32::{is_on_battery, query_dxgi_adapters, resolve_dxgi_adapter_inde
 use chrono::Utc;
 use pgmwatch_core::config::GovernorConfig;
 use pgmwatch_core::models::GovernorTelemetry;
-use std::time::Instant;
-use sysinfo::{Networks, System};
+use sysinfo::System;
 
 pub struct ResourceGovernor {
     sys: System,
-    networks: Networks,
-    last_net_sample: Instant,
-    os_wan_rx_mbps: f32,
     cfg: GovernorConfig,
     last_wan_rx_mbps: f32,
     preferred_gpu_luid: String,
@@ -41,55 +37,12 @@ impl ResourceGovernor {
     pub fn new(cfg: GovernorConfig) -> Self {
         let mut sys = System::new_all();
         sys.refresh_all();
-        let networks = Networks::new_with_refreshed_list();
         Self {
             sys,
-            networks,
-            last_net_sample: Instant::now(),
-            os_wan_rx_mbps: 0.0,
             cfg,
             last_wan_rx_mbps: 0.0,
             preferred_gpu_luid: String::new(),
         }
-    }
-
-    fn sample_os_wan_rx_mbps(&mut self) -> f32 {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_net_sample).as_secs_f64();
-        if elapsed < 0.25 {
-            return self.os_wan_rx_mbps;
-        }
-        self.last_net_sample = now;
-        self.networks.refresh(true);
-        let mut max_rx_bytes: u64 = 0;
-        for (name, data) in &self.networks {
-            let lower = name.to_ascii_lowercase();
-            // Skip loopback and Windows virtual/filter/bridge pseudo-adapters that mirror physical
-            // NIC traffic and would otherwise double-count Ethernet throughput.
-            if lower.contains("loopback")
-                || lower == "lo"
-                || lower.contains("vethernet")
-                || lower.contains("wfp")
-                || lower.contains("filter")
-                || lower.contains("pseudo")
-                || lower.contains("teredo")
-                || lower.contains("isatap")
-                || lower.contains("vmware")
-                || lower.contains("virtualbox")
-            {
-                continue;
-            }
-            max_rx_bytes = max_rx_bytes.max(data.received());
-        }
-        let instant_mbps = ((max_rx_bytes as f64) * 8.0 / (elapsed * 1_000_000.0)) as f32;
-        if instant_mbps.is_finite() && instant_mbps >= 0.0 {
-            self.os_wan_rx_mbps = if self.os_wan_rx_mbps <= 0.01 {
-                instant_mbps
-            } else {
-                self.os_wan_rx_mbps * 0.5 + instant_mbps * 0.5
-            };
-        }
-        self.os_wan_rx_mbps
     }
 
     pub fn update_config(&mut self, cfg: GovernorConfig) {
@@ -138,14 +91,18 @@ impl ResourceGovernor {
         &mut self,
         active_workers: usize,
         shed_channels: usize,
-        worker_wan_rx_mbps: f32,
+        app_wan_rx_mbps: f32,
         max_decode_latency_pct: f32,
         nominal_thumb_fps: f32,
     ) -> GovernorDecision {
-        // Measure real host NIC RX (captures MSE Live 60p, muxed LIGHT downloads, and HTTP overhead)
-        // and take max with reported worker media bitrates so the UI & WAN cap reflect actual load.
-        let os_rx_mbps = self.sample_os_wan_rx_mbps();
-        let wan_rx_mbps = worker_wan_rx_mbps.max(os_rx_mbps);
+        // Track ONLY PGMWatch's own measured download traffic (workers + Live 60p MSE hubs).
+        // Sampling host-wide OS NIC counters would falsely count unrelated local LAN video
+        // (e.g., OBS/vMix NDI feeds on Ethernet) as PGMWatch internet consumption.
+        let wan_rx_mbps = if app_wan_rx_mbps.is_finite() && app_wan_rx_mbps >= 0.0 {
+            app_wan_rx_mbps
+        } else {
+            0.0
+        };
         self.last_wan_rx_mbps = wan_rx_mbps;
         self.sys.refresh_memory();
         self.sys.refresh_cpu_usage();

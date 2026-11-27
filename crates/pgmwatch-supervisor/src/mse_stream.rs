@@ -5,7 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex as AsyncMutex, Notify};
@@ -39,6 +39,7 @@ fn find_ffmpeg_bin() -> String {
 
 pub struct MseHubManager {
     hubs: AsyncMutex<HashMap<String, Arc<MseChannelHub>>>,
+    rx_bytes_total: Arc<AtomicU64>,
 }
 
 impl Default for MseHubManager {
@@ -51,7 +52,12 @@ impl MseHubManager {
     pub fn new() -> Self {
         Self {
             hubs: AsyncMutex::new(HashMap::new()),
+            rx_bytes_total: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn take_rx_bytes(&self) -> u64 {
+        self.rx_bytes_total.swap(0, Ordering::Relaxed)
     }
 
     pub async fn invalidate(&self, channel_id: &str) {
@@ -90,12 +96,14 @@ impl MseHubManager {
                     Arc::clone(existing)
                 } else {
                     existing.stop();
-                    let created = MseChannelHub::spawn(media, job_guard)?;
+                    let created =
+                        MseChannelHub::spawn(media, job_guard, Arc::clone(&self.rx_bytes_total))?;
                     map.insert(channel_id.to_string(), Arc::clone(&created));
                     created
                 }
             } else {
-                let created = MseChannelHub::spawn(media, job_guard)?;
+                let created =
+                    MseChannelHub::spawn(media, job_guard, Arc::clone(&self.rx_bytes_total))?;
                 map.insert(channel_id.to_string(), Arc::clone(&created));
                 created
             }
@@ -120,6 +128,7 @@ pub struct MseChannelHub {
     active_subs: AtomicUsize,
     idle_since: Mutex<Option<Instant>>,
     closed: AtomicBool,
+    rx_bytes_total: Arc<AtomicU64>,
 }
 
 pub struct MseSubscription {
@@ -227,7 +236,11 @@ fn build_ffmpeg_fmp4_args(media: &ResolvedMedia) -> Vec<String> {
 }
 
 impl MseChannelHub {
-    fn spawn(media: &ResolvedMedia, job_guard: Arc<WindowsJobGuard>) -> anyhow::Result<Arc<Self>> {
+    fn spawn(
+        media: &ResolvedMedia,
+        job_guard: Arc<WindowsJobGuard>,
+        rx_bytes_total: Arc<AtomicU64>,
+    ) -> anyhow::Result<Arc<Self>> {
         let ffmpeg = find_ffmpeg_bin();
         let args = build_ffmpeg_fmp4_args(media);
 
@@ -260,6 +273,7 @@ impl MseChannelHub {
             active_subs: AtomicUsize::new(0),
             idle_since: Mutex::new(Some(Instant::now())),
             closed: AtomicBool::new(false),
+            rx_bytes_total,
         });
 
         let reader_hub = Arc::clone(&hub);
@@ -394,6 +408,7 @@ fn pump_fmp4_boxes(mut stdout: std::process::ChildStdout, hub: &MseChannelHub) {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
+        hub.rx_bytes_total.fetch_add(n as u64, Ordering::Relaxed);
         raw_buf.extend_from_slice(&read_tmp[..n]);
 
         let mut consumed = 0usize;
