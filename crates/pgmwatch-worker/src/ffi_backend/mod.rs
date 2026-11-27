@@ -422,18 +422,18 @@ fn sync_split_av_peer(
     if want_audio && !want_video {
         let vp = shared.telemetry.lock().ok().and_then(|t| t.last_video_pts_ms);
         if let Some(v) = vp
-            && p > v + 220
+            && p > v + 80
             && p - v < 15_000
         {
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(15));
         }
     } else if want_video && !want_audio {
         let ap = shared.telemetry.lock().ok().and_then(|t| t.last_audio_pts_ms);
         if let Some(a) = ap
-            && p > a + 350
+            && p > a + 80
             && p - a < 15_000
         {
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(15));
         }
     }
 }

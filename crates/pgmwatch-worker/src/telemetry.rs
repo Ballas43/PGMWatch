@@ -184,20 +184,21 @@ impl AvSyncTracker {
             return self.smoothed_drift_ms;
         }
 
-        let max_normal_interleave_ms = if self.split_av_pair { 500.0 } else { 350.0 };
+        // HLS/DASH muxers and split A/V HTTP threads can legitimately carry a steady 200-500ms
+        // interleave/buffer offset without any playback lip-sync error. Only genuine large
+        // container PTS mismatches (>600ms muxed, >800ms split) bypass baseline calibration.
+        let max_normal_interleave_ms = if self.split_av_pair { 800.0 } else { 600.0 };
 
         if self.baseline_offset_ms.is_none() {
             let started = *self.cal_started_at.get_or_insert(now);
-            if raw_offset_ms.abs() <= 5_000.0 && self.cal_samples.len() < 120 {
+            if raw_offset_ms.abs() <= 5_000.0 && self.cal_samples.len() < 240 {
                 self.cal_samples.push(raw_offset_ms);
             }
             let elapsed = now.saturating_duration_since(started);
-            if self.cal_samples.len() >= 25 && elapsed >= Duration::from_millis(1_200) {
+            if self.cal_samples.len() >= 40 && elapsed >= Duration::from_millis(2_500) {
                 self.cal_samples
                     .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 let med = self.cal_samples[self.cal_samples.len() / 2];
-                // Only absorb plausible muxer interleave / B-frame pipeline offsets.
-                // Genuine large container PTS mismatches (>350ms muxed, >500ms split) are kept.
                 self.baseline_offset_ms = Some(if med.abs() <= max_normal_interleave_ms {
                     med
                 } else {
@@ -217,9 +218,29 @@ impl AvSyncTracker {
         }
 
         let baseline = self.baseline_offset_ms.unwrap_or(0.0);
-        let drift_ms = (raw_offset_ms - baseline).clamp(-5_000.0, 5_000.0);
-        let alpha = if self.split_av_pair { 0.10 } else { 0.15 };
-        self.smoothed_drift_ms = self.smoothed_drift_ms * (1.0 - alpha) + drift_ms * alpha;
+        let raw_drift = (raw_offset_ms - baseline).clamp(-5_000.0, 5_000.0);
+        // Apply a soft deadband for normal HLS segment-burst / split-HTTP thread scheduling jitter
+        // while keeping track stalls (>1.5s) and sustained encoder clock drift completely visible.
+        let deadband_ms = if wall_delta_ms.abs() > 1_500.0 {
+            0.0
+        } else if self.split_av_pair {
+            120.0
+        } else {
+            40.0
+        };
+        let effective_drift = if raw_drift.abs() <= deadband_ms {
+            0.0
+        } else {
+            raw_drift - deadband_ms.copysign(raw_drift)
+        };
+        let alpha = if wall_delta_ms.abs() > 1_500.0 {
+            0.15
+        } else if self.split_av_pair {
+            0.03
+        } else {
+            0.05
+        };
+        self.smoothed_drift_ms = self.smoothed_drift_ms * (1.0 - alpha) + effective_drift * alpha;
         self.smoothed_drift_ms
     }
 }
@@ -325,28 +346,28 @@ mod tests {
         let mut tracker = AvSyncTracker::new(false);
         let t0 = Instant::now();
 
-        // Simulate a healthy YouTube HLS stream with constant -92ms muxing/B-frame offset
-        for i in 0..40 {
+        // Simulate a healthy YouTube HLS stream with constant -350ms muxing/B-frame offset
+        for i in 0..80 {
             let now = t0 + Duration::from_millis(i * 40);
             let vp = 10_000 + (i as i64) * 40;
-            let ap = vp - 92;
+            let ap = vp - 350;
             tracker.push_video(vp, now);
             let drift = tracker.push_audio(ap, now);
             assert!(drift.abs() < 5.0, "healthy stream false drift at i={i}: {drift}");
         }
 
-        // Now inject real +220ms encoder clock drift over subsequent frames
+        // Now inject real +260ms encoder clock drift over subsequent frames
         let mut last_drift = 0.0;
-        for i in 40..80 {
+        for i in 80..200 {
             let now = t0 + Duration::from_millis(i * 40);
             let vp = 10_000 + (i as i64) * 40;
-            let ap = vp - 92 + 220;
+            let ap = vp - 350 + 260;
             tracker.push_video(vp, now);
             last_drift = tracker.push_audio(ap, now);
         }
         assert!(
-            last_drift > 190.0 && last_drift < 230.0,
-            "expected ~+220ms real drift, got {last_drift}"
+            last_drift > 180.0 && last_drift < 235.0,
+            "expected ~+220ms effective drift (260ms - 40ms deadband), got {last_drift}"
         );
     }
 
@@ -355,12 +376,12 @@ mod tests {
         let mut tracker = AvSyncTracker::new(false);
         let t0 = Instant::now();
 
-        // Broken encoder where audio PTS starts +800ms ahead of video PTS
+        // Broken encoder where audio PTS starts +850ms ahead of video PTS
         let mut last_drift = 0.0;
-        for i in 0..45 {
+        for i in 0..120 {
             let now = t0 + Duration::from_millis(i * 40);
             let vp = 10_000 + (i as i64) * 40;
-            let ap = vp + 800;
+            let ap = vp + 850;
             tracker.push_video(vp, now);
             last_drift = tracker.push_audio(ap, now);
         }
@@ -375,8 +396,8 @@ mod tests {
         let mut tracker = AvSyncTracker::new(false);
         let t0 = Instant::now();
 
-        // Calibrate healthy stream with -60ms interleave
-        for i in 0..40 {
+        // Calibrate healthy stream with -60ms interleave (~3.2s)
+        for i in 0..80 {
             let now = t0 + Duration::from_millis(i * 40);
             let vp = 10_000 + (i as i64) * 40;
             tracker.push_video(vp, now);
@@ -385,7 +406,7 @@ mod tests {
 
         // Video stalls while audio keeps advancing for 2.5 seconds
         let mut last_drift = 0.0;
-        for i in 40..105 {
+        for i in 80..145 {
             let now = t0 + Duration::from_millis(i * 40);
             let ap = 10_000 + (i as i64) * 40 - 60;
             last_drift = tracker.push_audio(ap, now);
