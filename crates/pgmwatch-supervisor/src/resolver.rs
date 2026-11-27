@@ -628,9 +628,11 @@ fn select_streamlink_quality(platform: Platform, tier: FeedTier) -> &'static str
         (Platform::Youtube, FeedTier::Simulcast) => "480p,360p,worst",
         (Platform::Youtube, FeedTier::Light) => "audio_only,360p,480p,worst",
         (Platform::Tiktok | Platform::Bigo, FeedTier::Simulcast) => {
-            "sd,ld,480p,360p,hd,origin,best"
+            "h264_sd,h265_sd,sd,h264_ld,h265_ld,ld,480p,360p,worst"
         }
-        (Platform::Tiktok | Platform::Bigo, FeedTier::Light) => "audio_only,ld,sd,360p,worst",
+        (Platform::Tiktok | Platform::Bigo, FeedTier::Light) => {
+            "h264_ao,h265_ao,audio_only,h265_ld,h264_ld,ld,sd,360p,worst"
+        }
         (_, FeedTier::Light) => "audio_only,160p,360p,480p,worst",
         _ => "480p,360p,worst",
     }
@@ -1235,8 +1237,11 @@ mod tests {
 
         assert_eq!(
             select_streamlink_quality(Platform::Tiktok, FeedTier::Light),
-            "audio_only,ld,sd,360p,worst"
+            "h264_ao,h265_ao,audio_only,h265_ld,h264_ld,ld,sd,360p,worst"
         );
+        let tt_sim = select_streamlink_quality(Platform::Tiktok, FeedTier::Simulcast);
+        assert!(tt_sim.contains("h265_sd"));
+        assert!(!tt_sim.ends_with(",best"));
         assert_eq!(
             select_streamlink_quality(Platform::Twitch, FeedTier::Light),
             "audio_only,160p,360p,480p,worst"

@@ -58,11 +58,22 @@ impl ManifestProbe {
             || lower.contains("playlist")
             || lower.contains("manifest");
 
+        // Continuous HTTP media streams (e.g. TikTok/Bigo live HTTP-FLV) have no text manifest.
+        // Live FLV CDNs ignore Range headers and push multi-megabyte fast-start GOP bursts on every
+        // GET, which would burn tens of Mbps every 2s across workers while FFmpeg already monitors
+        // the live socket directly.
+        if !is_playlist_url {
+            return ProbeOutcome {
+                ad_break: false,
+                stalled: false,
+                cdn_starvation: false,
+                cdn_ratio: 0.18,
+                token_expired: false,
+            };
+        }
+
         let started = Instant::now();
         let mut req = self.client.get(url);
-        if !is_playlist_url {
-            req = req.header(reqwest::header::RANGE, "bytes=0-1023");
-        }
         for (k, v) in headers {
             req = req.header(k.as_str(), v.as_str());
         }
@@ -269,10 +280,14 @@ https://cdn.example.net/ad.ts
     #[tokio::test]
     async fn test_manifest_probe_skips_rtmp_and_srt() {
         let mut probe = ManifestProbe::new(None).unwrap();
-        for url in ["rtmp://127.0.0.1:1935/live/test", "srt://127.0.0.1:9000?mode=caller"] {
+        for url in [
+            "rtmp://127.0.0.1:1935/live/test",
+            "srt://127.0.0.1:9000?mode=caller",
+            "http://127.0.0.1:1/game/stream-12345_ld5.flv?expire=999",
+        ] {
             for _ in 0..4 {
                 let res = probe.probe(url, &[]).await;
-                assert!(!res.stalled, "expected non-HTTP probe never stalled for {url}");
+                assert!(!res.stalled, "expected continuous stream probe never stalled for {url}");
                 assert!(!res.token_expired);
             }
         }
