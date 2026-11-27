@@ -269,6 +269,10 @@ pub struct ShowPreset {
     pub show_id: String,
     pub title: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_start_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_end_at: Option<DateTime<Utc>>,
     pub groups: Vec<LanguageGroupConfig>,
     pub channels: Vec<ChannelConfig>,
 }

@@ -74,6 +74,8 @@ export interface ShowPreset {
   show_id: string;
   title: string;
   created_at: string;
+  scheduled_start_at?: string | null;
+  scheduled_end_at?: string | null;
   groups: LanguageGroupConfig[];
   channels: ChannelConfig[];
 }

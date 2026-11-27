@@ -16,7 +16,8 @@ use pgmwatch_core::config::PgmWatchConfig;
 use pgmwatch_core::db::DbCommand;
 use pgmwatch_core::export::build_accounting_workbook;
 use pgmwatch_core::grid::{
-    apply_overrides_to_samples, prepare_accounting_samples, slice_matches, summarize_grid,
+    apply_overrides_to_samples, filter_samples_by_window, prepare_accounting_samples,
+    slice_matches, summarize_grid,
 };
 use pgmwatch_core::models::{FeedTier, LanguageGroupConfig, ManualOverride, Platform, ShowPreset};
 use serde::{Deserialize, Serialize};
@@ -38,10 +39,17 @@ pub(super) async fn get_accounting(State(st): State<Arc<SupervisorState>>) -> im
     let samples = st.db.load_grid_samples(None).await.unwrap_or_default();
     let overrides = st.overrides.read().await.clone();
     let matches = st.matches.read().await.clone();
-    let show_channels = st.show.read().await.channels.clone();
-    let merged = prepare_accounting_samples(
-        &apply_overrides_to_samples(&samples, &overrides),
-        &show_channels,
+    let (show_channels, sched_start, sched_end) = {
+        let s = st.show.read().await;
+        (s.channels.clone(), s.scheduled_start_at, s.scheduled_end_at)
+    };
+    let merged = filter_samples_by_window(
+        prepare_accounting_samples(
+            &apply_overrides_to_samples(&samples, &overrides),
+            &show_channels,
+        ),
+        sched_start,
+        sched_end,
     );
     let summary = summarize_grid(&merged);
     let match_slices = slice_matches(&merged, &matches);
@@ -108,6 +116,37 @@ pub(super) async fn post_show_preset(
             .into_response();
     }
     st.apply_show_preset(preset).await;
+    Json(st.snapshot().await).into_response()
+}
+
+#[derive(Deserialize)]
+pub(super) struct ShowScheduleReq {
+    scheduled_start_at: Option<chrono::DateTime<Utc>>,
+    scheduled_end_at: Option<chrono::DateTime<Utc>>,
+}
+
+pub(super) async fn post_show_schedule(
+    State(st): State<Arc<SupervisorState>>,
+    Json(req): Json<ShowScheduleReq>,
+) -> Response {
+    if let (Some(start), Some(end)) = (req.scheduled_start_at, req.scheduled_end_at)
+        && end <= start
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Stream end time must be after stream push (start) time." })),
+        )
+            .into_response();
+    }
+    let updated = {
+        let mut s = st.show.write().await;
+        s.scheduled_start_at = req.scheduled_start_at;
+        s.scheduled_end_at = req.scheduled_end_at;
+        s.clone()
+    };
+    st.persist_show_preset(&updated).await;
+    st.recompute_live_accounting_totals().await;
+    st.broadcast_snapshot().await;
     Json(st.snapshot().await).into_response()
 }
 
@@ -325,6 +364,8 @@ pub(super) async fn post_create_show(
         show_id: format!("show-{suffix}"),
         title: title.to_string(),
         created_at: Utc::now(),
+        scheduled_start_at: None,
+        scheduled_end_at: None,
         groups: vec![LanguageGroupConfig {
             id: group_id,
             name: group_name,

@@ -271,6 +271,8 @@ pub fn default_show_preset() -> ShowPreset {
         show_id: "default-show".to_string(),
         title: "PGMWatch Live Broadcast".to_string(),
         created_at: Utc::now(),
+        scheduled_start_at: None,
+        scheduled_end_at: None,
         groups: vec![
             LanguageGroupConfig {
                 id: "id-pgm".to_string(),

@@ -4,10 +4,13 @@ use crate::worker_bridge::send_worker_cmd;
 use chrono::Utc;
 use pgmwatch_core::db::DbCommand;
 use pgmwatch_core::grid::{
-    apply_overrides_to_samples, floor_to_minute_utc, prepare_accounting_samples, summarize_grid,
+    apply_overrides_to_samples, filter_samples_by_window, floor_to_minute_utc,
+    prepare_accounting_samples, summarize_grid,
 };
 use pgmwatch_core::ipc::SupervisorToWorker;
-use pgmwatch_core::models::{ChannelConfig, FeedTier, GridSample, MetricStatus, Platform, TriStateMetric};
+use pgmwatch_core::models::{
+    AlertState, ChannelConfig, FeedTier, GridSample, MetricStatus, Platform, TriStateMetric,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -47,6 +50,116 @@ impl SupervisorState {
                 let _ = gov_state.ws_tx.send(WsBroadcast::Snapshot {
                     snapshot: Box::new(snap),
                 });
+            }
+        });
+
+        // Auto-poll enabled Offline / ExtractorErr channels so pre-live links seamlessly go live
+        // without requiring manual Retry clicks. Polls every 20s near/during broadcast (60s far outside).
+        let offline_state = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(20));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Skip the immediate t=0 tick so initial startup workers finish resolving first.
+            interval.tick().await;
+            let mut shutdown_rx = offline_state.subscribe_shutdown();
+            let mut poll_tick = 0u64;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = shutdown_rx.changed() => break,
+                }
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+                poll_tick += 1;
+
+                let (sched_start, sched_end) = {
+                    let s = offline_state.show.read().await;
+                    (s.scheduled_start_at, s.scheduled_end_at)
+                };
+                let now = Utc::now();
+                let far_outside_window = sched_start
+                    .is_some_and(|st| now < st - chrono::Duration::minutes(15))
+                    || sched_end.is_some_and(|en| now > en + chrono::Duration::minutes(15));
+                if far_outside_window && poll_tick % 3 != 1 {
+                    continue;
+                }
+
+                let active_worker_ids: std::collections::HashSet<String> = {
+                    let workers = offline_state.workers.lock().await;
+                    workers.keys().cloned().collect()
+                };
+                let candidates: Vec<(ChannelConfig, FeedTier)> = {
+                    let map = offline_state.channels.read().await;
+                    map.values()
+                        .filter(|m| {
+                            m.config.enabled
+                                && !active_worker_ids.contains(&m.config.id)
+                                && matches!(
+                                    m.tracker.state,
+                                    AlertState::Offline | AlertState::ExtractorErr
+                                )
+                        })
+                        .map(|m| (m.config.clone(), m.effective_tier))
+                        .collect()
+                };
+
+                for (ch, eff_tier) in candidates {
+                    let st = Arc::clone(&offline_state);
+                    tokio::spawn(async move {
+                        st.resolver.invalidate_url(&ch.url).await;
+                        match st
+                            .resolver
+                            .resolve(&ch.url, ch.platform, eff_tier, ch.live_streams_only)
+                            .await
+                        {
+                            Ok(_) => {
+                                // Cache now holds the live resolved media URL; spawn worker immediately.
+                                let still_offline = {
+                                    let map = st.channels.read().await;
+                                    map.get(&ch.id).is_some_and(|m| {
+                                        m.config.enabled
+                                            && m.config.url == ch.url
+                                            && matches!(
+                                                m.tracker.state,
+                                                AlertState::Offline | AlertState::ExtractorErr
+                                            )
+                                    })
+                                };
+                                if still_offline {
+                                    tracing::info!(
+                                        channel_id = %ch.id,
+                                        "Pre-live/offline stream is now live; auto-starting worker"
+                                    );
+                                    st.reload_channel_worker(&ch.id).await;
+                                }
+                            }
+                            Err(crate::resolver::ResolveError::LoginGated(msg)) => {
+                                if let Some(m) = st.channels.write().await.get_mut(&ch.id)
+                                    && m.config.enabled
+                                    && m.config.url == ch.url
+                                {
+                                    m.tracker.set_external_state(AlertState::LoginGated, msg);
+                                }
+                            }
+                            Err(crate::resolver::ResolveError::Offline(_)) => {
+                                if let Some(m) = st.channels.write().await.get_mut(&ch.id)
+                                    && m.config.enabled
+                                    && m.config.url == ch.url
+                                    && m.tracker.state == AlertState::Offline
+                                {
+                                    m.tracker.set_external_state(
+                                        AlertState::Offline,
+                                        "Waiting for live stream (auto-checking every 20s)",
+                                    );
+                                }
+                            }
+                            Err(crate::resolver::ResolveError::ExtractorFailed(_)) => {
+                                // Keep existing status reason until stream comes online.
+                            }
+                        }
+                    });
+                }
             }
         });
 
@@ -430,11 +543,30 @@ impl SupervisorState {
             }
             cache.values().cloned().collect()
         };
+        self.recompute_live_accounting_from_samples(&samples).await;
+    }
+
+    pub async fn recompute_live_accounting_totals(&self) {
+        let samples: Vec<GridSample> = {
+            let cache = self.grid_samples.read().await;
+            cache.values().cloned().collect()
+        };
+        self.recompute_live_accounting_from_samples(&samples).await;
+    }
+
+    async fn recompute_live_accounting_from_samples(&self, samples: &[GridSample]) {
         let overrides = self.overrides.read().await.clone();
-        let show_channels = self.show.read().await.channels.clone();
-        let merged = prepare_accounting_samples(
-            &apply_overrides_to_samples(&samples, &overrides),
-            &show_channels,
+        let (show_channels, sched_start, sched_end) = {
+            let s = self.show.read().await;
+            (s.channels.clone(), s.scheduled_start_at, s.scheduled_end_at)
+        };
+        let merged = filter_samples_by_window(
+            prepare_accounting_samples(
+                &apply_overrides_to_samples(samples, &overrides),
+                &show_channels,
+            ),
+            sched_start,
+            sched_end,
         );
         let sum = summarize_grid(&merged);
         *self.combined_pcv.write().await = sum.combined_pcv;

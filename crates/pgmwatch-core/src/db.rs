@@ -773,6 +773,8 @@ mod tests {
             show_id: "show-alpha".into(),
             title: "Alpha Event".into(),
             created_at: Utc::now(),
+            scheduled_start_at: None,
+            scheduled_end_at: None,
             groups: vec![crate::models::LanguageGroupConfig {
                 id: "grp-en".into(),
                 name: "English".into(),

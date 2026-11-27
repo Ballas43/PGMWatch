@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { RotateCcw } from "lucide-react";
+import { CalendarClock, RotateCcw, X } from "lucide-react";
 import { AccountingResponse, DashboardSnapshot } from "../types";
 import { ANALYTICS_GLOSSARY } from "../utils/analyticsGlossary";
 import { getDeviceTimeZoneLabel } from "../utils/time";
@@ -7,6 +7,22 @@ import { formatTriStateCompact } from "../utils/telemetry";
 import { CcvTimelineChart } from "./CcvTimelineChart";
 import { InfoTip } from "./InfoTip";
 import { ManualOverrideForm } from "./ManualOverrideForm";
+
+function isoToLocalInput(iso?: string | null): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function localInputToIso(val: string): string | null {
+  const trimmed = val.trim();
+  if (!trimmed) return null;
+  const d = new Date(trimmed);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
 
 interface AccountingViewProps {
   snapshot: DashboardSnapshot | null;
@@ -17,6 +33,20 @@ export function AccountingView({ snapshot, onRefresh }: AccountingViewProps) {
   const [accounting, setAccounting] = useState<AccountingResponse | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
   const [resetting, setResetting] = useState(false);
+  const [startInput, setStartInput] = useState(() => isoToLocalInput(snapshot?.show.scheduled_start_at));
+  const [endInput, setEndInput] = useState(() => isoToLocalInput(snapshot?.show.scheduled_end_at));
+  const [savingWindow, setSavingWindow] = useState(false);
+  const [windowErr, setWindowErr] = useState<string | null>(null);
+
+  const showId = snapshot?.show.show_id;
+  const savedStart = snapshot?.show.scheduled_start_at ?? null;
+  const savedEnd = snapshot?.show.scheduled_end_at ?? null;
+
+  useEffect(() => {
+    setStartInput(isoToLocalInput(savedStart));
+    setEndInput(isoToLocalInput(savedEnd));
+    setWindowErr(null);
+  }, [showId, savedStart, savedEnd]);
 
   const loadAccounting = async () => {
     const res = await fetch("/api/accounting");
@@ -30,6 +60,32 @@ export function AccountingView({ snapshot, onRefresh }: AccountingViewProps) {
     const t = window.setInterval(() => void loadAccounting(), 10000);
     return () => window.clearInterval(t);
   }, []);
+
+  const saveScheduleWindow = async (nextStart: string | null, nextEnd: string | null) => {
+    setSavingWindow(true);
+    setWindowErr(null);
+    try {
+      const res = await fetch("/api/show/schedule", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          scheduled_start_at: nextStart,
+          scheduled_end_at: nextEnd,
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+        setWindowErr(body.error ?? `Failed to save window (HTTP ${res.status})`);
+        return;
+      }
+      await loadAccounting();
+      onRefresh();
+    } catch (err) {
+      setWindowErr(err instanceof Error ? err.message : "Network error");
+    } finally {
+      setSavingWindow(false);
+    }
+  };
 
   const resetGraph = async () => {
     if (!confirmReset) {
@@ -78,6 +134,103 @@ export function AccountingView({ snapshot, onRefresh }: AccountingViewProps) {
           <span>{resetting ? "Resetting..." : confirmReset ? "Click Again to Confirm Reset" : "Reset Graph"}</span>
         </button>
       </div>
+
+      <section className="rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-card)] px-4 py-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <CalendarClock size={14} strokeWidth={1.5} className="text-[var(--text-muted)]" aria-hidden="true" />
+            <h2 className="text-xs font-semibold text-[var(--text-primary)]">
+              Broadcast Push & End Window ({getDeviceTimeZoneLabel()})
+            </h2>
+            {(savedStart || savedEnd) ? (
+              <span className="rounded border border-[var(--positive)]/40 bg-[var(--positive-soft)] px-2 py-0.5 text-[11px] font-mono-tabular text-[var(--positive-text)]">
+                Window active · pre-show & post-show excluded from analytics & Excel
+              </span>
+            ) : (
+              <span className="text-xs text-[var(--text-muted)]">
+                Optional — set when the engineer pushes & ends the stream for exact PCV/ACV/Hours Watched
+              </span>
+            )}
+          </div>
+          {(savedStart || savedEnd || startInput || endInput) && (
+            <button
+              type="button"
+              disabled={savingWindow}
+              onClick={() => {
+                setStartInput("");
+                setEndInput("");
+                void saveScheduleWindow(null, null);
+              }}
+              className="inline-flex h-7 items-center gap-1 rounded border border-[var(--border-hairline)] bg-[var(--bg-raised)] px-2 text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] disabled:opacity-50"
+            >
+              <X size={12} strokeWidth={1.5} />
+              <span>Clear Window</span>
+            </button>
+          )}
+        </div>
+
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            void saveScheduleWindow(localInputToIso(startInput), localInputToIso(endInput));
+          }}
+          className="mt-2.5 flex flex-wrap items-end gap-2.5"
+        >
+          <label className="flex flex-col gap-1 text-[11px] text-[var(--text-muted)]">
+            <span>Stream Push (Start)</span>
+            <div className="flex items-center gap-1">
+              <input
+                type="datetime-local"
+                value={startInput}
+                onChange={(e) => setStartInput(e.target.value)}
+                className="h-8 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-raised)] px-2 text-xs font-mono-tabular text-[var(--text-primary)]"
+              />
+              <button
+                type="button"
+                onClick={() => setStartInput(isoToLocalInput(new Date().toISOString()))}
+                className="h-8 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-raised)] px-2 text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                title="Set start time to current time"
+              >
+                Now
+              </button>
+            </div>
+          </label>
+
+          <label className="flex flex-col gap-1 text-[11px] text-[var(--text-muted)]">
+            <span>Stream End</span>
+            <div className="flex items-center gap-1">
+              <input
+                type="datetime-local"
+                value={endInput}
+                onChange={(e) => setEndInput(e.target.value)}
+                className="h-8 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-raised)] px-2 text-xs font-mono-tabular text-[var(--text-primary)]"
+              />
+              <button
+                type="button"
+                onClick={() => setEndInput(isoToLocalInput(new Date().toISOString()))}
+                className="h-8 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-raised)] px-2 text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                title="Set end time to current time"
+              >
+                Now
+              </button>
+            </div>
+          </label>
+
+          <button
+            type="submit"
+            disabled={savingWindow}
+            className="inline-flex h-8 items-center rounded-lg bg-[var(--text-primary)] px-3 text-xs font-medium text-[var(--bg-rail)] transition-opacity hover:opacity-90 disabled:opacity-50"
+          >
+            {savingWindow ? "Saving..." : "Apply Window"}
+          </button>
+
+          {windowErr && (
+            <span className="text-xs text-[var(--negative-text)]" role="alert">
+              {windowErr}
+            </span>
+          )}
+        </form>
+      </section>
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
         <div className="rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-card)] p-5">

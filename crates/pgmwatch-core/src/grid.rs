@@ -98,6 +98,38 @@ pub fn prepare_accounting_samples(
         .collect()
 }
 
+/// Filter program-time 1-minute samples to the configured broadcast push/end window (inclusive).
+/// Samples before `start_at` (pre-show waiting room / rehearsal) or after `end_at` (post-show tail)
+/// are excluded from PCV, ACV, Hours Watched, timeline, and Excel exports.
+pub fn filter_samples_by_window(
+    samples: Vec<GridSample>,
+    start_at: Option<DateTime<Utc>>,
+    end_at: Option<DateTime<Utc>>,
+) -> Vec<GridSample> {
+    if start_at.is_none() && end_at.is_none() {
+        return samples;
+    }
+    let start_bucket = start_at.map(floor_to_minute_utc);
+    let end_bucket = end_at.map(floor_to_minute_utc);
+    samples
+        .into_iter()
+        .filter(|s| {
+            let b = floor_to_minute_utc(s.bucket_utc);
+            if let Some(sb) = start_bucket
+                && b < sb
+            {
+                return false;
+            }
+            if let Some(eb) = end_bucket
+                && b > eb
+            {
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
 pub fn summarize_grid(samples: &[GridSample]) -> AccountingSummary {
     let mut by_bucket: BTreeMap<DateTime<Utc>, Vec<&GridSample>> = BTreeMap::new();
     for s in samples {
@@ -370,5 +402,45 @@ mod tests {
             }],
         );
         assert_eq!(slices[0].pcv, 5400);
+    }
+
+    #[test]
+    fn test_filter_samples_by_window_excludes_preshow_and_postshow() {
+        let t_pre = Utc.with_ymd_and_hms(2026, 11, 27, 11, 55, 0).unwrap();
+        let t_start = Utc.with_ymd_and_hms(2026, 11, 27, 12, 0, 0).unwrap();
+        let t_mid = Utc.with_ymd_and_hms(2026, 11, 27, 12, 30, 0).unwrap();
+        let t_end = Utc.with_ymd_and_hms(2026, 11, 27, 13, 0, 0).unwrap();
+        let t_post = Utc.with_ymd_and_hms(2026, 11, 27, 13, 5, 0).unwrap();
+
+        let mk = |bucket_utc, ccv| GridSample {
+            bucket_utc,
+            channel_id: "ch1".into(),
+            group_id: "g1".into(),
+            platform: crate::models::Platform::Youtube,
+            ccv: Some(ccv),
+            ccv_status: MetricStatus::Value,
+            source: MetricSource::AutoViewer,
+            views: None,
+            likes: None,
+            chat_msgs: None,
+            shares: None,
+            gifts: None,
+            coverage_pct: 100.0,
+            extras_json: HashMap::new(),
+        };
+
+        let samples = vec![
+            mk(t_pre, 50),
+            mk(t_start, 1000),
+            mk(t_mid, 5000),
+            mk(t_end, 2000),
+            mk(t_post, 100),
+        ];
+
+        let filtered = filter_samples_by_window(samples, Some(t_start), Some(t_end));
+        assert_eq!(filtered.len(), 3);
+        let sum = summarize_grid(&filtered);
+        assert_eq!(sum.total_minutes, 3);
+        assert_eq!(sum.combined_pcv, 5000);
     }
 }

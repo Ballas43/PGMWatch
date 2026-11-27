@@ -44,6 +44,7 @@ pub fn build_router(state: Arc<SupervisorState>) -> Router {
         .route("/api/export.xlsx", get(routes::download_xlsx))
         .route("/api/show", post(routes::post_show_preset))
         .route("/api/show/title", post(routes::post_show_title))
+        .route("/api/show/schedule", post(routes::post_show_schedule))
         .route("/api/shows", get(routes::list_shows))
         .route("/api/shows/create", post(routes::post_create_show))
         .route("/api/shows/import", post(routes::post_import_show))
@@ -287,6 +288,8 @@ mod tests {
             show_id: "show-1".into(),
             title: "Main Event".into(),
             created_at: chrono::Utc::now(),
+            scheduled_start_at: None,
+            scheduled_end_at: None,
             groups: vec![base_group.clone()],
             channels: vec![base_ch.clone()],
         };

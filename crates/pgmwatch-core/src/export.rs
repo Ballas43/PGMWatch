@@ -1,5 +1,6 @@
 use crate::grid::{
-    apply_overrides_to_samples, prepare_accounting_samples, slice_matches, summarize_grid,
+    apply_overrides_to_samples, filter_samples_by_window, prepare_accounting_samples,
+    slice_matches, summarize_grid,
 };
 use crate::models::{
     ChannelConfig, ChannelRuntimeSnapshot, GridSample, IncidentRecord, ManualOverride,
@@ -17,8 +18,11 @@ pub fn build_accounting_workbook(
     overrides: &[ManualOverride],
 ) -> anyhow::Result<Vec<u8>> {
     let channel_cfgs: Vec<ChannelConfig> = channels.iter().map(|c| c.config.clone()).collect();
-    let effective_samples =
-        prepare_accounting_samples(&apply_overrides_to_samples(samples, overrides), &channel_cfgs);
+    let effective_samples = filter_samples_by_window(
+        prepare_accounting_samples(&apply_overrides_to_samples(samples, overrides), &channel_cfgs),
+        show.scheduled_start_at,
+        show.scheduled_end_at,
+    );
     let summary = summarize_grid(&effective_samples);
     let match_slices = slice_matches(&effective_samples, matches);
 
@@ -36,6 +40,17 @@ pub fn build_accounting_workbook(
         let ws = wb.add_worksheet().set_name("Executive Summary")?;
         ws.write_string_with_format(0, 0, format!("PGMWatch Broadcast Accounting — {}", show.title), &title_fmt)?;
         ws.write_string(1, 0, format!("Show ID: {}", show.show_id))?;
+        if show.scheduled_start_at.is_some() || show.scheduled_end_at.is_some() {
+            let start_s = show
+                .scheduled_start_at
+                .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| "Open".to_string());
+            let end_s = show
+                .scheduled_end_at
+                .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| "Open".to_string());
+            ws.write_string(2, 0, format!("Broadcast Window: {start_s} -> {end_s}"))?;
+        }
 
         ws.write_string_with_format(3, 0, "Global Metric", &header_fmt)?;
         ws.write_string_with_format(3, 1, "Value", &header_fmt)?;
