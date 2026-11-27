@@ -90,6 +90,7 @@ fn build_headless_edge_args(port: u16, profile_dir: &Path, target_url: &str) -> 
     vec![
         "--headless=new".to_string(),
         "--disable-gpu".to_string(),
+        "--disable-background-mode".to_string(),
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
         "--disk-cache-size=1".to_string(),
@@ -222,6 +223,7 @@ pub fn open_isolated_login_window(
         .args([
             "--no-first-run",
             "--no-default-browser-check",
+            "--disable-background-mode",
             "--disk-cache-size=1",
             "--media-cache-size=1",
             &format!("--user-data-dir={}", auth_profile_dir.display()),
@@ -262,12 +264,26 @@ pub async fn export_cookies_from_auth_profile(
 
     let _ = job_guard.assign_pid(child.id());
 
-    let res = tokio::time::timeout(Duration::from_secs(6), async {
+    let res = tokio::time::timeout(Duration::from_secs(15), async {
         let mut ws_url = None;
-        for _ in 0..16 {
+        let mut use_browser_target = false;
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap_or_default();
+        for _ in 0..40 {
             tokio::time::sleep(Duration::from_millis(250)).await;
+            let version_url = format!("http://127.0.0.1:{port}/json/version");
+            if let Ok(resp) = http.get(&version_url).send().await
+                && let Ok(ver) = resp.json::<serde_json::Value>().await
+                && let Some(u) = ver.get("webSocketDebuggerUrl").and_then(|v| v.as_str())
+            {
+                ws_url = Some(u.to_string());
+                use_browser_target = true;
+                break;
+            }
             let targets_url = format!("http://127.0.0.1:{port}/json");
-            if let Ok(resp) = reqwest::get(&targets_url).await
+            if let Ok(resp) = http.get(&targets_url).send().await
                 && let Ok(targets) = resp.json::<serde_json::Value>().await
                 && let Some(u) = targets
                     .as_array()
@@ -280,15 +296,21 @@ pub async fn export_cookies_from_auth_profile(
             }
         }
         let ws_url = ws_url.ok_or_else(|| {
-            anyhow::anyhow!("Close the Sign In Edge window before clicking Retry")
+            anyhow::anyhow!("Close the Sign In Edge window before clicking Sync Session")
         })?;
         let (mut ws, _) = connect_async(&ws_url).await?;
+        let method = if use_browser_target {
+            "Storage.getCookies"
+        } else {
+            "Network.getAllCookies"
+        };
         ws.send(Message::Text(
-            json!({ "id": 1, "method": "Storage.getCookies", "params": {} })
+            json!({ "id": 1, "method": method, "params": {} })
                 .to_string()
                 .into(),
         ))
         .await?;
+        let mut exported: Option<usize> = None;
         while let Some(Ok(Message::Text(txt))) = ws.next().await {
             if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&txt)
                 && ev.get("id").and_then(|v| v.as_i64()) == Some(1)
@@ -303,10 +325,19 @@ pub async fn export_cookies_from_auth_profile(
                     let _ = std::fs::create_dir_all(parent);
                 }
                 std::fs::write(cookies_out_path, netscape)?;
-                return Ok(cookies.len());
+                exported = Some(cookies.len());
+                break;
             }
         }
-        anyhow::bail!("Did not receive cookies from Edge profile")
+        // Gracefully shut down Edge so all helper processes release the profile lock immediately.
+        let _ = ws
+            .send(Message::Text(
+                json!({ "id": 2, "method": "Browser.close", "params": {} })
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+        exported.ok_or_else(|| anyhow::anyhow!("Did not receive cookies from Edge profile"))
     })
     .await;
 
