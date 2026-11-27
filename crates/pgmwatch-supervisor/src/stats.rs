@@ -29,7 +29,7 @@ impl Default for ChatComplaintSensor {
         Self::new()
     }
 }
-
+ 
 pub struct ChatComplaintRule<'a> {
     pub keywords: &'a [String],
     pub window_secs: u64,
@@ -221,6 +221,8 @@ async fn fetch_youtube_public_stats(
     let ccv = extract_json_number_near(&html, "\"concurrentViewers\":\"")
         .or_else(|| extract_json_number_near(&html, "\"viewCount\":{\"runs\":[{\"text\":\""));
     let views = extract_json_number_near(&html, "\"viewCount\":\"");
+    let likes = extract_json_number_near(&html, "\"likeCount\":\"")
+        .or_else(|| extract_json_field_number(&html, "likeCount"));
 
     ChannelStatsUpdate {
         channel_id: channel_id.to_string(),
@@ -232,7 +234,10 @@ async fn fetch_youtube_public_stats(
             Some(v) => TriStateMetric::value(v, 100.0),
             None => TriStateMetric::unavailable("YouTube views unavailable"),
         },
-        likes: TriStateMetric::na(),
+        likes: match likes {
+            Some(v) => TriStateMetric::value(v, 100.0),
+            None => TriStateMetric::unavailable("YouTube likes unavailable"),
+        },
         chat_rate_per_min: chat_rate
             .map(|v| TriStateMetric::value(v, 100.0))
             .unwrap_or_else(|| TriStateMetric::unavailable("Live chat stream connecting")),
@@ -295,14 +300,24 @@ async fn fetch_tiktok_public_stats(
     };
 
     if let Some(ccv) = parse_tiktok_public_ccv(&html) {
+        let likes = ["likeCount", "like_count"]
+            .iter()
+            .find_map(|k| extract_json_field_number(&html, k))
+            .map(|v| TriStateMetric::value(v, 100.0))
+            .unwrap_or_else(|| TriStateMetric::unavailable("TikTok likes awaiting sidecar"));
+        let shares = ["shareCount", "share_count"]
+            .iter()
+            .find_map(|k| extract_json_field_number(&html, k))
+            .map(|v| TriStateMetric::value(v, 100.0))
+            .unwrap_or_else(|| TriStateMetric::unavailable("TikTok shares awaiting sidecar"));
         ChannelStatsUpdate {
             channel_id: channel_id.to_string(),
             ccv: TriStateMetric::value(ccv, 100.0),
             total_views: TriStateMetric::na(),
-            likes: TriStateMetric::na(),
+            likes,
             chat_rate_per_min: TriStateMetric::unavailable("TikTok sidecar reconnecting"),
-            shares: TriStateMetric::na(),
-            gifts_count: TriStateMetric::na(),
+            shares,
+            gifts_count: TriStateMetric::unavailable("TikTok gifts awaiting sidecar"),
             extras: HashMap::new(),
         }
     } else {
@@ -435,7 +450,18 @@ fn extract_json_field_number(haystack: &str, key: &str) -> Option<f64> {
             let trimmed_ws = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
             if let Some(after_colon) = trimmed_ws.strip_prefix(':') {
                 let val_part = after_colon.trim_start_matches(|c: char| c.is_ascii_whitespace());
-                let digits: String = val_part
+                // Support both direct numeric values (`"reaction_count":33`) and nested
+                // Facebook/GraphQL objects (`"reaction_count":{"count":33}`).
+                let candidate = if let Some(inner) = val_part.strip_prefix('{') {
+                    let window = &inner[..inner.len().min(96)];
+                    if let Some(num) = extract_direct_count_in_object(window) {
+                        return Some(num);
+                    }
+                    ""
+                } else {
+                    val_part.trim_start_matches('"')
+                };
+                let digits: String = candidate
                     .chars()
                     .take_while(|c| c.is_ascii_digit() || *c == ',')
                     .filter(|c| c.is_ascii_digit())
@@ -447,6 +473,28 @@ fn extract_json_field_number(haystack: &str, key: &str) -> Option<f64> {
                 }
             }
             offset = after_key;
+        }
+    }
+    None
+}
+
+fn extract_direct_count_in_object(window: &str) -> Option<f64> {
+    for key in ["\"count\"", "\\\"count\\\""] {
+        if let Some(idx) = window.find(key) {
+            let rest = window[idx + key.len()..].trim_start();
+            if let Some(after_colon) = rest.strip_prefix(':') {
+                let val_part = after_colon.trim_start().trim_start_matches('"');
+                let digits: String = val_part
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == ',')
+                    .filter(|c| c.is_ascii_digit())
+                    .collect();
+                if !digits.is_empty()
+                    && let Ok(num) = digits.parse::<f64>()
+                {
+                    return Some(num);
+                }
+            }
         }
     }
     None
@@ -558,6 +606,8 @@ pub enum SidecarEvent {
         channel_id: String,
         ccv: Option<f64>,
         likes: Option<f64>,
+        #[serde(default)]
+        shares: Option<f64>,
         gifts: Option<f64>,
         chat_count: Option<f64>,
     },
@@ -707,10 +757,12 @@ mod tests {
         assert_eq!(parsed.shares.value, Some(7.0));
         assert_eq!(parsed.chat_rate_per_min.value, Some(19.0));
 
-        let escaped = r#"{\"viewer_count\": 42, \"video_view_count\": 901}"#;
+        let escaped = r#"{\"viewer_count\": 42, \"video_view_count\": 901, \"reaction_count\": {\"count\": 128}, \"share_count\": {\"count\": 14}}"#;
         let parsed_escaped = parse_facebook_html_stats("ch-fb-2", escaped).expect("escaped FB JSON should parse");
         assert_eq!(parsed_escaped.ccv.value, Some(42.0));
         assert_eq!(parsed_escaped.total_views.value, Some(901.0));
+        assert_eq!(parsed_escaped.likes.value, Some(128.0));
+        assert_eq!(parsed_escaped.shares.value, Some(14.0));
     }
 
     #[test]

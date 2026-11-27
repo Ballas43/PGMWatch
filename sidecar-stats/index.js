@@ -58,6 +58,7 @@ function subscribeRoom(channelId, username) {
 
   let ccv = null;
   let likes = null;
+  let shares = null;
   let gifts = 0;
   let chatCount = 0;
   let isCurrent = () => connections.get(channelId) === conn;
@@ -73,21 +74,27 @@ function subscribeRoom(channelId, username) {
     if (Number.isFinite(nextCcv)) {
       ccv = nextCcv;
     }
-    emit({ type: "stats", channel_id: channelId, ccv, likes, gifts, chat_count: chatCount });
+    emit({ type: "stats", channel_id: channelId, ccv, likes, shares, gifts, chat_count: chatCount });
   });
 
   conn.on("like", (data) => {
     if (!isCurrent()) return;
     if (typeof data?.totalLikeCount === "number") {
       likes = data.totalLikeCount;
-      emit({ type: "stats", channel_id: channelId, ccv, likes, gifts, chat_count: chatCount });
+      emit({ type: "stats", channel_id: channelId, ccv, likes, shares, gifts, chat_count: chatCount });
     }
+  });
+
+  conn.on("share", () => {
+    if (!isCurrent()) return;
+    shares = (shares ?? 0) + 1;
+    emit({ type: "stats", channel_id: channelId, ccv, likes, shares, gifts, chat_count: chatCount });
   });
 
   conn.on("gift", (data) => {
     if (!isCurrent()) return;
     gifts += Number(data?.repeatCount ?? 1);
-    emit({ type: "stats", channel_id: channelId, ccv, likes, gifts, chat_count: chatCount });
+    emit({ type: "stats", channel_id: channelId, ccv, likes, shares, gifts, chat_count: chatCount });
   });
 
   conn.on("chat", (data) => {
@@ -119,9 +126,23 @@ function subscribeRoom(channelId, username) {
       if (desired) desired.attempts = 0;
       const ri = st?.roomInfo?.data || st?.roomInfo || {};
       const initialCcv = Number(ri?.user_count ?? ri?.stats?.user_count);
+      const initialLikes = Number(ri?.like_count ?? ri?.stats?.like_count);
+      const initialShares = Number(ri?.stats?.share_count ?? ri?.share_count);
+      let changed = false;
       if (Number.isFinite(initialCcv)) {
         ccv = initialCcv;
-        emit({ type: "stats", channel_id: channelId, ccv, likes, gifts, chat_count: chatCount });
+        changed = true;
+      }
+      if (Number.isFinite(initialLikes)) {
+        likes = initialLikes;
+        changed = true;
+      }
+      if (Number.isFinite(initialShares)) {
+        shares = initialShares;
+        changed = true;
+      }
+      if (changed) {
+        emit({ type: "stats", channel_id: channelId, ccv, likes, shares, gifts, chat_count: chatCount });
       }
     })
     .catch((err) => {

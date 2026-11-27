@@ -39,7 +39,7 @@ fn status_label(status: MetricStatus) -> &'static str {
     match status {
         MetricStatus::Value => "Live",
         MetricStatus::Unavailable => "Unavailable",
-        MetricStatus::Na => "Not Tracked",
+        MetricStatus::Na => "Not Supported",
     }
 }
 
@@ -234,7 +234,7 @@ pub fn build_accounting_workbook(
                     r,
                     5,
                     match ch.ccv.status {
-                        MetricStatus::Na => "Not Tracked",
+                        MetricStatus::Na => "Not Supported",
                         MetricStatus::Unavailable => "Unavailable",
                         MetricStatus::Value => "0",
                     },
@@ -330,7 +330,7 @@ fn write_tristate_cell(
             ws.write_number_with_format(row, col, metric.value.unwrap_or(0.0), fmt)?;
         }
         MetricStatus::Na => {
-            ws.write_string(row, col, "Not Tracked")?;
+            ws.write_string(row, col, "Not Supported")?;
         }
         MetricStatus::Unavailable => {
             ws.write_string(row, col, "Unavailable")?;

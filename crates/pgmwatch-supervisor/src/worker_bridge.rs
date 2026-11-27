@@ -97,6 +97,7 @@ impl SupervisorState {
                                 channel_id,
                                 ccv,
                                 likes,
+                                shares,
                                 gifts,
                                 chat_count,
                             } => {
@@ -108,14 +109,16 @@ impl SupervisorState {
                                     total_views: TriStateMetric::na(),
                                     likes: likes
                                         .map(|v| TriStateMetric::value(v, 100.0))
-                                        .unwrap_or_else(TriStateMetric::na),
+                                        .unwrap_or_else(|| TriStateMetric::unavailable("Awaiting TikTok like count")),
                                     chat_rate_per_min: chat_count
                                         .map(|v| TriStateMetric::value(v, 95.0))
                                         .unwrap_or_else(TriStateMetric::na),
-                                    shares: TriStateMetric::na(),
+                                    shares: shares
+                                        .map(|v| TriStateMetric::value(v, 100.0))
+                                        .unwrap_or_else(|| TriStateMetric::unavailable("Awaiting TikTok share count")),
                                     gifts_count: gifts
                                         .map(|v| TriStateMetric::value(v, 100.0))
-                                        .unwrap_or_else(TriStateMetric::na),
+                                        .unwrap_or_else(|| TriStateMetric::unavailable("Awaiting TikTok gift count")),
                                     extras: HashMap::new(),
                                 };
                                 let became_valued = {
@@ -131,6 +134,7 @@ impl SupervisorState {
                                     if let Some(m) = map.get_mut(&channel_id) {
                                         m.ccv = upd.ccv;
                                         m.likes = upd.likes;
+                                        m.shares = upd.shares;
                                         m.chat_rate_per_min = upd.chat_rate_per_min;
                                         m.gifts_count = upd.gifts_count;
                                     }
