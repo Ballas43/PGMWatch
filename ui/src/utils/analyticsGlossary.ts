@@ -223,9 +223,9 @@ export const ANALYTICS_GLOSSARY = {
       "Number of background channel monitor processes currently decoding and analyzing streams.",
   },
   shedChannels: {
-    title: "Shed Channels",
+    title: "Stepped-Down Channels",
     summary:
-      "Backup feeds temporarily downgraded to Light (Audio-Only) mode to protect Master feeds under high PC load.",
+      "Feeds temporarily lowered in tier (MASTER -> 480p SIMULCAST first, then SIMULCAST -> Audio-Only LIGHT) to stay within your WAN bandwidth or GPU limits.",
   },
   forceClip: {
     title: "Instant Pre-Trigger Clip",

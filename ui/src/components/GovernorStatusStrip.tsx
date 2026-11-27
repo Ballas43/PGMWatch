@@ -175,7 +175,7 @@ export function GovernorStatusStrip({ governor }: GovernorStatusStripProps) {
             pct={governor.max_decode_latency_pct}
             detail={
               governor.shed_channels > 0
-                ? `${governor.shed_channels} reduced to audio-only`
+                ? `${governor.shed_channels} stepped down`
                 : "Decoding smoothly"
             }
           />

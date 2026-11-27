@@ -670,6 +670,11 @@ fn select_ytdlp_format(platform: Platform, tier: FeedTier) -> &'static str {
         (Platform::Youtube | Platform::Facebook, FeedTier::Simulcast) => {
             "bestvideo[height<=480][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=480]+bestaudio/best[height<=480]/worst[height>=360]/worst"
         }
+        // TikTok/Bigo Simulcast: explicitly exclude audio-only (`ao` / `only_audio=1`) formats
+        // because yt-dlp leaves `vcodec` unset on some TikTok FLV audio-only variants.
+        (Platform::Tiktok | Platform::Bigo, FeedTier::Simulcast) => {
+            "best[height<=480][format_id!*=ao][url!*=only_audio]/worst[height>=360][format_id!*=ao][url!*=only_audio]/worst[format_id!*=ao][url!*=only_audio]/best[format_id!*=ao][url!*=only_audio]/worst"
+        }
         // Audio-only preferred; when platform only offers muxed HLS, pick LOWEST >=360p (never best/1080p!)
         (_, FeedTier::Light) => "bestaudio/worst[height>=360]/best[height<=480]/worst",
         _ => "best[height<=480][vcodec!=none]/worst[height>=360][vcodec!=none]/worst[vcodec!=none]/worst",
