@@ -79,17 +79,26 @@ export function ChannelAudioMeter({
   };
 
   const avgText = formatAvgLufs(audio.integrated_lufs);
+  const shortTermText = formatAvgLufs(audio.short_term_lufs);
 
   return (
     <div className="mt-1.5 space-y-1 font-mono-tabular text-[11px]">
       <div className="flex flex-wrap items-center justify-between gap-1.5 pb-0.5">
-        <div className="flex flex-wrap items-center gap-1.5">
+        <div className="flex flex-wrap items-center gap-2">
           <InfoTip entry={ANALYTICS_GLOSSARY.avgLufs} underline focusable>
             <span className="text-[var(--text-secondary)]">
-              <span className="text-[var(--text-muted)]">Loudness</span>{" "}
-              <span className="font-medium text-[var(--text-primary)]">{avgText} LUFS</span>
+              <span className="text-[var(--text-muted)]">Avg</span>{" "}
+              <span className="font-medium text-[var(--text-primary)]">{avgText}</span>
             </span>
           </InfoTip>
+          <span
+            className="text-[var(--text-secondary)]"
+            title="3-second Short-Term LUFS (live loudness dynamics; incident alerting uses Avg LUFS)"
+          >
+            <span className="text-[var(--text-muted)]">ST</span>{" "}
+            <span className="font-medium text-[var(--text-primary)]">{shortTermText}</span>{" "}
+            <span className="text-[var(--text-muted)]">LUFS</span>
+          </span>
           {pflSyncMode && (
             <span
               className="inline-flex items-center gap-1 rounded border border-[#4cc38a]/35 bg-[#4cc38a]/10 px-1.5 py-0.5 text-[10px] font-medium text-[#4cc38a]"
@@ -126,8 +135,8 @@ export function ChannelAudioMeter({
             type="button"
             disabled={resetting}
             onClick={() => void handleReset()}
-            aria-label={`Reset average LUFS for ${channelName}`}
-            title="Reset integrated average LUFS measurement"
+            aria-label={`Reset all audio metrics for ${channelName}`}
+            title="Reset all audio metrics (Average LUFS, Short-Term LUFS, True Peak, and fault timers)"
             className={`inline-flex h-6 items-center gap-1 rounded border px-2 text-[11px] font-medium transition-colors disabled:opacity-50 ${
               cleared
                 ? "border-[var(--positive)]/50 bg-[var(--positive-soft)] text-[var(--positive-text)]"

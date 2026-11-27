@@ -239,7 +239,17 @@ async fn main() -> anyhow::Result<()> {
                                 }
                                 SupervisorToWorker::ResetLufs => {
                                     dsp.reset_average_lufs();
-                                    last_audio_tel.integrated_lufs = -70.0;
+                                    last_audio_tel = AudioTelemetry {
+                                        integrated_lufs: -70.0,
+                                        short_term_lufs: -70.0,
+                                        true_peak_dbtp: -96.0,
+                                        left_rms_dbfs: -96.0,
+                                        right_rms_dbfs: -96.0,
+                                        phase_correlation: 1.0,
+                                        hum_peak_db: 0.0,
+                                        hum_freq_hz: None,
+                                    };
+                                    last_audio_faults.clear();
                                     let _ = emit(&WorkerToSupervisor::Meter {
                                         channel_id: args.channel_id.clone(),
                                         audio: last_audio_tel.clone(),

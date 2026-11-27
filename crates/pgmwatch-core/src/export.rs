@@ -3,11 +3,59 @@ use crate::grid::{
     slice_matches, summarize_grid,
 };
 use crate::models::{
-    ChannelConfig, ChannelRuntimeSnapshot, GridSample, IncidentRecord, ManualOverride,
-    MatchMarker, MetricSource, MetricStatus, ShowPreset,
+    AlertState, ChannelConfig, ChannelRuntimeSnapshot, FeedTier, GridSample, IncidentRecord,
+    ManualOverride, MatchMarker, MetricSource, MetricStatus, ShowPreset,
 };
+use chrono::{DateTime, Local, Utc};
 use rust_xlsxwriter::{Color, Format, Workbook};
 use std::collections::HashMap;
+
+fn format_local_dt(dt: DateTime<Utc>) -> String {
+    dt.with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
+fn format_local_hm(dt: DateTime<Utc>) -> String {
+    dt.with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M")
+        .to_string()
+}
+
+fn local_tz_label() -> String {
+    let offset = Local::now().format("%:z").to_string();
+    format!("Local Time (UTC{offset})")
+}
+
+fn tier_label(tier: FeedTier) -> &'static str {
+    match tier {
+        FeedTier::Master => "Primary (HD)",
+        FeedTier::Simulcast => "Standard (SD)",
+        FeedTier::Light => "Audio-Only",
+    }
+}
+
+fn status_label(status: MetricStatus) -> &'static str {
+    match status {
+        MetricStatus::Value => "Live",
+        MetricStatus::Unavailable => "Unavailable",
+        MetricStatus::Na => "Not Tracked",
+    }
+}
+
+fn severity_label(state: AlertState) -> &'static str {
+    match state {
+        AlertState::Critical => "Critical",
+        AlertState::Warning => "Warning",
+        AlertState::Acknowledged => "Acknowledged",
+        AlertState::AdBreak => "Ad Break",
+        AlertState::Offline => "Offline",
+        AlertState::LoginGated => "Login Required",
+        AlertState::ExtractorErr => "Stream Error",
+        AlertState::Reacquiring => "Reconnecting",
+        AlertState::Healthy => "Normal",
+    }
+}
 
 pub fn build_accounting_workbook(
     show: &ShowPreset,
@@ -25,6 +73,12 @@ pub fn build_accounting_workbook(
     );
     let summary = summarize_grid(&effective_samples);
     let match_slices = slice_matches(&effective_samples, matches);
+    let tz_label = local_tz_label();
+    let group_names: HashMap<&str, &str> = show
+        .groups
+        .iter()
+        .map(|g| (g.id.as_str(), g.name.as_str()))
+        .collect();
 
     let mut wb = Workbook::new();
     let header_fmt = Format::new()
@@ -38,40 +92,40 @@ pub fn build_accounting_workbook(
     // Tab 1: Executive Summary
     {
         let ws = wb.add_worksheet().set_name("Executive Summary")?;
-        ws.write_string_with_format(0, 0, format!("PGMWatch Broadcast Accounting — {}", show.title), &title_fmt)?;
-        ws.write_string(1, 0, format!("Show ID: {}", show.show_id))?;
+        ws.write_string_with_format(0, 0, format!("Broadcast Viewership Report — {}", show.title), &title_fmt)?;
+        ws.write_string(1, 0, format!("Timezone: {tz_label}"))?;
         if show.scheduled_start_at.is_some() || show.scheduled_end_at.is_some() {
             let start_s = show
                 .scheduled_start_at
-                .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+                .map(format_local_hm)
                 .unwrap_or_else(|| "Open".to_string());
             let end_s = show
                 .scheduled_end_at
-                .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+                .map(format_local_hm)
                 .unwrap_or_else(|| "Open".to_string());
-            ws.write_string(2, 0, format!("Broadcast Window: {start_s} -> {end_s}"))?;
+            ws.write_string(2, 0, format!("Broadcast Window: {start_s} to {end_s}"))?;
         }
 
-        ws.write_string_with_format(3, 0, "Global Metric", &header_fmt)?;
-        ws.write_string_with_format(3, 1, "Value", &header_fmt)?;
+        ws.write_string_with_format(4, 0, "Summary Metric", &header_fmt)?;
+        ws.write_string_with_format(4, 1, "Value", &header_fmt)?;
 
-        ws.write_string(4, 0, "Combined Global Peak Concurrent Viewers (PCV)")?;
-        ws.write_number_with_format(4, 1, summary.combined_pcv as f64, &num_fmt)?;
-        ws.write_string(5, 0, "Combined Average Concurrent Viewers (ACV)")?;
-        ws.write_number_with_format(5, 1, summary.combined_acv, &dec_fmt)?;
-        ws.write_string(6, 0, "Total Hours Watched (60s UTC Grid)")?;
-        ws.write_number_with_format(6, 1, summary.hours_watched, &dec_fmt)?;
-        ws.write_string(7, 0, "Tracked Grid Minutes")?;
-        ws.write_number_with_format(7, 1, summary.total_minutes as f64, &num_fmt)?;
+        ws.write_string(5, 0, "Peak Concurrent Viewers (All Channels Combined)")?;
+        ws.write_number_with_format(5, 1, summary.combined_pcv as f64, &num_fmt)?;
+        ws.write_string(6, 0, "Average Concurrent Viewers")?;
+        ws.write_number_with_format(6, 1, summary.combined_acv, &dec_fmt)?;
+        ws.write_string(7, 0, "Total Hours Watched")?;
+        ws.write_number_with_format(7, 1, summary.hours_watched, &dec_fmt)?;
+        ws.write_string(8, 0, "Broadcast Duration (Minutes)")?;
+        ws.write_number_with_format(8, 1, summary.total_minutes as f64, &num_fmt)?;
 
-        ws.write_string_with_format(9, 0, "Stream Group", &header_fmt)?;
-        ws.write_string_with_format(9, 1, "Group Tag", &header_fmt)?;
-        ws.write_string_with_format(9, 2, "Group PCV", &header_fmt)?;
-        ws.write_string_with_format(9, 3, "Group ACV", &header_fmt)?;
-        ws.write_string_with_format(9, 4, "Hours Watched", &header_fmt)?;
+        ws.write_string_with_format(10, 0, "Stream Group", &header_fmt)?;
+        ws.write_string_with_format(10, 1, "Language / Region", &header_fmt)?;
+        ws.write_string_with_format(10, 2, "Peak Viewers", &header_fmt)?;
+        ws.write_string_with_format(10, 3, "Average Viewers", &header_fmt)?;
+        ws.write_string_with_format(10, 4, "Hours Watched", &header_fmt)?;
 
         for (idx, grp) in show.groups.iter().enumerate() {
-            let row = (10 + idx) as u32;
+            let row = (11 + idx) as u32;
             ws.write_string(row, 0, &grp.name)?;
             ws.write_string(row, 1, &grp.language_code)?;
             ws.write_number_with_format(
@@ -100,13 +154,12 @@ pub fn build_accounting_workbook(
     {
         let ws = wb.add_worksheet().set_name("Segment Breakdown")?;
         let headers = [
-            "Segment ID",
-            "Segment Label",
-            "Started UTC",
-            "Ended UTC",
-            "Minutes",
-            "Segment PCV",
-            "Segment ACV",
+            "Segment",
+            "Start Time (Local)",
+            "End Time (Local)",
+            "Duration (Minutes)",
+            "Peak Viewers",
+            "Average Viewers",
             "Hours Watched",
         ];
         for (c, h) in headers.iter().enumerate() {
@@ -114,44 +167,41 @@ pub fn build_accounting_workbook(
         }
         for (idx, ms) in match_slices.iter().enumerate() {
             let r = (idx + 1) as u32;
-            ws.write_string(r, 0, &ms.match_marker.id)?;
-            ws.write_string(r, 1, &ms.match_marker.label)?;
-            ws.write_string(r, 2, ms.match_marker.started_at.to_rfc3339())?;
+            ws.write_string(r, 0, &ms.match_marker.label)?;
+            ws.write_string(r, 1, format_local_dt(ms.match_marker.started_at))?;
             ws.write_string(
                 r,
-                3,
+                2,
                 ms.match_marker
                     .ended_at
-                    .map(|d| d.to_rfc3339())
-                    .unwrap_or_else(|| "LIVE".to_string()),
+                    .map(format_local_dt)
+                    .unwrap_or_else(|| "Ongoing".to_string()),
             )?;
-            ws.write_number_with_format(r, 4, ms.duration_minutes as f64, &num_fmt)?;
-            ws.write_number_with_format(r, 5, ms.pcv as f64, &num_fmt)?;
-            ws.write_number_with_format(r, 6, ms.acv, &dec_fmt)?;
-            ws.write_number_with_format(r, 7, ms.hours_watched, &dec_fmt)?;
+            ws.write_number_with_format(r, 3, ms.duration_minutes as f64, &num_fmt)?;
+            ws.write_number_with_format(r, 4, ms.pcv as f64, &num_fmt)?;
+            ws.write_number_with_format(r, 5, ms.acv, &dec_fmt)?;
+            ws.write_number_with_format(r, 6, ms.hours_watched, &dec_fmt)?;
         }
         ws.autofit();
     }
 
-    // Tab 3: Platform Accounting
+    // Tab 3: Channel Breakdown
     {
-        let ws = wb.add_worksheet().set_name("Platform Accounting")?;
+        let ws = wb.add_worksheet().set_name("Channel Breakdown")?;
         let headers = [
-            "Channel ID",
             "Channel Name",
-            "Group ID",
+            "Group",
             "Platform",
-            "Tier",
-            "CCV Status",
-            "Current / Override CCV",
-            "Peak CCV",
-            "Coverage %",
-            "Source",
+            "Monitoring Mode",
+            "Viewer Data Status",
+            "Latest Viewers",
+            "Peak Viewers",
+            "Data Coverage (%)",
+            "Data Source",
             "Total Views",
             "Likes",
             "Shares",
             "Gifts",
-            "Extras JSON",
         ];
         for (c, h) in headers.iter().enumerate() {
             ws.write_string_with_format(0, c as u16, *h, &header_fmt)?;
@@ -159,118 +209,108 @@ pub fn build_accounting_workbook(
 
         let mut ch_peak: HashMap<String, i64> = HashMap::new();
         let mut ch_source: HashMap<String, MetricSource> = HashMap::new();
-        let mut ch_extras: HashMap<String, String> = HashMap::new();
         for s in &effective_samples {
             if let Some(v) = s.ccv {
                 let p = ch_peak.entry(s.channel_id.clone()).or_insert(0);
                 *p = (*p).max(v);
             }
             ch_source.insert(s.channel_id.clone(), s.source);
-            if !s.extras_json.is_empty()
-                && let Ok(json) = serde_json::to_string(&s.extras_json)
-            {
-                ch_extras.insert(s.channel_id.clone(), json);
-            }
         }
 
         for (idx, ch) in channels.iter().enumerate() {
             let r = (idx + 1) as u32;
-            ws.write_string(r, 0, &ch.config.id)?;
-            ws.write_string(r, 1, &ch.config.name)?;
-            ws.write_string(r, 2, &ch.config.group_id)?;
-            ws.write_string(r, 3, ch.config.platform.display_name())?;
-            ws.write_string(r, 4, ch.effective_tier.as_str())?;
-            ws.write_string(r, 5, format!("{:?}", ch.ccv.status).to_uppercase())?;
+            let grp_label = group_names
+                .get(ch.config.group_id.as_str())
+                .copied()
+                .unwrap_or(ch.config.group_id.as_str());
+            ws.write_string(r, 0, &ch.config.name)?;
+            ws.write_string(r, 1, grp_label)?;
+            ws.write_string(r, 2, ch.config.platform.display_name())?;
+            ws.write_string(r, 3, tier_label(ch.effective_tier))?;
+            ws.write_string(r, 4, status_label(ch.ccv.status))?;
             match ch.ccv.value {
-                Some(v) => ws.write_number_with_format(r, 6, v, &num_fmt)?,
+                Some(v) => ws.write_number_with_format(r, 5, v, &num_fmt)?,
                 None => ws.write_string(
                     r,
-                    6,
+                    5,
                     match ch.ccv.status {
-                        MetricStatus::Na => "N/A",
-                        MetricStatus::Unavailable => "UNAVAILABLE",
+                        MetricStatus::Na => "Not Tracked",
+                        MetricStatus::Unavailable => "Unavailable",
                         MetricStatus::Value => "0",
                     },
                 )?,
             };
             ws.write_number_with_format(
                 r,
-                7,
+                6,
                 *ch_peak.get(&ch.config.id).unwrap_or(&0) as f64,
                 &num_fmt,
             )?;
-            ws.write_number_with_format(r, 8, ch.ccv.coverage_pct as f64, &dec_fmt)?;
+            ws.write_number_with_format(r, 7, ch.ccv.coverage_pct as f64, &dec_fmt)?;
             let src = ch_source
                 .get(&ch.config.id)
                 .copied()
                 .unwrap_or(ch.ccv.source);
             ws.write_string(
                 r,
-                9,
+                8,
                 if ch.config.exclude_from_accounting {
-                    "EXCLUDED_INTERNAL_QC"
+                    "Excluded (Internal QC)"
                 } else {
                     match src {
-                        MetricSource::AutoViewer => "AUTO_VIEWER",
-                        MetricSource::ManualStudio => "MANUAL_STUDIO",
+                        MetricSource::AutoViewer => "Automatic",
+                        MetricSource::ManualStudio => "Manual Override",
                     }
                 },
             )?;
-            write_tristate_cell(ws, r, 10, &ch.total_views, &num_fmt)?;
-            write_tristate_cell(ws, r, 11, &ch.likes, &num_fmt)?;
-            write_tristate_cell(ws, r, 12, &ch.shares, &num_fmt)?;
-            write_tristate_cell(ws, r, 13, &ch.gifts_count, &num_fmt)?;
-            ws.write_string(
-                r,
-                14,
-                ch_extras.get(&ch.config.id).map(String::as_str).unwrap_or("{}"),
-            )?;
+            write_tristate_cell(ws, r, 9, &ch.total_views, &num_fmt)?;
+            write_tristate_cell(ws, r, 10, &ch.likes, &num_fmt)?;
+            write_tristate_cell(ws, r, 11, &ch.shares, &num_fmt)?;
+            write_tristate_cell(ws, r, 12, &ch.gifts_count, &num_fmt)?;
         }
         ws.autofit();
     }
 
-    // Tab 4: Health & Incident Log
+    // Tab 4: Incident Log
     {
-        let ws = wb.add_worksheet().set_name("Health & Incident Log")?;
+        let ws = wb.add_worksheet().set_name("Incident Log")?;
         let headers = [
-            "Incident ID",
             "Channel",
             "Group",
-            "Fault Type",
+            "Issue",
             "Severity",
-            "Started UTC",
-            "Resolved UTC",
-            "Duration (s)",
+            "Started (Local)",
+            "Resolved (Local)",
+            "Duration (Seconds)",
             "Acknowledged",
             "Evidence Clip",
-            "Detail",
+            "Details",
         ];
         for (c, h) in headers.iter().enumerate() {
             ws.write_string_with_format(0, c as u16, *h, &header_fmt)?;
         }
         for (idx, inc) in incidents.iter().enumerate() {
             let r = (idx + 1) as u32;
-            ws.write_string(r, 0, &inc.id)?;
-            ws.write_string(r, 1, &inc.channel_name)?;
-            ws.write_string(r, 2, &inc.group_id)?;
-            ws.write_string(r, 3, inc.fault.label())?;
-            ws.write_string(r, 4, format!("{:?}", inc.severity).to_uppercase())?;
-            ws.write_string(r, 5, inc.started_at.to_rfc3339())?;
+            let grp_label = group_names
+                .get(inc.group_id.as_str())
+                .copied()
+                .unwrap_or(inc.group_id.as_str());
+            ws.write_string(r, 0, &inc.channel_name)?;
+            ws.write_string(r, 1, grp_label)?;
+            ws.write_string(r, 2, inc.fault.label())?;
+            ws.write_string(r, 3, severity_label(inc.severity))?;
+            ws.write_string(r, 4, format_local_dt(inc.started_at))?;
             ws.write_string(
                 r,
-                6,
+                5,
                 inc.resolved_at
-                    .map(|d| d.to_rfc3339())
-                    .unwrap_or_else(|| "ACTIVE".to_string()),
+                    .map(format_local_dt)
+                    .unwrap_or_else(|| "Active".to_string()),
             )?;
-            ws.write_number_with_format(r, 7, inc.duration_secs, &dec_fmt)?;
-            ws.write_string(r, 8, if inc.acknowledged { "YES" } else { "NO" })?;
-            ws.write_string(
-                r,
-                9,
-                inc.clip_filename.as_deref().unwrap_or(""),
-            )?;
-            ws.write_string(r, 10, &inc.detail)?;
+            ws.write_number_with_format(r, 6, inc.duration_secs, &dec_fmt)?;
+            ws.write_string(r, 7, if inc.acknowledged { "Yes" } else { "No" })?;
+            ws.write_string(r, 8, inc.clip_filename.as_deref().unwrap_or(""))?;
+            ws.write_string(r, 9, &inc.detail)?;
         }
         ws.autofit();
     }
@@ -290,10 +330,10 @@ fn write_tristate_cell(
             ws.write_number_with_format(row, col, metric.value.unwrap_or(0.0), fmt)?;
         }
         MetricStatus::Na => {
-            ws.write_string(row, col, "N/A")?;
+            ws.write_string(row, col, "Not Tracked")?;
         }
         MetricStatus::Unavailable => {
-            ws.write_string(row, col, "UNAVAILABLE")?;
+            ws.write_string(row, col, "Unavailable")?;
         }
     }
     Ok(())

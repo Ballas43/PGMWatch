@@ -124,6 +124,8 @@ pub struct AvSyncTracker {
     cal_samples: Vec<f32>,
     cal_started_at: Option<Instant>,
     baseline_offset_ms: Option<f32>,
+    recent_drifts: VecDeque<(Instant, f32)>,
+    last_sample_at: Option<Instant>,
     smoothed_drift_ms: f32,
 }
 
@@ -136,6 +138,8 @@ impl AvSyncTracker {
             cal_samples: Vec::with_capacity(32),
             cal_started_at: None,
             baseline_offset_ms: None,
+            recent_drifts: VecDeque::with_capacity(256),
+            last_sample_at: None,
             smoothed_drift_ms: 0.0,
         }
     }
@@ -146,6 +150,8 @@ impl AvSyncTracker {
         self.cal_samples.clear();
         self.cal_started_at = None;
         self.baseline_offset_ms = None;
+        self.recent_drifts.clear();
+        self.last_sample_at = None;
         self.smoothed_drift_ms = 0.0;
     }
 
@@ -172,8 +178,9 @@ impl AvSyncTracker {
 
         // If one track has stalled for >1.5s while the other keeps advancing, do not mask it
         // with wall-clock compensation so true track starvation surfaces as A/V sync drift.
-        let max_comp_ms = if self.split_av_pair { 500.0 } else { 250.0 };
-        let comp_ms = if wall_delta_ms.abs() > 1_500.0 {
+        let stalled = wall_delta_ms.abs() > 1_500.0;
+        let max_comp_ms = if self.split_av_pair { 1_200.0 } else { 600.0 };
+        let comp_ms = if stalled {
             0.0
         } else {
             wall_delta_ms.clamp(-max_comp_ms, max_comp_ms)
@@ -184,10 +191,10 @@ impl AvSyncTracker {
             return self.smoothed_drift_ms;
         }
 
-        // HLS/DASH muxers and split A/V HTTP threads can legitimately carry a steady 200-500ms
+        // HLS/DASH muxers and split A/V HTTP threads can legitimately carry a steady 200-800ms
         // interleave/buffer offset without any playback lip-sync error. Only genuine large
-        // container PTS mismatches (>600ms muxed, >800ms split) bypass baseline calibration.
-        let max_normal_interleave_ms = if self.split_av_pair { 800.0 } else { 600.0 };
+        // container PTS mismatches (>600ms muxed, >900ms split) bypass baseline calibration.
+        let max_normal_interleave_ms = if self.split_av_pair { 900.0 } else { 600.0 };
 
         if self.baseline_offset_ms.is_none() {
             let started = *self.cal_started_at.get_or_insert(now);
@@ -206,6 +213,7 @@ impl AvSyncTracker {
                 });
                 self.cal_samples.clear();
                 self.cal_samples.shrink_to_fit();
+                self.last_sample_at = Some(now);
             } else {
                 if raw_offset_ms.abs() > max_normal_interleave_ms {
                     let clamped = raw_offset_ms.clamp(-5_000.0, 5_000.0);
@@ -217,29 +225,69 @@ impl AvSyncTracker {
             }
         }
 
+        let dt_s = self
+            .last_sample_at
+            .map(|prev| now.saturating_duration_since(prev).as_secs_f32())
+            .unwrap_or(0.02)
+            .clamp(0.001, 2.0);
+        self.last_sample_at = Some(now);
+
         let baseline = self.baseline_offset_ms.unwrap_or(0.0);
         let raw_drift = (raw_offset_ms - baseline).clamp(-5_000.0, 5_000.0);
-        // Apply a soft deadband for normal HLS segment-burst / split-HTTP thread scheduling jitter
+
+        // Sliding 2-second median filter rejects transient HLS/DASH segment-reload bursts
+        // while preserving 100% of sustained encoder clock drift and real lip-sync offsets.
+        self.recent_drifts.push_back((now, raw_drift));
+        let median_window = Duration::from_secs(2);
+        while let Some(&(ts, _)) = self.recent_drifts.front() {
+            if now.saturating_duration_since(ts) > median_window || self.recent_drifts.len() > 240 {
+                self.recent_drifts.pop_front();
+            } else {
+                break;
+            }
+        }
+        let filtered_drift = if stalled || self.recent_drifts.len() < 5 {
+            raw_drift
+        } else {
+            let mut vals: Vec<f32> = self.recent_drifts.iter().map(|&(_, v)| v).collect();
+            vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            vals[vals.len() / 2]
+        };
+
+        // Slowly adapt baseline only for tiny steady-state interleave shifts inside the normal band
+        // so gradual CDN playlist phase shifts don't accumulate, while never absorbing real drift.
+        let adapt_band_ms = if self.split_av_pair { 100.0 } else { 40.0 };
+        if !stalled && filtered_drift.abs() <= adapt_band_ms {
+            let adapt_alpha = 1.0 - (-dt_s / 60.0).exp();
+            let next_base = (baseline + filtered_drift * adapt_alpha)
+                .clamp(-max_normal_interleave_ms, max_normal_interleave_ms);
+            self.baseline_offset_ms = Some(next_base);
+        }
+
+        // Soft deadband for normal HLS segment-burst / split-HTTP thread scheduling jitter
         // while keeping track stalls (>1.5s) and sustained encoder clock drift completely visible.
-        let deadband_ms = if wall_delta_ms.abs() > 1_500.0 {
+        let deadband_ms = if stalled {
             0.0
         } else if self.split_av_pair {
-            120.0
+            100.0
         } else {
-            40.0
+            35.0
         };
-        let effective_drift = if raw_drift.abs() <= deadband_ms {
+        let effective_drift = if filtered_drift.abs() <= deadband_ms {
             0.0
         } else {
-            raw_drift - deadband_ms.copysign(raw_drift)
+            filtered_drift - deadband_ms.copysign(filtered_drift)
         };
-        let alpha = if wall_delta_ms.abs() > 1_500.0 {
-            0.15
+
+        // True wall-clock time-constant EMA (frame-rate independent across 30p/60p/48kHz audio).
+        let tau_s = if stalled {
+            1.0
         } else if self.split_av_pair {
-            0.03
+            3.5
         } else {
-            0.05
+            2.0
         };
+        let alpha = 1.0 - (-dt_s / tau_s).exp();
         self.smoothed_drift_ms = self.smoothed_drift_ms * (1.0 - alpha) + effective_drift * alpha;
         self.smoothed_drift_ms
     }

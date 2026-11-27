@@ -177,6 +177,20 @@ fn append_fmp4_input_args(args: &mut Vec<String>, url: &str, header_str: &str) {
     );
 }
 
+/// TikTok SD/LD/HD/UHD FLV streams (`_ld5`, `_sd5`, `_hd5`, `_uhd5`, `h265`, `hevc`) use HEVC,
+/// which Firefox and many Chromium builds cannot decode via MSE `-c:v copy`. Transcode those to
+/// ultrafast H.264 on demand (only when the operator explicitly clicks HQ on that card).
+pub(crate) fn is_hevc_stream_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    let path = lower.split(['?', '#']).next().unwrap_or("");
+    path.contains("_ld5.")
+        || path.contains("_sd5.")
+        || path.contains("_hd5.")
+        || path.contains("_uhd5.")
+        || path.contains("h265")
+        || path.contains("hevc")
+}
+
 fn build_ffmpeg_fmp4_args(media: &ResolvedMedia) -> Vec<String> {
     let mut header_str = String::new();
     for (k, v) in &media.headers {
@@ -204,10 +218,34 @@ fn build_ffmpeg_fmp4_args(media: &ResolvedMedia) -> Vec<String> {
         args.extend(["-map", "0:a:0?"].map(String::from));
     }
 
+    if is_hevc_stream_url(&media.stream_url) {
+        args.extend(
+            [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-tune",
+                "zerolatency",
+                "-pix_fmt",
+                "yuv420p",
+                "-g",
+                "60",
+                "-b:v",
+                "1500k",
+                "-maxrate",
+                "2000k",
+                "-bufsize",
+                "3000k",
+            ]
+            .map(String::from),
+        );
+    } else {
+        args.extend(["-c:v", "copy"].map(String::from));
+    }
+
     args.extend(
         [
-            "-c:v",
-            "copy",
             "-c:a",
             "aac",
             "-ar",
@@ -624,6 +662,13 @@ pub fn extract_mse_codec(moov: &[u8]) -> Option<String> {
                 avcc[9], avcc[10], avcc[11]
             ));
         }
+    } else if let Some(hvcc) = find_bmff_box(moov, b"hvcC")
+        && hvcc.len() >= 21
+    {
+        let profile_idc = hvcc[9] & 0x1f;
+        let tier = if (hvcc[9] & 0x20) != 0 { 'H' } else { 'L' };
+        let level_idc = hvcc[20];
+        video_codec = Some(format!("hvc1.{profile_idc}.4.{tier}{level_idc}.B0"));
     } else if let Some(vpcc) = find_bmff_box(moov, b"vpcC") {
         if vpcc.len() >= 15 {
             let profile = vpcc[12];
@@ -666,7 +711,7 @@ fn find_bmff_box<'a>(data: &'a [u8], target: &[u8; 4]) -> Option<&'a [u8]> {
         // Recurse into container boxes inside moov -> trak -> mdia -> minf -> stbl -> stsd -> SampleEntry
         let child_start = match typ {
             b"stsd" => Some(16),
-            b"avc1" | b"avc3" | b"vp09" | b"vp08" | b"av01" => Some(86),
+            b"avc1" | b"avc3" | b"hvc1" | b"hev1" | b"vp09" | b"vp08" | b"av01" => Some(86),
             b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" => Some(8),
             _ => None,
         };

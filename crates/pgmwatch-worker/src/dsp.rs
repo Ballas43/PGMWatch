@@ -81,12 +81,33 @@ impl AudioDspAnalyzer {
         self.lufs_bad_ms = 0;
     }
 
-    /// Reset the integrated (average) LUFS accumulator while preserving short-term and peak detectors.
+    /// Reset all audio metrics (integrated LUFS, short-term LUFS, true peak hold, hum, and fault timers).
     pub fn reset_average_lufs(&mut self) {
+        if let Ok(fresh) = EbuR128::new(
+            CANONICAL_CHANNELS,
+            CANONICAL_SAMPLE_RATE,
+            Mode::S | Mode::TRUE_PEAK,
+        ) {
+            self.ebur = fresh;
+        }
         if let Ok(fresh) = EbuR128::new(CANONICAL_CHANNELS, CANONICAL_SAMPLE_RATE, Mode::I) {
             self.ebur_avg = fresh;
         }
+        self.mono_ring.clear();
+        self.master_lufs_history.clear();
+        self.self_lufs_history.clear();
         self.lufs_bad_ms = 0;
+        self.dead_air_ms = 0;
+        self.micro_silence_ms = 0;
+        self.missing_channel_ms = 0;
+        self.phase_inv_ms = 0;
+        self.hum_ms = 0;
+        self.wrong_bus_ms = 0;
+        self.wrong_bus_sample_ms = 0;
+        self.consecutive_clip_samples = 0;
+        self.hum_candidate_hz = None;
+        self.last_hum_freq = None;
+        self.last_hum_peak_db = 0.0;
     }
 
     /// Analyze interleaved 48 kHz Stereo F32LE frames and return telemetry + triggered faults.

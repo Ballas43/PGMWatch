@@ -107,8 +107,25 @@ impl GopRingBuffer {
     }
 
     pub fn snapshot_from_pretrigger_idr(&self, pretrigger_ms: i64) -> Vec<CompressedPacket> {
-        let newest_pts = self.packets.iter().map(|p| p.pts_ms).max().unwrap_or(0);
-        let target_start = newest_pts - pretrigger_ms;
+        let newest_video_pts = self
+            .packets
+            .iter()
+            .filter(|p| p.is_video)
+            .map(|p| p.pts_ms)
+            .max();
+        let newest_audio_pts = self
+            .packets
+            .iter()
+            .filter(|p| !p.is_video)
+            .map(|p| p.pts_ms)
+            .max();
+        let newest_pts = newest_video_pts
+            .into_iter()
+            .chain(newest_audio_pts)
+            .max()
+            .unwrap_or(0);
+        let video_target_start = newest_video_pts.unwrap_or(newest_pts) - pretrigger_ms;
+        let audio_target_start = newest_audio_pts.unwrap_or(newest_pts) - pretrigger_ms;
 
         // Collect all video keyframes ordered by timestamp so split-A/V arrival jitter
         // never causes us to pick a stale earlier keyframe or lose track of the latest IDR.
@@ -118,13 +135,13 @@ impl GopRingBuffer {
                 match best_idr {
                     None => best_idr = Some((idx, pkt.pts_ms)),
                     Some((_, cur_pts)) => {
-                        if cur_pts < target_start {
-                            // Still searching forward to reach target_start
+                        if cur_pts < video_target_start {
+                            // Still searching forward to reach video_target_start
                             if pkt.pts_ms > cur_pts {
                                 best_idr = Some((idx, pkt.pts_ms));
                             }
-                        } else if pkt.pts_ms >= target_start && pkt.pts_ms < cur_pts {
-                            // Tightest IDR at or after target_start
+                        } else if pkt.pts_ms >= video_target_start && pkt.pts_ms < cur_pts {
+                            // Tightest IDR at or after video_target_start
                             best_idr = Some((idx, pkt.pts_ms));
                         }
                     }
@@ -132,9 +149,20 @@ impl GopRingBuffer {
             }
         }
 
-        let (start_idx, anchor_pts) = match best_idr {
+        let (start_idx, video_anchor_pts) = match best_idr {
             Some((idx, idr_pts)) => (idx, idr_pts),
-            None => (0, target_start),
+            None => (0, video_target_start),
+        };
+        // Anchor audio to the tighter of audio_target_start and video_anchor_pts (when on the same
+        // timeline) so split-A/V PTS skew or long GOP intervals cannot leak pre-fault program audio
+        // into Dead Air / audio fault clips.
+        let same_timeline = newest_video_pts
+            .zip(newest_audio_pts)
+            .is_some_and(|(v, a)| (v - a).abs() < 30_000);
+        let audio_anchor_pts = if same_timeline {
+            audio_target_start.max(video_anchor_pts)
+        } else {
+            audio_target_start
         };
 
         let mut selected: Vec<CompressedPacket> = self
@@ -143,11 +171,9 @@ impl GopRingBuffer {
             .enumerate()
             .filter(|(idx, pkt)| {
                 if pkt.is_video {
-                    *idx >= start_idx && pkt.pts_ms >= anchor_pts
+                    *idx >= start_idx && pkt.pts_ms >= video_anchor_pts
                 } else {
-                    // Strictly clip audio earlier than the video IDR / target_start so
-                    // late-arriving split-A/V audio packets cannot leak pre-fault audio.
-                    pkt.pts_ms >= anchor_pts
+                    pkt.pts_ms >= audio_anchor_pts
                 }
             })
             .map(|(_, pkt)| pkt.clone())
@@ -214,7 +240,11 @@ impl ClipSaver {
         #[cfg(not(feature = "ffmpeg-ffi"))]
         let _ = (video_cfg, audio_cfg);
 
-        if let Some(url) = stream_url
+        // Never record 5 seconds from the *future* live edge for historical fault clips (especially
+        // AudioDeadAir / AudioClipping), because the fault may have already recovered by the time
+        // ffmpeg connects — causing a Dead Air incident clip to play back normal audio.
+        if fault.is_none()
+            && let Some(url) = stream_url
             && !url.starts_with("sim://")
             && remux_5s_clip_via_ffmpeg(url, &dest_path).is_ok()
         {

@@ -200,11 +200,25 @@ impl SupervisorState {
                     return false;
                 };
                 m.audio.integrated_lufs = -70.0;
+                m.audio.short_term_lufs = -70.0;
+                m.audio.true_peak_dbtp = -96.0;
+                m.audio.left_rms_dbfs = -96.0;
+                m.audio.right_rms_dbfs = -96.0;
+                m.audio.phase_correlation = 1.0;
+                m.audio.hum_peak_db = 0.0;
+                m.audio.hum_freq_hz = None;
                 vec![cid.to_string()]
             } else {
                 map.iter_mut()
                     .map(|(cid, m)| {
                         m.audio.integrated_lufs = -70.0;
+                        m.audio.short_term_lufs = -70.0;
+                        m.audio.true_peak_dbtp = -96.0;
+                        m.audio.left_rms_dbfs = -96.0;
+                        m.audio.right_rms_dbfs = -96.0;
+                        m.audio.phase_correlation = 1.0;
+                        m.audio.hum_peak_db = 0.0;
+                        m.audio.hum_freq_hz = None;
                         cid.clone()
                     })
                     .collect()
