@@ -289,41 +289,53 @@ impl SupervisorState {
         }
 
         if decision.shed_to_light {
-            let victim: Option<ChannelConfig> = {
+            // Shed highest-bitrate SIMULCAST channel to LIGHT first; if all SIMULCAST feeds are
+            // already LIGHT and WAN/GPU is still overloaded, step MASTER down 1080p60 -> 480p (Simulcast).
+            let victim: Option<(ChannelConfig, FeedTier)> = {
                 let mut map = self.channels.write().await;
-                let candidate_id = map
+                let sim_id = map
                     .values()
                     .filter(|c| c.effective_tier == FeedTier::Simulcast)
-                    .max_by_key(|c| c.config.priority)
+                    .max_by_key(|c| (c.rx_kbps.max(0.0) as u64, c.config.priority))
                     .map(|c| c.config.id.clone());
-                if let Some(id) = candidate_id {
+                if let Some(id) = sim_id {
                     map.get_mut(&id).map(|m| {
                         m.effective_tier = FeedTier::Light;
-                        m.config.clone()
+                        (m.config.clone(), FeedTier::Light)
                     })
                 } else {
-                    None
+                    let master_id = map
+                        .values()
+                        .filter(|c| c.effective_tier == FeedTier::Master)
+                        .max_by_key(|c| (c.rx_kbps.max(0.0) as u64, c.config.priority))
+                        .map(|c| c.config.id.clone());
+                    master_id.and_then(|id| {
+                        map.get_mut(&id).map(|m| {
+                            m.effective_tier = FeedTier::Simulcast;
+                            (m.config.clone(), FeedTier::Simulcast)
+                        })
+                    })
                 }
             };
-            if let Some(ch) = victim {
+            if let Some((ch, target_tier)) = victim {
                 let st = Arc::clone(self);
                 tokio::spawn(async move {
                     let resolved = match st
                         .resolver
-                        .resolve(&ch.url, ch.platform, FeedTier::Light, ch.live_streams_only)
+                        .resolve(&ch.url, ch.platform, target_tier, ch.live_streams_only)
                         .await
                     {
                         Ok(r) => Some(r),
                         Err(_) => st.resolved_media.read().await.get(&ch.id).cloned(),
                     };
-                    let still_light = st
+                    let still_target = st
                         .channels
                         .read()
                         .await
                         .get(&ch.id)
-                        .map(|m| m.effective_tier == FeedTier::Light)
+                        .map(|m| m.effective_tier == target_tier)
                         .unwrap_or(false);
-                    if !still_light {
+                    if !still_target {
                         return;
                     }
                     st.mse_hubs.invalidate(&ch.id).await;
@@ -337,7 +349,7 @@ impl SupervisorState {
                                     resolved_url: res.stream_url,
                                     audio_url: res.audio_url,
                                     headers: res.headers,
-                                    tier: FeedTier::Light,
+                                    tier: target_tier,
                                 },
                             )
                             .await;
@@ -353,18 +365,29 @@ impl SupervisorState {
             };
             if ticks >= 8 {
                 *self.recovery_healthy_ticks.lock().await = 0;
-                let recover_cand: Option<ChannelConfig> = {
+                // Recover stepped-down MASTER channels first, then shed SIMULCAST channels.
+                let recover_cand: Option<(ChannelConfig, FeedTier)> = {
                     let map = self.channels.read().await;
                     map.values()
                         .filter(|c| {
-                            c.effective_tier == FeedTier::Light
-                                && c.config.tier == FeedTier::Simulcast
+                            c.effective_tier == FeedTier::Simulcast
+                                && c.config.tier == FeedTier::Master
                                 && !c.forced_light
                         })
                         .min_by_key(|c| c.config.priority)
-                        .map(|c| c.config.clone())
+                        .map(|c| (c.config.clone(), FeedTier::Master))
+                        .or_else(|| {
+                            map.values()
+                                .filter(|c| {
+                                    c.effective_tier == FeedTier::Light
+                                        && c.config.tier == FeedTier::Simulcast
+                                        && !c.forced_light
+                                })
+                                .min_by_key(|c| c.config.priority)
+                                .map(|c| (c.config.clone(), FeedTier::Simulcast))
+                        })
                 };
-                if let Some(ch) = recover_cand {
+                if let Some((ch, target_tier)) = recover_cand {
                     let admit_ok = self.governor.lock().await.admit_tier_upgrade().is_ok();
                     if admit_ok {
                         let st = Arc::clone(self);
@@ -374,19 +397,24 @@ impl SupervisorState {
                                 .resolve(
                                     &ch.url,
                                     ch.platform,
-                                    FeedTier::Simulcast,
+                                    target_tier,
                                     ch.live_streams_only,
                                 )
                                 .await
                             {
                                 st.mse_hubs.invalidate(&ch.id).await;
+                                let expected_prev = if target_tier == FeedTier::Master {
+                                    FeedTier::Simulcast
+                                } else {
+                                    FeedTier::Light
+                                };
                                 {
                                     let mut map = st.channels.write().await;
                                     if let Some(m) = map.get_mut(&ch.id)
-                                        && m.effective_tier == FeedTier::Light
+                                        && m.effective_tier == expected_prev
                                         && !m.forced_light
                                     {
-                                        m.effective_tier = FeedTier::Simulcast;
+                                        m.effective_tier = target_tier;
                                     }
                                 }
                                 st.resolved_media
@@ -401,7 +429,7 @@ impl SupervisorState {
                                             resolved_url: resolved.stream_url,
                                             audio_url: resolved.audio_url,
                                             headers: resolved.headers,
-                                            tier: FeedTier::Simulcast,
+                                            tier: target_tier,
                                         },
                                     )
                                     .await;

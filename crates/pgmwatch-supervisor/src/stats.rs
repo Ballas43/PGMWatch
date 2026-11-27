@@ -109,11 +109,22 @@ pub async fn collect_platform_stats(
                 pub_stats
             }
         }
-        Platform::Tiktok => caches
-            .tiktok
-            .get(channel_id)
-            .cloned()
-            .unwrap_or_else(|| unavailable_stats(channel_id, "TikTok sidecar awaiting room connection")),
+        Platform::Tiktok => {
+            if let Some(cached) = caches
+                .tiktok
+                .get(channel_id)
+                .filter(|u| u.ccv.status == MetricStatus::Value)
+            {
+                cached.clone()
+            } else {
+                let http_fb = fetch_tiktok_public_stats(client, channel_id, url).await;
+                if http_fb.ccv.status == MetricStatus::Value {
+                    http_fb
+                } else {
+                    caches.tiktok.get(channel_id).cloned().unwrap_or(http_fb)
+                }
+            }
+        }
         Platform::Bigo | Platform::Custom => caches
             .mode_b
             .get(channel_id)
@@ -228,6 +239,74 @@ async fn fetch_youtube_public_stats(
         shares: TriStateMetric::na(),
         gifts_count: TriStateMetric::na(),
         extras: HashMap::new(),
+    }
+}
+
+fn parse_tiktok_public_ccv(html: &str) -> Option<f64> {
+    for key in [
+        "\"userCount\"",
+        "\"user_count\"",
+        "\"viewerCount\"",
+        "\"viewer_count\"",
+    ] {
+        let mut rest = html;
+        while let Some(idx) = rest.find(key) {
+            let after_key = &rest[idx + key.len()..];
+            let trimmed = after_key.trim_start();
+            if let Some(after_colon) = trimmed.strip_prefix(':') {
+                let num_start = after_colon.trim_start();
+                let digits: String = num_start
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(val) = digits.parse::<f64>()
+                    && val.is_finite()
+                {
+                    return Some(val);
+                }
+            }
+            rest = after_key;
+        }
+    }
+    None
+}
+
+async fn fetch_tiktok_public_stats(
+    client: &reqwest::Client,
+    channel_id: &str,
+    url: &str,
+) -> ChannelStatsUpdate {
+    let Some(username) = extract_tiktok_username(url) else {
+        return unavailable_stats(channel_id, "TikTok sidecar awaiting room connection");
+    };
+    let live_url = format!("https://www.tiktok.com/@{username}/live");
+    let html = match client
+        .get(&live_url)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+        )
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp.text().await.unwrap_or_default(),
+        _ => return unavailable_stats(channel_id, "TikTok sidecar reconnecting"),
+    };
+
+    if let Some(ccv) = parse_tiktok_public_ccv(&html) {
+        ChannelStatsUpdate {
+            channel_id: channel_id.to_string(),
+            ccv: TriStateMetric::value(ccv, 100.0),
+            total_views: TriStateMetric::na(),
+            likes: TriStateMetric::na(),
+            chat_rate_per_min: TriStateMetric::unavailable("TikTok sidecar reconnecting"),
+            shares: TriStateMetric::na(),
+            gifts_count: TriStateMetric::na(),
+            extras: HashMap::new(),
+        }
+    } else {
+        unavailable_stats(channel_id, "TikTok sidecar awaiting room connection")
     }
 }
 
@@ -516,7 +595,7 @@ impl TikTokSidecarClient {
             .arg(script_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
 
         match cmd.spawn() {
             Ok(mut child) => {
@@ -526,6 +605,17 @@ impl TikTokSidecarClient {
                     tracing::debug!("Failed assigning TikTok sidecar PID to job guard: {err}");
                 }
                 let stdin = child.stdin.take();
+                if let Some(stderr) = child.stderr.take() {
+                    tokio::spawn(async move {
+                        let mut lines = BufReader::new(stderr).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                tracing::warn!("tiktok-sidecar: {trimmed}");
+                            }
+                        }
+                    });
+                }
                 if let Some(stdout) = child.stdout.take() {
                     tokio::spawn(async move {
                         let mut lines = BufReader::new(stdout).lines();
@@ -638,5 +728,14 @@ mod tests {
             Some("hokglobal")
         );
         assert_eq!(extract_tiktok_username("https://www.tiktok.com/explore"), None);
+        assert_eq!(
+            parse_tiktok_public_ccv(r#"{"liveRoom":{"liveRoomStats":{"userCount":147}}}"#),
+            Some(147.0)
+        );
+        assert_eq!(
+            parse_tiktok_public_ccv(r#"{"roomInfo":{"user_count":72}}"#),
+            Some(72.0)
+        );
+        assert_eq!(parse_tiktok_public_ccv("<html>offline</html>"), None);
     }
 }

@@ -143,7 +143,7 @@ pub(super) fn run_demux_loop(
         }
         if is_network {
             let is_http = lower_url.starts_with("http://") || lower_url.starts_with("https://");
-            ff::av_dict_set(&mut opts, c"rw_timeout".as_ptr(), c"5000000".as_ptr(), 0);
+            ff::av_dict_set(&mut opts, c"rw_timeout".as_ptr(), c"10000000".as_ptr(), 0);
             if is_http {
                 ff::av_dict_set(&mut opts, c"reconnect".as_ptr(), c"1".as_ptr(), 0);
                 ff::av_dict_set(&mut opts, c"reconnect_streamed".as_ptr(), c"1".as_ptr(), 0);
@@ -375,15 +375,17 @@ pub(super) fn run_demux_loop(
             let is_audio_pkt = stream_idx == audio_idx;
 
             if is_video_pkt || is_audio_pkt {
-                if shared.split_av_pair {
+                let catch_up_peer = if shared.split_av_pair {
                     sync_split_av_peer(
                         &shared,
                         want_audio,
                         want_video,
                         raw_pts_ms,
                         &mut waited_for_video_start,
-                    );
-                }
+                    )
+                } else {
+                    false
+                };
 
                 if let Ok(mut tel) = shared.telemetry.lock() {
                     tel.bitrate.push(Instant::now(), raw_pts_ms, pkt_size, is_video_pkt);
@@ -408,12 +410,18 @@ pub(super) fn run_demux_loop(
                     }
                 }
 
-                pace_demux_to_realtime(
-                    is_network,
-                    raw_pts_ms,
-                    &mut pace_origin_wall,
-                    &mut pace_origin_pts_ms,
-                );
+                if catch_up_peer {
+                    // Re-anchor pacing while catching up to the peer track so we don't sleep behind it.
+                    pace_origin_wall = None;
+                    pace_origin_pts_ms = None;
+                } else {
+                    pace_demux_to_realtime(
+                        is_network,
+                        raw_pts_ms,
+                        &mut pace_origin_wall,
+                        &mut pace_origin_pts_ms,
+                    );
+                }
             }
 
             if is_audio_pkt && !actx_guard.0.is_null() {

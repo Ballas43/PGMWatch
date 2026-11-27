@@ -627,7 +627,10 @@ fn select_streamlink_quality(platform: Platform, tier: FeedTier) -> &'static str
         // YouTube HLS hard floor: never below 360p (itag 93) so AAC-LC stays >=128kbps
         (Platform::Youtube, FeedTier::Simulcast) => "480p,360p,best",
         (Platform::Youtube, FeedTier::Light) => "audio_only,360p,480p",
-        (Platform::Tiktok | Platform::Bigo, _) => "origin,hd,best",
+        (Platform::Tiktok | Platform::Bigo, FeedTier::Simulcast) => {
+            "sd,ld,480p,360p,hd,origin,best"
+        }
+        (Platform::Tiktok | Platform::Bigo, FeedTier::Light) => "audio_only,ld,sd,360p,best",
         _ => "480p,360p,best",
     }
 }
@@ -750,6 +753,7 @@ pub(crate) fn build_yt_extractor_args(
 }
 
 const YT_AV_FORMAT_EXPR: &str = "best[vcodec^=avc1][fps>=50]/best[height<=1080][vcodec^=avc1]/best[height<=1080]/bestvideo[vcodec^=avc1][fps>=50]+bestaudio[acodec^=mp4a]/bestvideo[vcodec^=avc1][fps>=50]+bestaudio/bestvideo[vcodec^=avc1]+bestaudio/bestvideo+bestaudio/best";
+const YT_SIMULCAST_FORMAT_EXPR: &str = "best[height<=480][vcodec^=avc1]/best[height<=480]/bestvideo[height<=480][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=480]+bestaudio/best[height>=360]/best";
 
 fn yt_format_for(format_expr: &str, prefer_short_audio_only: bool) -> &str {
     if format_expr.contains("bestaudio") && !format_expr.contains("bestvideo") {
@@ -758,6 +762,8 @@ fn yt_format_for(format_expr: &str, prefer_short_audio_only: bool) -> &str {
         } else {
             format_expr
         }
+    } else if format_expr.contains("height<=480") {
+        YT_SIMULCAST_FORMAT_EXPR
     } else {
         YT_AV_FORMAT_EXPR
     }

@@ -392,13 +392,16 @@ fn ts_to_ms(ts: i64, tb: ff::AVRational) -> Option<i64> {
     Some(ms)
 }
 
+/// Coordinate split audio/video demux threads so neither drifts far ahead of the other.
+/// Returns `true` when this thread is lagging >200ms behind its peer and should skip
+/// realtime pacing sleep to catch up rapidly.
 fn sync_split_av_peer(
     shared: &FfiSharedState,
     want_audio: bool,
     want_video: bool,
     raw_pts_ms: Option<i64>,
     waited_for_video_start: &mut bool,
-) {
+) -> bool {
     if want_audio && !want_video && !*waited_for_video_start {
         let wait_start = Instant::now();
         while !shared.stop_flag.load(Ordering::Relaxed) && wait_start.elapsed() < Duration::from_secs(4) {
@@ -417,25 +420,29 @@ fn sync_split_av_peer(
     }
 
     let Some(p) = raw_pts_ms.filter(|&v| v >= 0) else {
-        return;
+        return false;
     };
-    if want_audio && !want_video {
-        let vp = shared.telemetry.lock().ok().and_then(|t| t.last_video_pts_ms);
-        if let Some(v) = vp
-            && p > v + 80
-            && p - v < 15_000
-        {
-            thread::sleep(Duration::from_millis(15));
-        }
+    let peer_pts = if want_audio && !want_video {
+        shared.telemetry.lock().ok().and_then(|t| t.last_video_pts_ms)
     } else if want_video && !want_audio {
-        let ap = shared.telemetry.lock().ok().and_then(|t| t.last_audio_pts_ms);
-        if let Some(a) = ap
-            && p > a + 80
-            && p - a < 15_000
-        {
-            thread::sleep(Duration::from_millis(15));
+        shared.telemetry.lock().ok().and_then(|t| t.last_audio_pts_ms)
+    } else {
+        None
+    };
+
+    if let Some(peer) = peer_pts {
+        let ahead = p.saturating_sub(peer);
+        if ahead > 80 && ahead < 30_000 {
+            let sleep_ms = if ahead > 500 { 25 } else { 15 };
+            thread::sleep(Duration::from_millis(sleep_ms));
+            return false;
+        }
+        let behind = peer.saturating_sub(p);
+        if behind > 200 && behind < 30_000 {
+            return true;
         }
     }
+    false
 }
 
 struct DemuxTask {
