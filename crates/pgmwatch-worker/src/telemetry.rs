@@ -114,6 +114,109 @@ pub fn smooth_av_sync(prev_ms: f32, sample_ms: f32) -> f32 {
     }
 }
 
+/// Tracks true A/V clock drift and container PTS divergence without false positives
+/// from constant muxer packet interleaving, B-frame/hardware decoder pipeline lag,
+/// or transient HTTP segment fetch jitter on split A/V streams.
+pub struct AvSyncTracker {
+    split_av_pair: bool,
+    last_audio: Option<(i64, Instant)>,
+    last_video: Option<(i64, Instant)>,
+    cal_samples: Vec<f32>,
+    cal_started_at: Option<Instant>,
+    baseline_offset_ms: Option<f32>,
+    smoothed_drift_ms: f32,
+}
+
+impl AvSyncTracker {
+    pub fn new(split_av_pair: bool) -> Self {
+        Self {
+            split_av_pair,
+            last_audio: None,
+            last_video: None,
+            cal_samples: Vec::with_capacity(32),
+            cal_started_at: None,
+            baseline_offset_ms: None,
+            smoothed_drift_ms: 0.0,
+        }
+    }
+
+    pub fn push_audio(&mut self, pts_ms: i64, now: Instant) -> f32 {
+        self.last_audio = Some((pts_ms, now));
+        self.sample(now)
+    }
+
+    pub fn push_video(&mut self, pts_ms: i64, now: Instant) -> f32 {
+        self.last_video = Some((pts_ms, now));
+        self.sample(now)
+    }
+
+    fn sample(&mut self, now: Instant) -> f32 {
+        let (Some((ap_ms, t_a)), Some((vp_ms, t_v))) = (self.last_audio, self.last_video) else {
+            return self.smoothed_drift_ms;
+        };
+
+        let wall_delta_ms = if t_a >= t_v {
+            t_a.duration_since(t_v).as_secs_f32() * 1000.0
+        } else {
+            -(t_v.duration_since(t_a).as_secs_f32() * 1000.0)
+        };
+
+        // If one track has stalled for >1.5s while the other keeps advancing, do not mask it
+        // with wall-clock compensation so true track starvation surfaces as A/V sync drift.
+        let max_comp_ms = if self.split_av_pair { 500.0 } else { 250.0 };
+        let comp_ms = if wall_delta_ms.abs() > 1_500.0 {
+            0.0
+        } else {
+            wall_delta_ms.clamp(-max_comp_ms, max_comp_ms)
+        };
+
+        let raw_offset_ms = (ap_ms - vp_ms) as f32 - comp_ms;
+        if !raw_offset_ms.is_finite() {
+            return self.smoothed_drift_ms;
+        }
+
+        let max_normal_interleave_ms = if self.split_av_pair { 500.0 } else { 350.0 };
+
+        if self.baseline_offset_ms.is_none() {
+            let started = *self.cal_started_at.get_or_insert(now);
+            if raw_offset_ms.abs() <= 5_000.0 {
+                self.cal_samples.push(raw_offset_ms);
+            }
+            let elapsed = now.saturating_duration_since(started);
+            if self.cal_samples.len() >= 25
+                && (elapsed >= Duration::from_millis(1_200) || self.cal_samples.len() >= 60)
+            {
+                self.cal_samples
+                    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let med = self.cal_samples[self.cal_samples.len() / 2];
+                // Only absorb plausible muxer interleave / B-frame pipeline offsets.
+                // Genuine large container PTS mismatches (>350ms muxed, >500ms split) are kept.
+                self.baseline_offset_ms = Some(if med.abs() <= max_normal_interleave_ms {
+                    med
+                } else {
+                    0.0
+                });
+                self.cal_samples.clear();
+                self.cal_samples.shrink_to_fit();
+            } else {
+                if raw_offset_ms.abs() > max_normal_interleave_ms {
+                    let clamped = raw_offset_ms.clamp(-5_000.0, 5_000.0);
+                    self.smoothed_drift_ms = smooth_av_sync(self.smoothed_drift_ms, clamped);
+                } else {
+                    self.smoothed_drift_ms = 0.0;
+                }
+                return self.smoothed_drift_ms;
+            }
+        }
+
+        let baseline = self.baseline_offset_ms.unwrap_or(0.0);
+        let drift_ms = (raw_offset_ms - baseline).clamp(-5_000.0, 5_000.0);
+        let alpha = if self.split_av_pair { 0.10 } else { 0.15 };
+        self.smoothed_drift_ms = self.smoothed_drift_ms * (1.0 - alpha) + drift_ms * alpha;
+        self.smoothed_drift_ms
+    }
+}
+
 pub fn detect_pts_jump(prev_pts_ms: Option<i64>, curr_pts_ms: i64) -> bool {
     let Some(prev) = prev_pts_ms else {
         return false;
@@ -208,5 +311,81 @@ mod tests {
             assert!(v < dec, "expected decay at t={s}: {v} < {dec}");
             dec = v;
         }
+    }
+
+    #[test]
+    fn test_av_sync_tracker_absorbs_muxer_interleave_and_detects_real_drift() {
+        let mut tracker = AvSyncTracker::new(false);
+        let t0 = Instant::now();
+
+        // Simulate a healthy YouTube HLS stream with constant -92ms muxing/B-frame offset
+        for i in 0..40 {
+            let now = t0 + Duration::from_millis(i * 40);
+            let vp = 10_000 + (i as i64) * 40;
+            let ap = vp - 92;
+            tracker.push_video(vp, now);
+            let drift = tracker.push_audio(ap, now);
+            assert!(drift.abs() < 5.0, "healthy stream false drift at i={i}: {drift}");
+        }
+
+        // Now inject real +220ms encoder clock drift over subsequent frames
+        let mut last_drift = 0.0;
+        for i in 40..80 {
+            let now = t0 + Duration::from_millis(i * 40);
+            let vp = 10_000 + (i as i64) * 40;
+            let ap = vp - 92 + 220;
+            tracker.push_video(vp, now);
+            last_drift = tracker.push_audio(ap, now);
+        }
+        assert!(
+            last_drift > 190.0 && last_drift < 230.0,
+            "expected ~+220ms real drift, got {last_drift}"
+        );
+    }
+
+    #[test]
+    fn test_av_sync_tracker_preserves_severe_initial_pts_mismatch() {
+        let mut tracker = AvSyncTracker::new(false);
+        let t0 = Instant::now();
+
+        // Broken encoder where audio PTS starts +800ms ahead of video PTS
+        let mut last_drift = 0.0;
+        for i in 0..45 {
+            let now = t0 + Duration::from_millis(i * 40);
+            let vp = 10_000 + (i as i64) * 40;
+            let ap = vp + 800;
+            tracker.push_video(vp, now);
+            last_drift = tracker.push_audio(ap, now);
+        }
+        assert!(
+            last_drift > 700.0,
+            "severe initial PTS mismatch should not be zeroed out, got {last_drift}"
+        );
+    }
+
+    #[test]
+    fn test_av_sync_tracker_detects_track_stall() {
+        let mut tracker = AvSyncTracker::new(false);
+        let t0 = Instant::now();
+
+        // Calibrate healthy stream with -60ms interleave
+        for i in 0..40 {
+            let now = t0 + Duration::from_millis(i * 40);
+            let vp = 10_000 + (i as i64) * 40;
+            tracker.push_video(vp, now);
+            tracker.push_audio(vp - 60, now);
+        }
+
+        // Video stalls while audio keeps advancing for 2.5 seconds
+        let mut last_drift = 0.0;
+        for i in 40..105 {
+            let now = t0 + Duration::from_millis(i * 40);
+            let ap = 10_000 + (i as i64) * 40 - 60;
+            last_drift = tracker.push_audio(ap, now);
+        }
+        assert!(
+            last_drift > 500.0,
+            "video track stall should surface as A/V sync drift, got {last_drift}"
+        );
     }
 }

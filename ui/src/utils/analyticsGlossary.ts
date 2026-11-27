@@ -478,7 +478,8 @@ export const FAULT_GLOSSARY: Record<FaultKind, MetricGlossaryEntry> = {
   },
   AV_SYNC_DRIFT: {
     title: "A/V Sync Drift",
-    summary: "Source audio and video timestamps are separated by more than ±150 ms for 3+ seconds.",
+    summary:
+      "Audio and video timestamps drifted more than ±150 ms from their calibrated stream baseline (or one track stalled) for 3+ seconds.",
   },
   CORRUPT_DECODE: {
     title: "Corrupt Decode",

@@ -1,7 +1,7 @@
 use crate::backend::{DecodedFrameBatch, MediaOpenOptions};
 use crate::dsp::{CANONICAL_CHANNELS, CANONICAL_SAMPLE_RATE};
 use crate::ring_buffer::{CompressedPacket, StreamCodecConfig};
-use crate::telemetry::{estimate_qp_from_bpp, BitrateEstimator};
+use crate::telemetry::{estimate_qp_from_bpp, AvSyncTracker, BitrateEstimator};
 use ffmpeg_sys_next as ff;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::VecDeque;
@@ -32,12 +32,13 @@ struct FfiTelemetryState {
     pts_drift_pending: bool,
     corrupt_pending: bool,
     av_sync_ms: f32,
+    av_sync_tracker: AvSyncTracker,
     avg_qp: f32,
     bitrate: BitrateEstimator,
 }
 
-impl Default for FfiTelemetryState {
-    fn default() -> Self {
+impl FfiTelemetryState {
+    fn new(split_av_pair: bool) -> Self {
         Self {
             width: 0,
             height: 0,
@@ -50,6 +51,7 @@ impl Default for FfiTelemetryState {
             pts_drift_pending: false,
             corrupt_pending: false,
             av_sync_ms: 0.0,
+            av_sync_tracker: AvSyncTracker::new(split_av_pair),
             avg_qp: 22.0,
             bitrate: BitrateEstimator::default(),
         }
@@ -92,6 +94,7 @@ impl FfiFfmpegReader {
     ) -> anyhow::Result<Self> {
         let (tw, th) = if vertical { (180usize, 320usize) } else { (320usize, 180usize) };
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let split_av_pair = audio_url.is_some() && !light_mode;
         let shared = Arc::new(FfiSharedState {
             audio_queue: Mutex::new(VecDeque::with_capacity(64)),
             latest_rgb: Mutex::new(Vec::new()),
@@ -102,11 +105,11 @@ impl FfiFfmpegReader {
             audio_codec_cfg: Mutex::new(None),
             video_cfg_dirty: AtomicBool::new(false),
             audio_cfg_dirty: AtomicBool::new(false),
-            telemetry: Mutex::new(FfiTelemetryState::default()),
+            telemetry: Mutex::new(FfiTelemetryState::new(split_av_pair)),
             gpu_fault_pending: AtomicBool::new(false),
             hw_accelerated: AtomicBool::new(false),
             ended: AtomicBool::new(false),
-            split_av_pair: audio_url.is_some() && !light_mode,
+            split_av_pair,
             stop_flag: Arc::clone(&stop_flag),
         });
 

@@ -4,7 +4,7 @@ use super::{
 };
 use crate::dsp::{CANONICAL_CHANNELS, CANONICAL_SAMPLE_RATE};
 use crate::ring_buffer::CompressedPacket;
-use crate::telemetry::{detect_pts_jump, pace_demux_to_realtime, smooth_av_sync};
+use crate::telemetry::{detect_pts_jump, pace_demux_to_realtime};
 use ffmpeg_sys_next as ff;
 use std::ffi::CString;
 use std::os::raw::{c_int, c_void};
@@ -452,9 +452,7 @@ pub(super) fn run_demux_loop(
                         && let Ok(mut tel) = shared.telemetry.lock()
                     {
                         tel.last_audio_pts_ms = Some(ap_ms);
-                        if let Some(vp) = tel.last_video_pts_ms {
-                            tel.av_sync_ms = smooth_av_sync(tel.av_sync_ms, (ap_ms - vp) as f32);
-                        }
+                        tel.av_sync_ms = tel.av_sync_tracker.push_audio(ap_ms, Instant::now());
                     }
 
                     if swr_guard.0.is_null() {
@@ -579,9 +577,7 @@ pub(super) fn run_demux_loop(
                         };
                         if let Some(vp_ms) = vpts_ms {
                             tel.last_video_pts_ms = Some(vp_ms);
-                            if let Some(ap) = tel.last_audio_pts_ms {
-                                tel.av_sync_ms = smooth_av_sync(tel.av_sync_ms, (ap - vp_ms) as f32);
-                            }
+                            tel.av_sync_ms = tel.av_sync_tracker.push_video(vp_ms, Instant::now());
                         }
                         if frame_corrupt {
                             tel.corrupt_pending = true;
