@@ -621,12 +621,11 @@ fn parse_facebook_html_stats(channel_id: &str, html: &str) -> Option<ChannelStat
     })
 }
 
-async fn fetch_facebook_public_stats(
+async fn fetch_facebook_html_once(
     client: &reqwest::Client,
-    channel_id: &str,
     url: &str,
     cookie_header: Option<&str>,
-) -> ChannelStatsUpdate {
+) -> Result<String, String> {
     let mut req = client
         .get(url)
         .header(
@@ -642,27 +641,67 @@ async fn fetch_facebook_public_stats(
     if let Some(cookie) = cookie_header.filter(|s| !s.is_empty()) {
         req = req.header("Cookie", cookie);
     }
-    let Ok(resp) = req.send().await else {
-        return unavailable_stats(channel_id, "Facebook stats request failed");
-    };
+    let resp = req
+        .send()
+        .await
+        .map_err(|_| "Facebook stats request failed".to_string())?;
 
     if !resp.status().is_success() {
-        return unavailable_stats(
-            channel_id,
-            &format!("Facebook public page returned HTTP {}", resp.status().as_u16()),
-        );
+        return Err(format!(
+            "Facebook public page returned HTTP {}",
+            resp.status().as_u16()
+        ));
     }
 
-    let Ok(html) = resp.text().await else {
-        return unavailable_stats(channel_id, "Facebook HTML read failed");
+    resp.text()
+        .await
+        .map_err(|_| "Facebook HTML read failed".to_string())
+}
+
+async fn fetch_facebook_public_stats(
+    client: &reqwest::Client,
+    channel_id: &str,
+    url: &str,
+    cookie_header: Option<&str>,
+) -> ChannelStatsUpdate {
+    let has_cookie = cookie_header.is_some_and(|s| !s.is_empty());
+    // Facebook `/events/` pages embed `live_viewer_count_read_only` and `play_count` in anonymous
+    // public SSR HTML, whereas logged-in Comet SSR often lazy-loads event video stats via JS.
+    // Try the best order first, then fall back to the other mode when cookies are configured.
+    let attempts: Vec<Option<&str>> = if has_cookie {
+        if url.to_ascii_lowercase().contains("/events/") {
+            vec![None, cookie_header]
+        } else {
+            vec![cookie_header, None]
+        }
+    } else {
+        vec![None]
     };
 
-    parse_facebook_html_stats(channel_id, &html).unwrap_or_else(|| {
-        unavailable_stats(
-            channel_id,
-            "Facebook public page viewer count unavailable (login or private event)",
-        )
-    })
+    let mut last_err: Option<String> = None;
+    for cookie_opt in attempts {
+        match fetch_facebook_html_once(client, url, cookie_opt).await {
+            Ok(html) => {
+                if let Some(parsed) = parse_facebook_html_stats(channel_id, &html) {
+                    return parsed;
+                }
+                last_err = Some(
+                    "Facebook public page viewer count unavailable (login or private event)"
+                        .to_string(),
+                );
+            }
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+
+    unavailable_stats(
+        channel_id,
+        last_err
+            .as_deref()
+            .unwrap_or("Facebook public page viewer count unavailable (login or private event)"),
+    )
 }
 
 fn extract_json_number_near(haystack: &str, needle: &str) -> Option<f64> {
