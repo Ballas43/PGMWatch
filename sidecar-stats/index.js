@@ -7,14 +7,63 @@ try {
 }
 
 const connections = new Map();
-const desiredRooms = new Map(); // channelId -> { username, attempts }
+const desiredRooms = new Map(); // channelId -> { username, sessionId, attempts }
 const pendingTimers = new Map();
+const restPollTimers = new Map(); // channelId -> interval handle for direct TikTok fetchRoomInfo fallback
 
 function emit(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");
 }
 
-function scheduleReconnect(channelId) {
+function stopRestPoll(channelId) {
+  if (restPollTimers.has(channelId)) {
+    clearInterval(restPollTimers.get(channelId));
+    restPollTimers.delete(channelId);
+  }
+}
+
+function startRestPoll(channelId, username, sessionId) {
+  stopRestPoll(channelId);
+  const pollOnce = async () => {
+    const cur = desiredRooms.get(channelId);
+    if (!cur || !TikTokLiveConnection) {
+      stopRestPoll(channelId);
+      return;
+    }
+    try {
+      const opts = { processInitialData: false, enableExtendedGiftInfo: false };
+      if (sessionId && String(sessionId).trim()) {
+        opts.sessionId = String(sessionId).trim();
+      }
+      const probe = new TikTokLiveConnection(username, opts);
+      const ri = await probe.fetchRoomInfo();
+      const data = ri?.data || ri || {};
+      const ccv = Number(data?.user_count ?? data?.stats?.user_count);
+      const totalViews = Number(data?.stats?.total_user ?? data?.stats?.enter_count);
+      const rawLikes = data?.like_count ?? data?.stats?.like_count;
+      const rawShares = data?.stats?.share_count ?? data?.share_count;
+      if (Number.isFinite(ccv)) {
+        emit({
+          type: "stats",
+          channel_id: channelId,
+          ccv,
+          total_views: Number.isFinite(totalViews) && totalViews > 0 ? totalViews : null,
+          likes: typeof rawLikes === "number" && rawLikes > 0 ? rawLikes : null,
+          shares: typeof rawShares === "number" && rawShares > 0 ? rawShares : null,
+          gifts: 0,
+          chat_count: 0,
+        });
+      }
+    } catch {
+      // ignore transient roomInfo errors; next tick retries
+    }
+  };
+  void pollOnce();
+  const handle = setInterval(() => void pollOnce(), 15000);
+  restPollTimers.set(channelId, handle);
+}
+
+function scheduleReconnect(channelId, isRateLimited = false) {
   const desired = desiredRooms.get(channelId);
   if (!desired) return;
   if (pendingTimers.has(channelId)) {
@@ -23,8 +72,12 @@ function scheduleReconnect(channelId) {
   }
   const attempt = desired.attempts;
   desired.attempts = Math.min(attempt + 1, 6);
-  const baseMs = Math.min(60000, 15000 * Math.pow(2, Math.min(attempt, 2)));
-  const jitterMs = Math.floor(Math.random() * 4000);
+  // If EulerStream sign server is rate-limited, back off 10 minutes while direct fetchRoomInfo
+  // REST polling keeps live Viewers & Total Views updating every 15s without hitting EulerStream.
+  const baseMs = isRateLimited
+    ? 600000
+    : Math.min(120000, 15000 * Math.pow(2, Math.min(attempt, 3)));
+  const jitterMs = Math.floor(Math.random() * 5000);
   const timer = setTimeout(() => {
     pendingTimers.delete(channelId);
     const cur = desiredRooms.get(channelId);
@@ -131,8 +184,8 @@ function subscribeRoom(channelId, username, sessionId) {
   conn.on("disconnected", () => {
     if (!isCurrent()) return;
     connections.delete(channelId);
-    emit({ type: "error", channel_id: channelId, message: "TikTok room disconnected (reconnecting...)" });
-    scheduleReconnect(channelId);
+    startRestPoll(channelId, cleanUser, sessionId);
+    scheduleReconnect(channelId, false);
   });
 
   connections.set(channelId, conn);
@@ -140,6 +193,7 @@ function subscribeRoom(channelId, username, sessionId) {
   conn.connect()
     .then((st) => {
       if (!isCurrent()) return;
+      stopRestPoll(channelId);
       const desired = desiredRooms.get(channelId);
       if (desired) desired.attempts = 0;
       const ri = st?.roomInfo?.data || st?.roomInfo || {};
@@ -172,13 +226,12 @@ function subscribeRoom(channelId, username, sessionId) {
       if (!isCurrent()) return;
       connections.delete(channelId);
       const msg = String(err?.message || err || "TikTok connect failed");
+      const rateLimited = /rate.?limit|too many connections/i.test(msg);
       process.stderr.write(`[tiktok-sidecar] ${cleanUser}: ${msg}\n`);
-      emit({
-        type: "error",
-        channel_id: channelId,
-        message: msg,
-      });
-      scheduleReconnect(channelId);
+      // Immediately start direct TikTok fetchRoomInfo REST polling (zero EulerStream dependency)
+      // so live Viewers & Total Views stay populated even when EulerStream is rate-limited.
+      startRestPoll(channelId, cleanUser, sessionId);
+      scheduleReconnect(channelId, rateLimited);
     });
 }
 
@@ -205,6 +258,7 @@ rl.on("line", (line) => {
       pendingTimers.set(msg.channel_id, timer);
     } else if (msg.cmd === "unsubscribe") {
       desiredRooms.delete(msg.channel_id);
+      stopRestPoll(msg.channel_id);
       if (pendingTimers.has(msg.channel_id)) {
         clearTimeout(pendingTimers.get(msg.channel_id));
         pendingTimers.delete(msg.channel_id);

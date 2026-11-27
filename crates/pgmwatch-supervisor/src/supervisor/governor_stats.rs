@@ -62,7 +62,7 @@ fn pick_shed_victim(candidates: &[ShedCandidate]) -> Option<(String, FeedTier)> 
 }
 
 pub(super) fn build_stats_http_client(bind_ip: &str) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(6));
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15));
     if let Some(ip) = (!bind_ip.trim().is_empty())
         .then(|| bind_ip.trim().parse::<std::net::IpAddr>().ok())
         .flatten()
