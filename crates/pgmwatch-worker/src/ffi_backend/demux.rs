@@ -517,7 +517,9 @@ pub(super) fn run_demux_loop(
                             while pcm_accum.len() >= AUDIO_CHUNK_SAMPLES {
                                 let chunk: Vec<f32> = pcm_accum.drain(..AUDIO_CHUNK_SAMPLES).collect();
                                 if let Ok(mut aq) = shared.audio_queue.lock() {
-                                    while aq.len() >= 6 {
+                                    // Keep up to 2.4s of decoded PCM so HLS/DASH segment bursts
+                                    // don't drop chunks and cause audible PFL crackles.
+                                    while aq.len() >= 24 {
                                         aq.pop_front();
                                     }
                                     aq.push_back(chunk);

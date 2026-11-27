@@ -219,14 +219,12 @@ fn build_ffmpeg_fmp4_args(media: &ResolvedMedia) -> Vec<String> {
     }
 
     if is_hevc_stream_url(&media.stream_url) {
+        // Use libopenh264 (bundled inside our LGPL ffmpeg.exe) so HEVC streams like TikTok
+        // h265_sd/h265_ld play in every browser on every PC without requiring GPU-specific encoders.
         args.extend(
             [
                 "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-tune",
-                "zerolatency",
+                "libopenh264",
                 "-pix_fmt",
                 "yuv420p",
                 "-g",
@@ -235,8 +233,6 @@ fn build_ffmpeg_fmp4_args(media: &ResolvedMedia) -> Vec<String> {
                 "1500k",
                 "-maxrate",
                 "2000k",
-                "-bufsize",
-                "3000k",
             ]
             .map(String::from),
         );

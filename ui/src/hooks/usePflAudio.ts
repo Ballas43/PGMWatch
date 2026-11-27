@@ -172,20 +172,29 @@ export function usePflAudio() {
       const frames = Math.floor(bytes.length / (2 * chCount));
       if (frames === 0) return;
 
+      const now = ctx.currentTime;
+      // Drop excess packet on severe overrun instead of overlapping on top of active buffers.
+      if (nextTimeRef.current > now + 0.85) {
+        return;
+      }
+
+      const underrun = nextTimeRef.current < now + 0.015;
+      if (underrun) {
+        // 180ms jitter buffer absorbs 100ms WS chunk cadence and HLS segment reload bursts.
+        nextTimeRef.current = now + 0.18;
+      }
+
       const audioBuf = ctx.createBuffer(chCount, frames, sampleRate);
+      const fadeSamples = underrun ? Math.min(frames, Math.floor(sampleRate * 0.003)) : 0;
       for (let c = 0; c < chCount; c++) {
         const channelData = audioBuf.getChannelData(c);
         for (let f = 0; f < frames; f++) {
-          const sample = view.getInt16((f * chCount + c) * 2, true);
-          channelData[f] = sample / 32768;
+          let sample = view.getInt16((f * chCount + c) * 2, true) / 32768;
+          if (f < fadeSamples) {
+            sample *= f / fadeSamples;
+          }
+          channelData[f] = sample;
         }
-      }
-
-      if (
-        nextTimeRef.current < ctx.currentTime ||
-        nextTimeRef.current > ctx.currentTime + 0.45
-      ) {
-        nextTimeRef.current = ctx.currentTime + 0.04;
       }
 
       const src = ctx.createBufferSource();
@@ -198,7 +207,7 @@ export function usePflAudio() {
           src.disconnect();
         } catch {}
       };
-      const startAt = Math.max(ctx.currentTime + 0.02, nextTimeRef.current);
+      const startAt = nextTimeRef.current;
       src.start(startAt);
       nextTimeRef.current = startAt + audioBuf.duration;
     },
