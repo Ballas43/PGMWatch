@@ -479,6 +479,11 @@ async fn main() -> anyhow::Result<()> {
                             hw_accelerated: batch.hw_accelerated,
                         };
                     } else {
+                        if batch.width == 0 && batch.height == 0 {
+                            last_video_tel.width = 0;
+                            last_video_tel.height = 0;
+                            last_video_tel.fps = 0.0;
+                        }
                         last_video_tel.bitrate_kbps = batch.bitrate_kbps;
                         last_video_tel.decode_ms = batch.decode_ms;
                         last_video_tel.av_sync_ms = batch.av_sync_ms;

@@ -11,6 +11,7 @@ import {
   Pause,
   Play,
   Trash2,
+  Volume2,
 } from "lucide-react";
 import { AlertState, AudioTelemetry, ChannelRuntimeSnapshot } from "../types";
 import { ANALYTICS_GLOSSARY } from "../utils/analyticsGlossary";
@@ -159,6 +160,15 @@ export function ChannelCard({
   const isLight = channel.effective_tier === "LIGHT";
   const isVertical = channel.config.orientation_vertical;
   const isPaused = !channel.config.enabled;
+  const isAudioOnlyStream =
+    !isLight &&
+    !isPaused &&
+    channel.alert_state !== "OFFLINE" &&
+    channel.alert_state !== "EXTRACTOR_ERR" &&
+    channel.alert_state !== "LOGIN_GATED" &&
+    !thumb &&
+    channel.video.width === 0 &&
+    channel.video.height === 0;
   const canUseMse = canChannelUseHq(channel);
   const showMse = canUseMse && hqEnabled;
 
@@ -249,13 +259,16 @@ export function ChannelCard({
 
       {/* Video Monitor Canvas — uniform 16:9 multiviewer frame with centered 9:16 pillarbox */}
       <div className="group/mon relative aspect-video w-full overflow-hidden rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-rail)]">
-        {isLight ? (
+        {isLight || isAudioOnlyStream ? (
           <div className="flex h-full w-full flex-col items-center justify-center px-3 text-center">
-            <span className="font-mono-tabular text-xs text-[var(--text-secondary)]">
-              Audio-Only Monitor
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-[#4cc38a]/35 bg-[#4cc38a]/12 px-2.5 py-0.5 font-mono-tabular text-[11px] font-medium tracking-wide text-[#4cc38a]">
+              <Volume2 size={12} strokeWidth={1.75} aria-hidden="true" />
+              <span>{isLight ? "AUDIO-ONLY · LIGHT" : "AUDIO-ONLY FEED"}</span>
             </span>
-            <span className="mt-1 font-mono-tabular text-[11px] text-[var(--text-muted)]">
-              Video decode paused (0% GPU)
+            <span className="mt-1.5 font-mono-tabular text-[11px] text-[var(--text-muted)]">
+              {isLight
+                ? "Audio DSP active · Video decode paused (0% GPU)"
+                : "Audio DSP active · Stream has no video track"}
             </span>
           </div>
         ) : (
@@ -269,7 +282,11 @@ export function ChannelCard({
                 />
               ) : (
                 <div className="flex h-full w-full items-center justify-center text-xs font-mono-tabular text-[var(--text-muted)]">
-                  {isPaused ? "Feed Paused" : "Awaiting frame"}
+                  {isPaused
+                    ? "Feed Paused"
+                    : channel.alert_state === "OFFLINE"
+                    ? "Stream Offline"
+                    : "Awaiting frame"}
                 </div>
               ))}
             {showMse && (

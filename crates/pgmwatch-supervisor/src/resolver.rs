@@ -650,7 +650,7 @@ fn select_streamlink_quality(platform: Platform, tier: FeedTier) -> &'static str
         (Platform::Youtube, FeedTier::Simulcast) => "480p,360p,worst",
         (Platform::Youtube, FeedTier::Light) => "audio_only,360p,480p,worst",
         (Platform::Tiktok | Platform::Bigo, FeedTier::Simulcast) => {
-            "h264_sd,h265_sd,sd,h264_ld,h265_ld,ld,480p,360p,worst"
+            "h264_sd,h265_sd,sd,h264_ld,h265_ld,ld,480p,360p,hd,h264_hd,h265_hd,worst"
         }
         (Platform::Tiktok | Platform::Bigo, FeedTier::Light) => {
             "h264_ao,h265_ao,audio_only,h265_ld,h264_ld,ld,sd,360p,worst"
@@ -672,7 +672,7 @@ fn select_ytdlp_format(platform: Platform, tier: FeedTier) -> &'static str {
         }
         // Audio-only preferred; when platform only offers muxed HLS, pick LOWEST >=360p (never best/1080p!)
         (_, FeedTier::Light) => "bestaudio/worst[height>=360]/best[height<=480]/worst",
-        _ => "best[height<=480]/worst[height>=360]/worst",
+        _ => "best[height<=480][vcodec!=none]/worst[height>=360][vcodec!=none]/worst[vcodec!=none]/worst",
     }
 }
 
