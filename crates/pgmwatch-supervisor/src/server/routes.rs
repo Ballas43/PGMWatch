@@ -853,8 +853,18 @@ pub(super) async fn get_dash_hls_playlist(
             res
         }
         Err(err) => {
-            tracing::debug!("DASH relay error for token '{token}': {err}");
-            (StatusCode::NOT_FOUND, format!("DASH relay unavailable: {err}")).into_response()
+            let msg = err.to_string();
+            tracing::debug!("DASH/HLS relay error for token '{token}': {msg}");
+            let status = if msg.contains("HTTP 401") {
+                StatusCode::UNAUTHORIZED
+            } else if msg.contains("HTTP 403") {
+                StatusCode::FORBIDDEN
+            } else if msg.contains("HTTP 410") {
+                StatusCode::GONE
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            (status, format!("Manifest relay unavailable: {msg}")).into_response()
         }
     }
 }

@@ -140,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
     let (probe_outcome_tx, probe_outcome_rx) =
         tokio::sync::watch::channel::<Option<ProbeOutcome>>(None);
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
             tokio::select! {
                 _ = interval.tick() => {}

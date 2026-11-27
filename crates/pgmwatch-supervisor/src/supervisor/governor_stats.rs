@@ -9,7 +9,7 @@ use pgmwatch_core::grid::{
 };
 use pgmwatch_core::ipc::SupervisorToWorker;
 use pgmwatch_core::models::{
-    AlertState, ChannelConfig, FeedTier, GridSample, Platform, TriStateMetric,
+    AlertState, ChannelConfig, FeedTier, GridSample, MetricStatus, Platform, TriStateMetric,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -254,11 +254,11 @@ impl SupervisorState {
             let mut shutdown_rx = stats_state.subscribe_shutdown();
             let mut tick = 0u64;
             loop {
-                tokio::select! {
-                    _ = interval.tick() => {}
-                    _ = stats_state.stats_notify.notified() => {}
+                let force_refresh = tokio::select! {
+                    _ = interval.tick() => false,
+                    _ = stats_state.stats_notify.notified() => true,
                     _ = shutdown_rx.changed() => break,
-                }
+                };
                 if *shutdown_rx.borrow() {
                     break;
                 }
@@ -268,7 +268,9 @@ impl SupervisorState {
                     active_bind_ip = desired_bind;
                 }
                 tick += 1;
-                stats_state.run_stats_tick(&client, tick).await;
+                stats_state
+                    .run_stats_tick(&client, tick, force_refresh || tick == 1)
+                    .await;
             }
         });
 
@@ -509,7 +511,7 @@ impl SupervisorState {
         }
     }
 
-    async fn run_stats_tick(&self, client: &reqwest::Client, tick: u64) {
+    async fn run_stats_tick(&self, client: &reqwest::Client, tick: u64, force_refresh: bool) {
         let configs: Vec<ChannelConfig> = self
             .channels
             .read()
@@ -607,17 +609,47 @@ impl SupervisorState {
             facebook_cookie: fb_cookie_header.as_deref(),
         };
         let mut new_samples = Vec::with_capacity(configs.len());
+        let scrape_heavy_html = force_refresh || tick % 3 == 1;
 
         for ch in configs {
-            let update = collect_platform_stats(
-                client,
-                &ch.id,
-                &ch.url,
-                ch.platform,
-                tick,
-                &stat_caches,
-            )
-            .await;
+            let cached_heavy = if !scrape_heavy_html
+                && !ch.url.starts_with("sim://")
+                && matches!(ch.platform, Platform::Youtube | Platform::Facebook)
+            {
+                let map = self.channels.read().await;
+                map.get(&ch.id)
+                    .filter(|m| m.ccv.status == MetricStatus::Value)
+                    .map(|m| ChannelStatsUpdate {
+                        channel_id: ch.id.clone(),
+                        ccv: m.ccv.clone(),
+                        total_views: m.total_views.clone(),
+                        likes: m.likes.clone(),
+                        chat_rate_per_min: chat_rates
+                            .get(&ch.id)
+                            .copied()
+                            .map(|v| TriStateMetric::value(v, 100.0))
+                            .unwrap_or_else(|| m.chat_rate_per_min.clone()),
+                        shares: m.shares.clone(),
+                        gifts_count: m.gifts_count.clone(),
+                        extras: HashMap::new(),
+                    })
+            } else {
+                None
+            };
+
+            let update = if let Some(cached) = cached_heavy {
+                cached
+            } else {
+                collect_platform_stats(
+                    client,
+                    &ch.id,
+                    &ch.url,
+                    ch.platform,
+                    tick,
+                    &stat_caches,
+                )
+                .await
+            };
 
             {
                 let mut map = self.channels.write().await;

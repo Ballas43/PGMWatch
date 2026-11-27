@@ -138,7 +138,7 @@ impl ManifestProbe {
 
                 ProbeOutcome {
                     ad_break,
-                    stalled: self.unchanged_polls >= 4,
+                    stalled: self.unchanged_polls >= 3,
                     cdn_starvation: self.consecutive_slow_downloads >= 3,
                     cdn_ratio,
                     token_expired: false,

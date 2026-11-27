@@ -8,15 +8,50 @@ use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 const MPD_CACHE_TTL: Duration = Duration::from_millis(800);
+const HLS_PROXY_CACHE_TTL: Duration = Duration::from_millis(1800);
+const HLS_DVR_TRIM_THRESHOLD: usize = 16;
+const HLS_DVR_KEEP_SEGMENTS: usize = 12;
 const MAX_SEGMENTS_PER_REPRESENTATION: usize = 256;
 
 #[derive(Debug, Clone)]
+enum RelayKind {
+    DashMpd {
+        mpd_url: String,
+        format_id: String,
+        last_times: Vec<u64>,
+        media_sequence: u64,
+    },
+    HlsProxy {
+        playlist_url: String,
+    },
+}
+
+#[derive(Debug, Clone)]
 struct RelayEntry {
-    mpd_url: String,
-    format_id: String,
+    kind: RelayKind,
     headers: Vec<(String, String)>,
-    last_times: Vec<u64>,
-    media_sequence: u64,
+}
+
+/// Returns true for large live DVR HLS manifests (such as YouTube's 3600s DVR `index.m3u8`,
+/// which is ~883 KB uncompressed vs ~7.5 KB with gzip) where proxying through our local
+/// gzip-enabled, live-edge-trimming relay saves ~99% of manifest bandwidth.
+pub fn should_proxy_hls_manifest(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return false;
+    }
+    if let Ok(parsed) = Url::parse(&lower)
+        && matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+    {
+        return false;
+    }
+    let path = lower.split(['?', '#']).next().unwrap_or("");
+    if !path.ends_with(".m3u8") {
+        return false;
+    }
+    lower.contains("manifest.googlevideo.com")
+        || lower.contains("playlist_type/dvr")
+        || lower.contains("manifest_duration/")
 }
 
 #[derive(Debug, Clone)]
@@ -67,11 +102,37 @@ impl DashRelayState {
     ) -> String {
         let token = Uuid::new_v4().simple().to_string();
         let entry = Arc::new(Mutex::new(RelayEntry {
-            mpd_url,
-            format_id,
+            kind: RelayKind::DashMpd {
+                mpd_url,
+                format_id,
+                last_times: Vec::new(),
+                media_sequence: 0,
+            },
             headers,
-            last_times: Vec::new(),
-            media_sequence: 0,
+        }));
+        self.entries.write().await.insert(token.clone(), entry);
+        self.by_source
+            .lock()
+            .await
+            .entry(source_url.to_string())
+            .or_default()
+            .push(token.clone());
+        format!(
+            "http://127.0.0.1:{}/api/internal/dash-hls/{}.m3u8",
+            self.local_port, token
+        )
+    }
+
+    pub async fn register_hls_proxy(
+        &self,
+        source_url: &str,
+        playlist_url: String,
+        headers: Vec<(String, String)>,
+    ) -> String {
+        let token = Uuid::new_v4().simple().to_string();
+        let entry = Arc::new(Mutex::new(RelayEntry {
+            kind: RelayKind::HlsProxy { playlist_url },
+            headers,
         }));
         self.entries.write().await.insert(token.clone(), entry);
         self.by_source
@@ -104,32 +165,53 @@ impl DashRelayState {
             .cloned()
             .ok_or_else(|| anyhow!("Unknown or expired DASH relay token"))?;
 
-        let (mpd_url, format_id, headers) = {
+        let (kind, headers) = {
             let e = entry_arc.lock().await;
-            (e.mpd_url.clone(), e.format_id.clone(), e.headers.clone())
+            (e.kind.clone(), e.headers.clone())
         };
 
-        let xml = self.fetch_mpd_xml(&mpd_url, &headers).await?;
-        let parsed = parse_dash_representation_to_segments(&xml, &mpd_url, &format_id)?;
+        match kind {
+            RelayKind::HlsProxy { playlist_url } => {
+                let raw_m3u8 = self
+                    .fetch_manifest_cached(&playlist_url, &headers, HLS_PROXY_CACHE_TTL)
+                    .await?;
+                Ok(trim_hls_dvr_playlist(
+                    &playlist_url,
+                    &raw_m3u8,
+                    HLS_DVR_KEEP_SEGMENTS,
+                ))
+            }
+            RelayKind::DashMpd {
+                mpd_url,
+                format_id,
+                ..
+            } => {
+                let xml = self
+                    .fetch_manifest_cached(&mpd_url, &headers, MPD_CACHE_TTL)
+                    .await?;
+                let parsed = parse_dash_representation_to_segments(&xml, &mpd_url, &format_id)?;
 
-        let mut entry = entry_arc.lock().await;
-        let seg_times: Vec<u64> = parsed.segments.iter().map(|s| s.start_tick).collect();
-        let media_seq = advance_media_sequence(&mut entry, &seg_times);
-        drop(entry);
+                let mut entry = entry_arc.lock().await;
+                let seg_times: Vec<u64> = parsed.segments.iter().map(|s| s.start_tick).collect();
+                let media_seq = advance_media_sequence(&mut entry, &seg_times);
+                drop(entry);
 
-        let ad_break = is_dash_mpd_ad_break(&xml);
-        Ok(format_hls_v7_playlist(&parsed, media_seq, ad_break))
+                let ad_break = is_dash_mpd_ad_break(&xml);
+                Ok(format_hls_v7_playlist(&parsed, media_seq, ad_break))
+            }
+        }
     }
 
-    async fn fetch_mpd_xml(
+    async fn fetch_manifest_cached(
         &self,
-        mpd_url: &str,
+        manifest_url: &str,
         headers: &[(String, String)],
+        ttl: Duration,
     ) -> Result<String> {
         {
             let cache = self.mpd_cache.lock().await;
-            if let Some(hit) = cache.get(mpd_url)
-                && hit.fetched_at.elapsed() < MPD_CACHE_TTL
+            if let Some(hit) = cache.get(manifest_url)
+                && hit.fetched_at.elapsed() < ttl
             {
                 return Ok(hit.xml.clone());
             }
@@ -138,7 +220,12 @@ impl DashRelayState {
         let mut req_headers = HeaderMap::new();
         for (k, v) in headers {
             let lower = k.to_ascii_lowercase();
-            if matches!(lower.as_str(), "host" | "content-length" | "connection") {
+            // Strip Range and Accept-Encoding so reqwest negotiates gzip cleanly
+            // (Google's manifest.googlevideo.com disables gzip when Range is sent).
+            if matches!(
+                lower.as_str(),
+                "host" | "content-length" | "connection" | "accept-encoding" | "range"
+            ) {
                 continue;
             }
             if let (Ok(name), Ok(val)) = (
@@ -159,49 +246,183 @@ impl DashRelayState {
 
         let resp = self
             .client
-            .get(mpd_url)
+            .get(manifest_url)
             .headers(req_headers)
             .send()
             .await
-            .with_context(|| format!("Failed fetching MPD manifest {mpd_url}"))?;
+            .with_context(|| format!("Failed fetching manifest {manifest_url}"))?;
 
         if !resp.status().is_success() {
-            return Err(anyhow!("MPD fetch returned HTTP {}", resp.status()));
+            return Err(anyhow!("Manifest fetch returned HTTP {}", resp.status()));
         }
 
-        let xml = resp.text().await.context("Failed reading MPD body")?;
+        let body = resp.text().await.context("Failed reading manifest body")?;
         {
             let mut cache = self.mpd_cache.lock().await;
-            if cache.len() > 64 {
+            if cache.len() > 128 {
                 cache.retain(|_, v| v.fetched_at.elapsed() < Duration::from_secs(10));
             }
             cache.insert(
-                mpd_url.to_string(),
+                manifest_url.to_string(),
                 CachedMpd {
-                    xml: xml.clone(),
+                    xml: body.clone(),
                     fetched_at: Instant::now(),
                 },
             );
         }
-        Ok(xml)
+        Ok(body)
     }
 }
 
-fn advance_media_sequence(entry: &mut RelayEntry, seg_times: &[u64]) -> u64 {
-    if let Some(&first_t) = seg_times.first() {
-        if !entry.last_times.is_empty() {
-            if let Some(pos) = entry.last_times.iter().position(|&t| t == first_t) {
-                entry.media_sequence = entry.media_sequence.saturating_add(pos as u64);
-            } else if let Some(&last_prev) = entry.last_times.last()
-                && first_t > last_prev
-            {
-                entry.media_sequence =
-                    entry.media_sequence.saturating_add(entry.last_times.len() as u64);
+/// Trims oversized live DVR HLS media playlists (e.g., YouTube's 720-segment 1-hour DVR
+/// playlist) down to the trailing `keep_segments` live-edge segments while preserving
+/// `#EXT-X-MEDIA-SEQUENCE`, `#EXT-X-DISCONTINUITY-SEQUENCE`, `#EXT-X-KEY`, and `#EXT-X-MAP`,
+/// and resolving any relative segment URIs against `base_url`.
+pub fn trim_hls_dvr_playlist(base_url: &str, body: &str, keep_segments: usize) -> String {
+    let keep = keep_segments.max(3);
+    if body.contains("#EXT-X-ENDLIST") || body.contains("#EXT-X-STREAM-INF") {
+        return body.to_string();
+    }
+
+    let base = Url::parse(base_url).ok();
+    let mut header_lines: Vec<String> = Vec::new();
+    let mut media_seq: u64 = 0;
+    let mut has_media_seq = false;
+    let mut disc_seq: u64 = 0;
+    let mut has_disc_seq = false;
+
+    let mut segments: Vec<Vec<String>> = Vec::new();
+    let mut pending_seg_tags: Vec<String> = Vec::new();
+    let mut in_segments = false;
+
+    for raw_line in body.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !in_segments {
+            if let Some(rest) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+                if let Ok(v) = rest.trim().parse::<u64>() {
+                    media_seq = v;
+                    has_media_seq = true;
+                }
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("#EXT-X-DISCONTINUITY-SEQUENCE:") {
+                if let Ok(v) = rest.trim().parse::<u64>() {
+                    disc_seq = v;
+                    has_disc_seq = true;
+                }
+                continue;
+            }
+            let is_seg_tag = line.starts_with("#EXTINF:")
+                || line.starts_with("#EXT-X-PROGRAM-DATE-TIME:")
+                || line.starts_with("#EXT-X-DISCONTINUITY")
+                || line.starts_with("#EXT-X-BYTERANGE:")
+                || line.starts_with("#EXT-X-KEY:")
+                || line.starts_with("#EXT-X-MAP:")
+                || line.starts_with("#EXT-X-DATERANGE:");
+            if is_seg_tag || !line.starts_with('#') {
+                in_segments = true;
+            } else {
+                header_lines.push(line.to_string());
+                continue;
             }
         }
-        entry.last_times = seg_times.to_vec();
+
+        if line.starts_with('#') {
+            pending_seg_tags.push(line.to_string());
+        } else {
+            let resolved_uri = if let Some(ref b) = base {
+                b.join(line).map(String::from).unwrap_or_else(|_| line.to_string())
+            } else {
+                line.to_string()
+            };
+            pending_seg_tags.push(resolved_uri);
+            segments.push(std::mem::take(&mut pending_seg_tags));
+        }
     }
-    entry.media_sequence
+
+    if segments.len() <= HLS_DVR_TRIM_THRESHOLD || segments.len() <= keep {
+        return body.to_string();
+    }
+
+    let drop_count = segments.len() - keep;
+    let mut dropped_discontinuities = 0u64;
+    let mut last_dropped_key: Option<String> = None;
+    let mut last_dropped_map: Option<String> = None;
+    for seg in &segments[..drop_count] {
+        for l in seg {
+            if l == "#EXT-X-DISCONTINUITY" {
+                dropped_discontinuities += 1;
+            } else if l.starts_with("#EXT-X-KEY:") {
+                last_dropped_key = Some(l.clone());
+            } else if l.starts_with("#EXT-X-MAP:") {
+                last_dropped_map = Some(l.clone());
+            }
+        }
+    }
+
+    let mut out = String::with_capacity(keep * 512 + 512);
+    for h in &header_lines {
+        out.push_str(h);
+        out.push('\n');
+    }
+    if has_media_seq || drop_count > 0 {
+        out.push_str(&format!(
+            "#EXT-X-MEDIA-SEQUENCE:{}\n",
+            media_seq.saturating_add(drop_count as u64)
+        ));
+    }
+    if has_disc_seq || dropped_discontinuities > 0 {
+        out.push_str(&format!(
+            "#EXT-X-DISCONTINUITY-SEQUENCE:{}\n",
+            disc_seq.saturating_add(dropped_discontinuities)
+        ));
+    }
+    if let Some(map_tag) = last_dropped_map {
+        out.push_str(&map_tag);
+        out.push('\n');
+    }
+    if let Some(key_tag) = last_dropped_key {
+        out.push_str(&key_tag);
+        out.push('\n');
+    }
+    for seg in &segments[drop_count..] {
+        for l in seg {
+            out.push_str(l);
+            out.push('\n');
+        }
+    }
+    for tail in &pending_seg_tags {
+        out.push_str(tail);
+        out.push('\n');
+    }
+    out
+}
+
+fn advance_media_sequence(entry: &mut RelayEntry, seg_times: &[u64]) -> u64 {
+    let RelayKind::DashMpd {
+        last_times,
+        media_sequence,
+        ..
+    } = &mut entry.kind
+    else {
+        return 0;
+    };
+    if let Some(&first_t) = seg_times.first() {
+        if !last_times.is_empty() {
+            if let Some(pos) = last_times.iter().position(|&t| t == first_t) {
+                *media_sequence = media_sequence.saturating_add(pos as u64);
+            } else if let Some(&last_prev) = last_times.last()
+                && first_t > last_prev
+            {
+                *media_sequence = media_sequence.saturating_add(last_times.len() as u64);
+            }
+        }
+        *last_times = seg_times.to_vec();
+    }
+    *media_sequence
 }
 
 #[derive(Debug, Clone)]
@@ -830,11 +1051,13 @@ mod tests {
     #[test]
     fn advances_media_sequence_monotonically_across_sliding_windows() {
         let mut entry = RelayEntry {
-            mpd_url: "https://example.com/live.mpd".into(),
-            format_id: "dash-lp-pst-v".into(),
+            kind: RelayKind::DashMpd {
+                mpd_url: "https://example.com/live.mpd".into(),
+                format_id: "dash-lp-pst-v".into(),
+                last_times: Vec::new(),
+                media_sequence: 0,
+            },
             headers: vec![],
-            last_times: Vec::new(),
-            media_sequence: 0,
         };
         assert_eq!(advance_media_sequence(&mut entry, &[100, 200, 300, 400]), 0);
         // Same window (cache hit) keeps sequence 0
@@ -843,6 +1066,55 @@ mod tests {
         assert_eq!(advance_media_sequence(&mut entry, &[300, 400, 500, 600]), 2);
         // Disjoint forward jump advances cleanly
         assert_eq!(advance_media_sequence(&mut entry, &[900, 1000, 1100]), 6);
+    }
+
+    #[test]
+    fn identifies_youtube_dvr_hls_manifests_for_gzip_proxy() {
+        assert!(should_proxy_hls_manifest(
+            "https://manifest.googlevideo.com/api/manifest/hls_playlist/playlist_type/DVR/playlist/index.m3u8"
+        ));
+        assert!(should_proxy_hls_manifest(
+            "https://cdn.example.com/live/manifest_duration/3600/index.m3u8"
+        ));
+        assert!(!should_proxy_hls_manifest(
+            "http://127.0.0.1:8787/api/internal/dash-hls/abc123.m3u8"
+        ));
+        assert!(!should_proxy_hls_manifest(
+            "https://pull-flv.tiktokcdn.com/stage/stream-123.flv"
+        ));
+    }
+
+    #[test]
+    fn trims_large_live_dvr_hls_playlist_to_live_edge() {
+        let mut raw = String::from(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:5\n#EXT-X-MEDIA-SEQUENCE:2400\n#EXT-X-DISCONTINUITY-SEQUENCE:1\n",
+        );
+        for i in 0..25 {
+            if i == 5 {
+                raw.push_str("#EXT-X-DISCONTINUITY\n");
+            }
+            raw.push_str(&format!("#EXTINF:5.005,\nseg_{i}.ts\n"));
+        }
+        let trimmed = trim_hls_dvr_playlist(
+            "https://manifest.googlevideo.com/api/manifest/hls_playlist/index.m3u8",
+            &raw,
+            12,
+        );
+        assert!(trimmed.contains("#EXT-X-MEDIA-SEQUENCE:2413\n"));
+        assert!(trimmed.contains("#EXT-X-DISCONTINUITY-SEQUENCE:2\n"));
+        assert!(!trimmed.contains("seg_12.ts"));
+        assert!(trimmed.contains("https://manifest.googlevideo.com/api/manifest/hls_playlist/seg_13.ts"));
+        assert!(trimmed.contains("https://manifest.googlevideo.com/api/manifest/hls_playlist/seg_24.ts"));
+        assert_eq!(trimmed.matches("#EXTINF:").count(), 12);
+    }
+
+    #[test]
+    fn leaves_short_or_vod_hls_playlists_unchanged() {
+        let vod = "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5.0,\nseg0.ts\n#EXT-X-ENDLIST\n";
+        assert_eq!(
+            trim_hls_dvr_playlist("https://example.com/vod.m3u8", vod, 12),
+            vod
+        );
     }
 
     #[test]

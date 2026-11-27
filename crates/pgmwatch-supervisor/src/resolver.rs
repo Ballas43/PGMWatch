@@ -594,7 +594,29 @@ impl UrlResolver {
             ))
         }.await;
 
-        if let Ok(ref media) = result {
+        let mut result = result;
+        if let Ok(ref mut media) = result {
+            let proxy_v = crate::dash_relay::should_proxy_hls_manifest(&media.stream_url);
+            let proxy_a = media
+                .audio_url
+                .as_deref()
+                .is_some_and(crate::dash_relay::should_proxy_hls_manifest);
+            if proxy_v || proxy_a {
+                self.dash_relay.clear_source(url).await;
+                if proxy_v {
+                    media.stream_url = self
+                        .dash_relay
+                        .register_hls_proxy(url, media.stream_url.clone(), media.headers.clone())
+                        .await;
+                }
+                if proxy_a && let Some(ref au) = media.audio_url {
+                    media.audio_url = Some(
+                        self.dash_relay
+                            .register_hls_proxy(url, au.clone(), media.headers.clone())
+                            .await,
+                    );
+                }
+            }
             self.cache.lock().await.insert(
                 (url.to_string(), tier, live_streams_only),
                 (media.clone(), Instant::now()),
