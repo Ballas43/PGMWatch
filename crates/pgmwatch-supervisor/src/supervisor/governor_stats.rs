@@ -9,7 +9,7 @@ use pgmwatch_core::grid::{
 };
 use pgmwatch_core::ipc::SupervisorToWorker;
 use pgmwatch_core::models::{
-    AlertState, ChannelConfig, FeedTier, GridSample, MetricStatus, Platform, TriStateMetric,
+    AlertState, ChannelConfig, FeedTier, GridSample, Platform, TriStateMetric,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -525,30 +525,12 @@ impl SupervisorState {
         let msedge_path = self.cfg.read().await.extraction.msedge_path.clone();
         if let Some(msedge) = crate::ghost_browser::detect_msedge_path(&msedge_path) {
             let now = std::time::Instant::now();
-            let current_ccv_ok: HashMap<String, bool> = self
-                .channels
-                .read()
-                .await
-                .iter()
-                .map(|(id, m)| (id.clone(), m.ccv.status == MetricStatus::Value))
-                .collect();
 
             for ch in &configs {
                 if ch.url.starts_with("sim://") {
                     continue;
                 }
-                let needs_mode_b = match ch.platform {
-                    Platform::Bigo | Platform::Custom => true,
-                    Platform::Facebook => {
-                        let has_fb_auth = self
-                            .profiles_dir
-                            .join(crate::resolver::auth_profile_slug(Platform::Facebook))
-                            .join("Default")
-                            .exists();
-                        has_fb_auth && !current_ccv_ok.get(&ch.id).copied().unwrap_or(false)
-                    }
-                    _ => false,
-                };
+                let needs_mode_b = matches!(ch.platform, Platform::Bigo | Platform::Custom);
                 if !needs_mode_b {
                     continue;
                 }
@@ -564,12 +546,7 @@ impl SupervisorState {
                     continue;
                 }
 
-                let profile_dir = if ch.platform == Platform::Facebook {
-                    self.profiles_dir
-                        .join(crate::resolver::auth_profile_slug(Platform::Facebook))
-                } else {
-                    self.profiles_dir.join("mode_b_ephemeral")
-                };
+                let profile_dir = self.profiles_dir.join("mode_b_ephemeral");
 
                 if let Ok(dom) = crate::ghost_browser::scrape_dom_stats_via_edge_cdp(
                     &msedge,
