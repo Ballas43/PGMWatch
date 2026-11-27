@@ -57,7 +57,7 @@ export function PlatformAuthPanel({ onSynced }: PlatformAuthPanelProps) {
         ...prev,
         [item.platform]: {
           kind: "info",
-          text: `Finish signing in to ${item.label} in the Edge window, close it, then click Sync Session.`,
+          text: `Finish signing in to ${item.label} in the Edge window, then click Sync Session (the login window will close automatically).`,
         },
       }));
     } catch (err) {

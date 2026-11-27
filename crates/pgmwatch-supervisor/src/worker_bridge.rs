@@ -56,6 +56,7 @@ impl SupervisorState {
                 Some(&tt_state.job_guard),
             );
             let mut active_rooms: HashMap<String, String> = HashMap::new();
+            let mut active_session_id: Option<String> = None;
             let mut shutdown_rx = tt_state.subscribe_shutdown();
 
             loop {
@@ -89,8 +90,10 @@ impl SupervisorState {
                             "tiktok.com",
                             "sessionid",
                         );
+                        let session_changed = session_id != active_session_id;
+                        active_session_id = session_id.clone();
                         for (id, user) in desired {
-                            if active_rooms.get(&id) != Some(&user) {
+                            if session_changed || active_rooms.get(&id) != Some(&user) {
                                 client.subscribe(&id, &user, session_id.as_deref()).await;
                                 active_rooms.insert(id, user);
                             }
@@ -120,13 +123,25 @@ impl SupervisorState {
                                         .unwrap_or_else(|| TriStateMetric::unavailable("Awaiting TikTok total views")),
                                     likes: likes
                                         .map(|v| TriStateMetric::value(v, 100.0))
-                                        .unwrap_or_else(|| TriStateMetric::unavailable("Awaiting TikTok like count")),
+                                        .unwrap_or_else(|| {
+                                            if ccv.is_some() {
+                                                TriStateMetric::value(0.0, 100.0)
+                                            } else {
+                                                TriStateMetric::unavailable("Awaiting TikTok like count")
+                                            }
+                                        }),
                                     chat_rate_per_min: chat_count
                                         .map(|v| TriStateMetric::value(v, 95.0))
                                         .unwrap_or_else(TriStateMetric::na),
                                     shares: shares
                                         .map(|v| TriStateMetric::value(v, 100.0))
-                                        .unwrap_or_else(|| TriStateMetric::unavailable("Awaiting TikTok share count")),
+                                        .unwrap_or_else(|| {
+                                            if ccv.is_some() {
+                                                TriStateMetric::value(0.0, 100.0)
+                                            } else {
+                                                TriStateMetric::unavailable("Awaiting TikTok share count")
+                                            }
+                                        }),
                                     gifts_count: gifts
                                         .map(|v| TriStateMetric::value(v, 100.0))
                                         .unwrap_or_else(|| TriStateMetric::unavailable("Awaiting TikTok gift count")),

@@ -213,12 +213,16 @@ pub async fn sniff_media_via_edge_cdp(
 }
 
 /// Opens a visible Edge window bound strictly to `data/profiles/<platform>_auth` for optional burner login fallback.
+/// Enables a local loopback CDP port saved to `.cdp_port` so Sync Session can export cookies directly
+/// from the open login window (and close it cleanly) without ever colliding on the Windows profile lockfile.
 pub fn open_isolated_login_window(
     msedge: &Path,
     auth_profile_dir: &Path,
     login_url: &str,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(auth_profile_dir)?;
+    let port = pick_ephemeral_port();
+    let _ = std::fs::write(auth_profile_dir.join(".cdp_port"), port.to_string());
     Command::new(msedge)
         .args([
             "--no-first-run",
@@ -226,6 +230,7 @@ pub fn open_isolated_login_window(
             "--disable-background-mode",
             "--disk-cache-size=1",
             "--media-cache-size=1",
+            &format!("--remote-debugging-port={port}"),
             &format!("--user-data-dir={}", auth_profile_dir.display()),
             login_url,
         ])
@@ -241,8 +246,86 @@ pub fn wipe_auth_profile(auth_profile_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn try_export_cookies_from_cdp_port(
+    port: u16,
+    cookies_out_path: &Path,
+    close_browser: bool,
+) -> anyhow::Result<usize> {
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap_or_default();
+
+    let mut ws_url = None;
+    let mut use_browser_target = false;
+    let version_url = format!("http://127.0.0.1:{port}/json/version");
+    if let Ok(resp) = http.get(&version_url).send().await
+        && let Ok(ver) = resp.json::<serde_json::Value>().await
+        && let Some(u) = ver.get("webSocketDebuggerUrl").and_then(|v| v.as_str())
+    {
+        ws_url = Some(u.to_string());
+        use_browser_target = true;
+    } else {
+        let targets_url = format!("http://127.0.0.1:{port}/json");
+        if let Ok(resp) = http.get(&targets_url).send().await
+            && let Ok(targets) = resp.json::<serde_json::Value>().await
+            && let Some(u) = targets
+                .as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|t| t.get("webSocketDebuggerUrl"))
+                .and_then(|v| v.as_str())
+        {
+            ws_url = Some(u.to_string());
+        }
+    }
+
+    let ws_url = ws_url.ok_or_else(|| anyhow::anyhow!("CDP port {port} not responding"))?;
+    let (mut ws, _) = connect_async(&ws_url).await?;
+    let method = if use_browser_target {
+        "Storage.getCookies"
+    } else {
+        "Network.getAllCookies"
+    };
+    ws.send(Message::Text(
+        json!({ "id": 1, "method": method, "params": {} })
+            .to_string()
+            .into(),
+    ))
+    .await?;
+
+    let mut exported: Option<usize> = None;
+    while let Some(Ok(Message::Text(txt))) = ws.next().await {
+        if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&txt)
+            && ev.get("id").and_then(|v| v.as_i64()) == Some(1)
+        {
+            let cookies = ev
+                .pointer("/result/cookies")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let netscape = format_netscape_cookies(&cookies);
+            if let Some(parent) = cookies_out_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(cookies_out_path, netscape)?;
+            exported = Some(cookies.len());
+            break;
+        }
+    }
+    if close_browser {
+        let _ = ws
+            .send(Message::Text(
+                json!({ "id": 2, "method": "Browser.close", "params": {} })
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+    }
+    exported.ok_or_else(|| anyhow::anyhow!("Did not receive cookies from Edge profile"))
+}
+
 /// Exports cookies from PGMWatch's isolated visible Sign-In profile (`data/profiles/<platform>_auth`)
-/// into a Netscape `cookies.txt` file for authenticated `yt-dlp` resolution.
+/// into a Netscape `cookies.txt` file for authenticated `yt-dlp` and stats requests.
 pub async fn export_cookies_from_auth_profile(
     msedge: &Path,
     auth_profile_dir: &Path,
@@ -252,6 +335,23 @@ pub async fn export_cookies_from_auth_profile(
     if !auth_profile_dir.join("Default").exists() {
         anyhow::bail!("No signed-in Edge profile exists yet");
     }
+
+    // Fast path: if the visible login Edge window is still open with our loopback CDP port,
+    // export cookies directly from it and close it cleanly (zero profile lockfile conflict).
+    let port_file = auth_profile_dir.join(".cdp_port");
+    if let Ok(raw_port) = std::fs::read_to_string(&port_file)
+        && let Ok(existing_port) = raw_port.trim().parse::<u16>()
+        && existing_port > 0
+        && let Ok(Ok(count)) = tokio::time::timeout(
+            Duration::from_secs(5),
+            try_export_cookies_from_cdp_port(existing_port, cookies_out_path, true),
+        )
+        .await
+    {
+        let _ = std::fs::remove_file(&port_file);
+        return Ok(count);
+    }
+
     let port = pick_ephemeral_port();
     let edge_args = build_headless_edge_args(port, auth_profile_dir, "about:blank");
     use pgmwatch_core::process::BackgroundCommandExt;
@@ -264,80 +364,21 @@ pub async fn export_cookies_from_auth_profile(
 
     let _ = job_guard.assign_pid(child.id());
 
-    let res = tokio::time::timeout(Duration::from_secs(15), async {
-        let mut ws_url = None;
-        let mut use_browser_target = false;
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap_or_default();
-        for _ in 0..40 {
+    let res = tokio::time::timeout(Duration::from_secs(12), async {
+        for _ in 0..36 {
             tokio::time::sleep(Duration::from_millis(250)).await;
-            let version_url = format!("http://127.0.0.1:{port}/json/version");
-            if let Ok(resp) = http.get(&version_url).send().await
-                && let Ok(ver) = resp.json::<serde_json::Value>().await
-                && let Some(u) = ver.get("webSocketDebuggerUrl").and_then(|v| v.as_str())
-            {
-                ws_url = Some(u.to_string());
-                use_browser_target = true;
-                break;
+            if let Ok(Some(status)) = child.try_wait() {
+                anyhow::bail!(
+                    "Edge profile is locked by another Edge process (exit {status}). Click Sign In again, log in, then click Sync Session while the window is open."
+                );
             }
-            let targets_url = format!("http://127.0.0.1:{port}/json");
-            if let Ok(resp) = http.get(&targets_url).send().await
-                && let Ok(targets) = resp.json::<serde_json::Value>().await
-                && let Some(u) = targets
-                    .as_array()
-                    .and_then(|arr| arr.first())
-                    .and_then(|t| t.get("webSocketDebuggerUrl"))
-                    .and_then(|v| v.as_str())
+            if let Ok(count) =
+                try_export_cookies_from_cdp_port(port, cookies_out_path, true).await
             {
-                ws_url = Some(u.to_string());
-                break;
+                return Ok(count);
             }
         }
-        let ws_url = ws_url.ok_or_else(|| {
-            anyhow::anyhow!("Close the Sign In Edge window before clicking Sync Session")
-        })?;
-        let (mut ws, _) = connect_async(&ws_url).await?;
-        let method = if use_browser_target {
-            "Storage.getCookies"
-        } else {
-            "Network.getAllCookies"
-        };
-        ws.send(Message::Text(
-            json!({ "id": 1, "method": method, "params": {} })
-                .to_string()
-                .into(),
-        ))
-        .await?;
-        let mut exported: Option<usize> = None;
-        while let Some(Ok(Message::Text(txt))) = ws.next().await {
-            if let Ok(ev) = serde_json::from_str::<serde_json::Value>(&txt)
-                && ev.get("id").and_then(|v| v.as_i64()) == Some(1)
-            {
-                let cookies = ev
-                    .pointer("/result/cookies")
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                let netscape = format_netscape_cookies(&cookies);
-                if let Some(parent) = cookies_out_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                std::fs::write(cookies_out_path, netscape)?;
-                exported = Some(cookies.len());
-                break;
-            }
-        }
-        // Gracefully shut down Edge so all helper processes release the profile lock immediately.
-        let _ = ws
-            .send(Message::Text(
-                json!({ "id": 2, "method": "Browser.close", "params": {} })
-                    .to_string()
-                    .into(),
-            ))
-            .await;
-        exported.ok_or_else(|| anyhow::anyhow!("Did not receive cookies from Edge profile"))
+        anyhow::bail!("Timed out waiting for Edge CDP cookie export")
     })
     .await;
 
