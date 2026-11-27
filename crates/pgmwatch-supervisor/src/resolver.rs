@@ -625,13 +625,14 @@ fn select_streamlink_quality(platform: Platform, tier: FeedTier) -> &'static str
     match (platform, tier) {
         (_, FeedTier::Master) => "best",
         // YouTube HLS hard floor: never below 360p (itag 93) so AAC-LC stays >=128kbps
-        (Platform::Youtube, FeedTier::Simulcast) => "480p,360p,best",
-        (Platform::Youtube, FeedTier::Light) => "audio_only,360p,480p",
+        (Platform::Youtube, FeedTier::Simulcast) => "480p,360p,worst",
+        (Platform::Youtube, FeedTier::Light) => "audio_only,360p,480p,worst",
         (Platform::Tiktok | Platform::Bigo, FeedTier::Simulcast) => {
             "sd,ld,480p,360p,hd,origin,best"
         }
-        (Platform::Tiktok | Platform::Bigo, FeedTier::Light) => "audio_only,ld,sd,360p,best",
-        _ => "480p,360p,best",
+        (Platform::Tiktok | Platform::Bigo, FeedTier::Light) => "audio_only,ld,sd,360p,worst",
+        (_, FeedTier::Light) => "audio_only,160p,360p,480p,worst",
+        _ => "480p,360p,worst",
     }
 }
 
@@ -641,12 +642,13 @@ fn select_ytdlp_format(platform: Platform, tier: FeedTier) -> &'static str {
             "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo+bestaudio/best"
         }
         (_, FeedTier::Master) => "bestvideo+bestaudio/best",
-        // DASH paired <=480p video + bestaudio; muxed fallback floor >=360p
+        // DASH paired <=480p video + bestaudio; muxed fallback picks <=480p or lowest >=360p (never 1080p)
         (Platform::Youtube | Platform::Facebook, FeedTier::Simulcast) => {
-            "bestvideo[height<=480][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=480]+bestaudio/best[height>=360]/best"
+            "bestvideo[height<=480][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=480]+bestaudio/best[height<=480]/worst[height>=360]/best"
         }
-        (_, FeedTier::Light) => "bestaudio/best[height>=360]/best",
-        _ => "best[height<=480]/best",
+        // Audio-only preferred; when platform only offers muxed HLS, pick LOWEST >=360p (never best/1080p!)
+        (_, FeedTier::Light) => "bestaudio/worst[height>=360]/best[height<=480]/worst",
+        _ => "best[height<=480]/worst[height>=360]/best",
     }
 }
 
@@ -753,12 +755,13 @@ pub(crate) fn build_yt_extractor_args(
 }
 
 const YT_AV_FORMAT_EXPR: &str = "best[vcodec^=avc1][fps>=50]/best[height<=1080][vcodec^=avc1]/best[height<=1080]/bestvideo[vcodec^=avc1][fps>=50]+bestaudio[acodec^=mp4a]/bestvideo[vcodec^=avc1][fps>=50]+bestaudio/bestvideo[vcodec^=avc1]+bestaudio/bestvideo+bestaudio/best";
-const YT_SIMULCAST_FORMAT_EXPR: &str = "best[height<=480][vcodec^=avc1]/best[height<=480]/bestvideo[height<=480][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=480]+bestaudio/best[height>=360]/best";
+const YT_SIMULCAST_FORMAT_EXPR: &str = "best[height<=480][vcodec^=avc1]/best[height<=480]/bestvideo[height<=480][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=480]+bestaudio/worst[height>=360]/best";
+const YT_LIGHT_FORMAT_EXPR: &str = "bestaudio/worst[height>=360]/best[height<=480]/worst";
 
 fn yt_format_for(format_expr: &str, prefer_short_audio_only: bool) -> &str {
     if format_expr.contains("bestaudio") && !format_expr.contains("bestvideo") {
         if prefer_short_audio_only {
-            "bestaudio/best"
+            YT_LIGHT_FORMAT_EXPR
         } else {
             format_expr
         }
@@ -1206,5 +1209,28 @@ mod tests {
         assert!(!is_static_vod_media_url("https://cdn.example.com/live/master.m3u8"));
         assert!(is_always_live_transport_url("sim://channel_1"));
         assert!(is_always_live_transport_url("rtmp://ingest.local/app/key"));
+    }
+
+    #[test]
+    fn test_light_and_simulcast_formats_never_fallback_to_1080p_best() {
+        let yt_light = select_ytdlp_format(Platform::Youtube, FeedTier::Light);
+        assert!(!yt_light.contains("best[height>=360]"));
+        assert!(yt_light.contains("worst[height>=360]"));
+        let tv_light = yt_format_for(yt_light, true);
+        assert_ne!(tv_light, "bestaudio/best");
+        assert!(tv_light.contains("worst[height>=360]"));
+
+        let yt_sim = yt_format_for(select_ytdlp_format(Platform::Youtube, FeedTier::Simulcast), false);
+        assert!(yt_sim.contains("height<=480"));
+        assert!(!yt_sim.contains("height<=1080"));
+
+        assert_eq!(
+            select_streamlink_quality(Platform::Tiktok, FeedTier::Light),
+            "audio_only,ld,sd,360p,worst"
+        );
+        assert_eq!(
+            select_streamlink_quality(Platform::Twitch, FeedTier::Light),
+            "audio_only,160p,360p,480p,worst"
+        );
     }
 }

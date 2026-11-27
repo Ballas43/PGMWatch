@@ -204,6 +204,9 @@ async fn main() -> anyhow::Result<()> {
                                     token_expired_sent_for = None;
                                     has_media_packet = current_url.starts_with("sim://");
                                     let _ = probe_target_tx.send((current_url.clone(), headers.clone()));
+                                    // Drop & close the previous socket/threads BEFORE opening the new URL
+                                    // so tier changes don't double-download two streams simultaneously.
+                                    drop(live_reader.take());
                                     live_reader = if !current_url.starts_with("sim://") {
                                         LiveMediaReader::start(
                                             &current_url,

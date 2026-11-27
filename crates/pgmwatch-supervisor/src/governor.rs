@@ -61,15 +61,27 @@ impl ResourceGovernor {
         }
         self.last_net_sample = now;
         self.networks.refresh(true);
-        let mut rx_bytes: u64 = 0;
+        let mut max_rx_bytes: u64 = 0;
         for (name, data) in &self.networks {
             let lower = name.to_ascii_lowercase();
-            if lower.contains("loopback") || lower == "lo" {
+            // Skip loopback and Windows virtual/filter/bridge pseudo-adapters that mirror physical
+            // NIC traffic and would otherwise double-count Ethernet throughput.
+            if lower.contains("loopback")
+                || lower == "lo"
+                || lower.contains("vethernet")
+                || lower.contains("wfp")
+                || lower.contains("filter")
+                || lower.contains("pseudo")
+                || lower.contains("teredo")
+                || lower.contains("isatap")
+                || lower.contains("vmware")
+                || lower.contains("virtualbox")
+            {
                 continue;
             }
-            rx_bytes = rx_bytes.saturating_add(data.received());
+            max_rx_bytes = max_rx_bytes.max(data.received());
         }
-        let instant_mbps = ((rx_bytes as f64) * 8.0 / (elapsed * 1_000_000.0)) as f32;
+        let instant_mbps = ((max_rx_bytes as f64) * 8.0 / (elapsed * 1_000_000.0)) as f32;
         if instant_mbps.is_finite() && instant_mbps >= 0.0 {
             self.os_wan_rx_mbps = if self.os_wan_rx_mbps <= 0.01 {
                 instant_mbps
