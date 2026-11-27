@@ -420,6 +420,7 @@ pub(super) fn run_demux_loop(
                 if let Ok(mut tel) = shared.telemetry.lock() {
                     if detect_pts_jump(tel.prev_stream_audio_pts_ms, pts_ms) {
                         tel.pts_drift_pending = true;
+                        tel.av_sync_tracker.reset_calibration();
                     }
                     tel.prev_stream_audio_pts_ms = Some(pts_ms);
                 }
@@ -512,6 +513,7 @@ pub(super) fn run_demux_loop(
                 if let Ok(mut tel) = shared.telemetry.lock() {
                     if detect_pts_jump(tel.prev_stream_video_pts_ms, pts_ms) {
                         tel.pts_drift_pending = true;
+                        tel.av_sync_tracker.reset_calibration();
                     }
                     tel.prev_stream_video_pts_ms = Some(pts_ms);
                 }

@@ -311,7 +311,7 @@ export function ChannelCard({
         )}
 
         {/* Signature: Broadcast Tally Dot + Tabular LUFS/Status Pill (over video canvas — stays high-contrast dark) */}
-        <div className="pointer-events-none absolute left-2 top-2 z-20 inline-flex max-w-[calc(100%-1rem)] items-center gap-1.5 rounded border border-white/15 bg-[#0f0f10]/85 px-2 py-0.5 text-[11px] font-mono-tabular text-[#eef0f4] whitespace-nowrap">
+        <div className="pointer-events-none absolute left-2 top-2 z-20 inline-flex max-w-[calc(100%-1rem)] items-center gap-1.5 overflow-hidden rounded border border-white/15 bg-[#0f0f10]/85 px-2 py-0.5 text-[11px] font-mono-tabular text-[#eef0f4] whitespace-nowrap">
           <span className={`h-2 w-2 shrink-0 rounded-full ${st.dot}`} aria-hidden="true" />
           <span>{st.label}</span>
           <span className="text-[#9ca3af]">·</span>

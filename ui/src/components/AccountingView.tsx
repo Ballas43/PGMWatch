@@ -16,12 +16,21 @@ function isoToLocalInput(iso?: string | null): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-function localInputToIso(val: string): string | null {
+function parseLocalDatetimeInput(val: string): { ok: true; iso: string | null } | { ok: false; error: string } {
   const trimmed = val.trim();
-  if (!trimmed) return null;
-  const d = new Date(trimmed);
-  if (Number.isNaN(d.getTime())) return null;
-  return d.toISOString();
+  if (!trimmed) return { ok: true, iso: null };
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(trimmed);
+  if (!m) return { ok: false, error: "Invalid date/time format." };
+  const d = new Date(
+    Number(m[1]),
+    Number(m[2]) - 1,
+    Number(m[3]),
+    Number(m[4]),
+    Number(m[5]),
+    m[6] ? Number(m[6]) : 0
+  );
+  if (Number.isNaN(d.getTime())) return { ok: false, error: "Invalid date/time value." };
+  return { ok: true, iso: d.toISOString() };
 }
 
 interface AccountingViewProps {
@@ -35,6 +44,7 @@ export function AccountingView({ snapshot, onRefresh }: AccountingViewProps) {
   const [resetting, setResetting] = useState(false);
   const [startInput, setStartInput] = useState(() => isoToLocalInput(snapshot?.show.scheduled_start_at));
   const [endInput, setEndInput] = useState(() => isoToLocalInput(snapshot?.show.scheduled_end_at));
+  const [dirtyWindow, setDirtyWindow] = useState(false);
   const [savingWindow, setSavingWindow] = useState(false);
   const [windowErr, setWindowErr] = useState<string | null>(null);
 
@@ -43,10 +53,18 @@ export function AccountingView({ snapshot, onRefresh }: AccountingViewProps) {
   const savedEnd = snapshot?.show.scheduled_end_at ?? null;
 
   useEffect(() => {
+    setDirtyWindow(false);
     setStartInput(isoToLocalInput(savedStart));
     setEndInput(isoToLocalInput(savedEnd));
     setWindowErr(null);
-  }, [showId, savedStart, savedEnd]);
+  }, [showId]);
+
+  useEffect(() => {
+    if (!dirtyWindow) {
+      setStartInput(isoToLocalInput(savedStart));
+      setEndInput(isoToLocalInput(savedEnd));
+    }
+  }, [savedStart, savedEnd, dirtyWindow]);
 
   const loadAccounting = async () => {
     const res = await fetch("/api/accounting");
@@ -78,6 +96,7 @@ export function AccountingView({ snapshot, onRefresh }: AccountingViewProps) {
         setWindowErr(body.error ?? `Failed to save window (HTTP ${res.status})`);
         return;
       }
+      setDirtyWindow(false);
       await loadAccounting();
       onRefresh();
     } catch (err) {
@@ -172,56 +191,80 @@ export function AccountingView({ snapshot, onRefresh }: AccountingViewProps) {
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            void saveScheduleWindow(localInputToIso(startInput), localInputToIso(endInput));
+            const parsedStart = parseLocalDatetimeInput(startInput);
+            if (!parsedStart.ok) {
+              setWindowErr(`Start time: ${parsedStart.error}`);
+              return;
+            }
+            const parsedEnd = parseLocalDatetimeInput(endInput);
+            if (!parsedEnd.ok) {
+              setWindowErr(`End time: ${parsedEnd.error}`);
+              return;
+            }
+            void saveScheduleWindow(parsedStart.iso, parsedEnd.iso);
           }}
           className="mt-2.5 flex flex-wrap items-end gap-2.5"
         >
-          <label className="flex flex-col gap-1 text-[11px] text-[var(--text-muted)]">
-            <span>Stream Push (Start)</span>
+          <div className="flex flex-col gap-1 text-[11px] text-[var(--text-muted)]">
+            <label htmlFor="sched-start-input">Stream Push (Start)</label>
             <div className="flex items-center gap-1">
               <input
+                id="sched-start-input"
                 type="datetime-local"
                 value={startInput}
-                onChange={(e) => setStartInput(e.target.value)}
+                onChange={(e) => {
+                  setStartInput(e.target.value);
+                  setDirtyWindow(true);
+                }}
                 className="h-8 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-raised)] px-2 text-xs font-mono-tabular text-[var(--text-primary)]"
               />
               <button
                 type="button"
-                onClick={() => setStartInput(isoToLocalInput(new Date().toISOString()))}
+                onClick={() => {
+                  setStartInput(isoToLocalInput(new Date().toISOString()));
+                  setDirtyWindow(true);
+                }}
                 className="h-8 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-raised)] px-2 text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
                 title="Set start time to current time"
               >
                 Now
               </button>
             </div>
-          </label>
+          </div>
 
-          <label className="flex flex-col gap-1 text-[11px] text-[var(--text-muted)]">
-            <span>Stream End</span>
+          <div className="flex flex-col gap-1 text-[11px] text-[var(--text-muted)]">
+            <label htmlFor="sched-end-input">Stream End</label>
             <div className="flex items-center gap-1">
               <input
+                id="sched-end-input"
                 type="datetime-local"
                 value={endInput}
-                onChange={(e) => setEndInput(e.target.value)}
+                onChange={(e) => {
+                  setEndInput(e.target.value);
+                  setDirtyWindow(true);
+                }}
                 className="h-8 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-raised)] px-2 text-xs font-mono-tabular text-[var(--text-primary)]"
               />
               <button
                 type="button"
-                onClick={() => setEndInput(isoToLocalInput(new Date().toISOString()))}
+                onClick={() => {
+                  setEndInput(isoToLocalInput(new Date().toISOString()));
+                  setDirtyWindow(true);
+                }}
                 className="h-8 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-raised)] px-2 text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
                 title="Set end time to current time"
               >
                 Now
               </button>
             </div>
-          </label>
+          </div>
 
           <button
             type="submit"
             disabled={savingWindow}
             className="inline-flex h-8 items-center rounded-lg bg-[var(--text-primary)] px-3 text-xs font-medium text-[var(--bg-rail)] transition-opacity hover:opacity-90 disabled:opacity-50"
           >
-            {savingWindow ? "Saving..." : "Apply Window"}
+            {savingWindow ? "Saving..." : dirtyWindow ? "Apply Window *" : "Apply Window"}
           </button>
 
           {windowErr && (

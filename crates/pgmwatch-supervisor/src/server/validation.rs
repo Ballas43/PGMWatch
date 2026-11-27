@@ -48,6 +48,11 @@ pub(super) fn validate_show_preset(preset: &ShowPreset) -> Result<(), String> {
     if preset.title.trim().is_empty() || preset.title.len() > 160 {
         return Err("Show title must be 1..160 characters".into());
     }
+    if let (Some(start), Some(end)) = (preset.scheduled_start_at, preset.scheduled_end_at)
+        && end <= start
+    {
+        return Err("Stream end time must be after stream push (start) time".into());
+    }
     if preset.groups.is_empty() {
         return Err("At least one language group is required".into());
     }

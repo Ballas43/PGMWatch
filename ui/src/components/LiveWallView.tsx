@@ -380,7 +380,7 @@ export function LiveWallView({
               </div>
             </div>
 
-            <div className="grid grid-cols-[repeat(auto-fill,minmax(340px,1fr))] items-start gap-2.5">
+            <div className="grid grid-cols-[repeat(auto-fill,minmax(min(340px,100%),1fr))] items-start gap-2.5">
               {members.map((ch) => (
                 <ChannelCard
                   key={ch.config.id}

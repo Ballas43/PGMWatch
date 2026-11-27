@@ -320,7 +320,21 @@ impl SupervisorState {
                 }
             })
             .sum();
-        let pcv = (*self.combined_pcv.read().await).max(combined_ccv);
+        let now_bucket = pgmwatch_core::grid::floor_to_minute_utc(Utc::now());
+        let in_schedule_window = show
+            .scheduled_start_at
+            .map(pgmwatch_core::grid::floor_to_minute_utc)
+            .is_none_or(|sb| now_bucket >= sb)
+            && show
+                .scheduled_end_at
+                .map(pgmwatch_core::grid::floor_to_minute_utc)
+                .is_none_or(|eb| now_bucket <= eb);
+        let stored_pcv = *self.combined_pcv.read().await;
+        let pcv = if in_schedule_window {
+            stored_pcv.max(combined_ccv)
+        } else {
+            stored_pcv
+        };
         let hours_watched = *self.hours_watched.read().await;
 
         DashboardSnapshot {

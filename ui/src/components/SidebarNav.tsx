@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { BarChart3, Cpu, Film, Monitor, Moon, Power, Sliders, Sun, Volume2, VolumeX, X } from "lucide-react";
 import type { ThemeMode } from "../utils/theme";
 import { BrandLogo } from "./BrandLogo";
@@ -48,6 +48,15 @@ export function SidebarNav({
   shuttingDown = false,
 }: SidebarNavProps) {
   const [confirmShutdown, setConfirmShutdown] = useState(false);
+
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onCloseMobile();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [mobileOpen, onCloseMobile]);
   const renderNavItem = ({ id, label, shortcut, Icon }: (typeof OPERATIONS_NAV)[number]) => {
     const active = activeView === id;
     return (
@@ -253,7 +262,12 @@ export function SidebarNav({
         {navContent}
       </aside>
       {mobileOpen && (
-        <div className="fixed inset-0 z-50 flex lg:hidden">
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Navigation menu"
+          className="fixed inset-0 z-50 flex lg:hidden"
+        >
           <div className="w-52 border-r border-[var(--border-hairline)] bg-[var(--bg-rail)]">
             {navContent}
           </div>

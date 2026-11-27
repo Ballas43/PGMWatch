@@ -214,6 +214,7 @@ impl SupervisorState {
         }
         self.persist_show_preset(&preset).await;
         *self.show.write().await = preset;
+        self.recompute_live_accounting_totals().await;
         self.spawn_enabled_workers().await;
         self.sync_tiktok_subscriptions().await;
         self.sync_chat_subscriptions().await;

@@ -140,6 +140,15 @@ impl AvSyncTracker {
         }
     }
 
+    pub fn reset_calibration(&mut self) {
+        self.last_audio = None;
+        self.last_video = None;
+        self.cal_samples.clear();
+        self.cal_started_at = None;
+        self.baseline_offset_ms = None;
+        self.smoothed_drift_ms = 0.0;
+    }
+
     pub fn push_audio(&mut self, pts_ms: i64, now: Instant) -> f32 {
         self.last_audio = Some((pts_ms, now));
         self.sample(now)
@@ -170,7 +179,7 @@ impl AvSyncTracker {
             wall_delta_ms.clamp(-max_comp_ms, max_comp_ms)
         };
 
-        let raw_offset_ms = (ap_ms - vp_ms) as f32 - comp_ms;
+        let raw_offset_ms = ap_ms.saturating_sub(vp_ms) as f32 - comp_ms;
         if !raw_offset_ms.is_finite() {
             return self.smoothed_drift_ms;
         }
@@ -179,13 +188,11 @@ impl AvSyncTracker {
 
         if self.baseline_offset_ms.is_none() {
             let started = *self.cal_started_at.get_or_insert(now);
-            if raw_offset_ms.abs() <= 5_000.0 {
+            if raw_offset_ms.abs() <= 5_000.0 && self.cal_samples.len() < 120 {
                 self.cal_samples.push(raw_offset_ms);
             }
             let elapsed = now.saturating_duration_since(started);
-            if self.cal_samples.len() >= 25
-                && (elapsed >= Duration::from_millis(1_200) || self.cal_samples.len() >= 60)
-            {
+            if self.cal_samples.len() >= 25 && elapsed >= Duration::from_millis(1_200) {
                 self.cal_samples
                     .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 let med = self.cal_samples[self.cal_samples.len() / 2];

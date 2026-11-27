@@ -57,6 +57,20 @@ impl SupervisorState {
         // without requiring manual Retry clicks. Polls every 20s near/during broadcast (60s far outside).
         let offline_state = Arc::clone(self);
         tokio::spawn(async move {
+            struct PollGuard {
+                set: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+                id: String,
+            }
+            impl Drop for PollGuard {
+                fn drop(&mut self) {
+                    if let Ok(mut g) = self.set.lock() {
+                        g.remove(&self.id);
+                    }
+                }
+            }
+
+            let in_flight_polls: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+                Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(20));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Skip the immediate t=0 tick so initial startup workers finish resolving first.
@@ -84,6 +98,7 @@ impl SupervisorState {
                 if far_outside_window && poll_tick % 3 != 1 {
                     continue;
                 }
+                let cadence_secs = if far_outside_window { 60 } else { 20 };
 
                 let active_worker_ids: std::collections::HashSet<String> = {
                     let workers = offline_state.workers.lock().await;
@@ -105,8 +120,24 @@ impl SupervisorState {
                 };
 
                 for (ch, eff_tier) in candidates {
+                    {
+                        let Ok(mut set) = in_flight_polls.lock() else {
+                            continue;
+                        };
+                        if !set.insert(ch.id.clone()) {
+                            continue;
+                        }
+                    }
+                    let guard = PollGuard {
+                        set: Arc::clone(&in_flight_polls),
+                        id: ch.id.clone(),
+                    };
                     let st = Arc::clone(&offline_state);
                     tokio::spawn(async move {
+                        let _guard = guard;
+                        if *st.shutdown_tx.borrow() {
+                            return;
+                        }
                         st.resolver.invalidate_url(&ch.url).await;
                         match st
                             .resolver
@@ -114,6 +145,9 @@ impl SupervisorState {
                             .await
                         {
                             Ok(_) => {
+                                if *st.shutdown_tx.borrow() {
+                                    return;
+                                }
                                 // Cache now holds the live resolved media URL; spawn worker immediately.
                                 let still_offline = {
                                     let map = st.channels.read().await;
@@ -150,7 +184,9 @@ impl SupervisorState {
                                 {
                                     m.tracker.set_external_state(
                                         AlertState::Offline,
-                                        "Waiting for live stream (auto-checking every 20s)",
+                                        format!(
+                                            "Waiting for live stream (auto-checking every {cadence_secs}s)"
+                                        ),
                                     );
                                 }
                             }
