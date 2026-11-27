@@ -362,7 +362,15 @@ pub async fn export_cookies_from_auth_profile(
         .stderr(Stdio::null());
     let mut child: Child = cmd.spawn()?;
 
-    let _ = job_guard.assign_pid(child.id());
+    // Use a per-export Job Object so dropping it atomically terminates the entire headless Edge
+    // process tree (browser + renderer + storage utility processes) and never leaves a zombie
+    // headless Edge holding the profile lockfile (which would also swallow future Sign In windows).
+    let export_job = WindowsJobGuard::new(0).ok();
+    if let Some(ref ej) = export_job {
+        let _ = ej.assign_pid(child.id());
+    } else {
+        let _ = job_guard.assign_pid(child.id());
+    }
 
     let res = tokio::time::timeout(Duration::from_secs(12), async {
         for _ in 0..36 {
@@ -375,6 +383,7 @@ pub async fn export_cookies_from_auth_profile(
             if let Ok(count) =
                 try_export_cookies_from_cdp_port(port, cookies_out_path, true).await
             {
+                tokio::time::sleep(Duration::from_millis(150)).await;
                 return Ok(count);
             }
         }
@@ -384,6 +393,7 @@ pub async fn export_cookies_from_auth_profile(
 
     let _ = child.kill();
     let _ = child.wait();
+    drop(export_job);
     res?
 }
 
