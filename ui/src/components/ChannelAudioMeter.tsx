@@ -81,7 +81,7 @@ export function ChannelAudioMeter({
   const avgText = formatAvgLufs(audio.integrated_lufs);
 
   return (
-    <div className="mt-3 space-y-1.5 font-mono-tabular text-[11px]">
+    <div className="mt-1.5 space-y-1 font-mono-tabular text-[11px]">
       <div className="flex flex-wrap items-center justify-between gap-1.5 pb-0.5">
         <div className="flex flex-wrap items-center gap-1.5">
           <InfoTip entry={ANALYTICS_GLOSSARY.avgLufs} underline focusable>

@@ -5,12 +5,12 @@ export function RuntimeSettingsView() {
   const [statusMsg, setStatusMsg] = useState<{ text: string; isError?: boolean } | null>(null);
 
   return (
-    <div className="space-y-6 animate-enter">
-      <div>
-        <h1 className="text-2xl font-medium tracking-tight text-[var(--text-primary)]">
+    <div className="space-y-4 animate-enter">
+      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5">
+        <h1 className="text-lg font-medium tracking-tight text-[var(--text-primary)]">
           Hardware & Runtime Settings
         </h1>
-        <p className="mt-1 text-sm text-[var(--text-secondary)]">
+        <p className="text-xs text-[var(--text-secondary)]">
           System-wide GPU decode pinning, extraction options, resource limits, and alert tuning stored in pgmwatch.toml
         </p>
       </div>

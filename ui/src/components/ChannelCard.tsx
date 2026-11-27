@@ -198,12 +198,12 @@ export function ChannelCard({
 
   return (
     <article
-      className={`flex flex-col rounded-xl border bg-[var(--bg-card)] p-3 transition-colors ${st.border} ${
+      className={`flex flex-col rounded-xl border bg-[var(--bg-card)] p-2 transition-colors ${st.border} ${
         isPaused ? "opacity-75" : ""
       }`}
     >
       {/* Header row */}
-      <div className="mb-2 flex items-start justify-between gap-2">
+      <div className="mb-1.5 flex items-start justify-between gap-2">
         <div className="min-w-0">
           <h3 className="truncate text-sm font-medium text-[var(--text-primary)]">
             {channel.config.name}
@@ -421,13 +421,13 @@ export function ChannelCard({
       <ChannelSignalStrip channel={channel} />
 
       {channel.last_status_reason && (
-        <div className="mt-2 truncate rounded bg-[var(--bg-raised)] px-2 py-1 text-xs text-[var(--warning-text)]" title={channel.last_status_reason}>
+        <div className="mt-1.5 truncate rounded bg-[var(--bg-raised)] px-2 py-1 text-xs text-[var(--warning-text)]" title={channel.last_status_reason}>
           {channel.last_status_reason}
         </div>
       )}
 
       {/* Action Strip */}
-      <div className="mt-3 flex flex-wrap items-center gap-1.5">
+      <div className="mt-2 flex flex-wrap items-center gap-1.5">
         <button
           type="button"
           onClick={() => onTogglePfl(channel.config.id)}

@@ -170,8 +170,8 @@ function MonitorConsole({ theme, onChangeTheme, onServerStopped }: MonitorConsol
           onRenameShow={(title) => postAction("/api/show/title", { title })}
         />
 
-        <main id="main-content" className="flex-1 overflow-y-auto px-4 py-6 lg:px-8">
-          <div className="mx-auto max-w-[1600px]">
+        <main id="main-content" className="flex-1 overflow-y-auto p-2 sm:p-3">
+          <div className="w-full">
             {error && (
               <div
                 role="alert"

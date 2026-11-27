@@ -53,13 +53,13 @@ export function AccountingView({ snapshot, onRefresh }: AccountingViewProps) {
   const sum = accounting?.summary;
 
   return (
-    <div className="space-y-6 animate-enter">
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-medium tracking-tight text-[var(--text-primary)]">
+    <div className="space-y-4 animate-enter">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5">
+          <h1 className="text-lg font-medium tracking-tight text-[var(--text-primary)]">
             Broadcast Accounting
           </h1>
-            <p className="mt-1 text-sm text-[var(--text-secondary)]">
+          <p className="text-xs text-[var(--text-secondary)]">
             1-minute viewer summaries ({getDeviceTimeZoneLabel()}), show segments, and manual viewer corrections
           </p>
         </div>

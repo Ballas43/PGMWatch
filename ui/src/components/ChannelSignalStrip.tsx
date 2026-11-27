@@ -58,7 +58,7 @@ export function ChannelSignalStrip({ channel }: ChannelSignalStripProps) {
   }
 
   return (
-    <div className="mt-2.5 space-y-2">
+    <div className="mt-1.5 space-y-1.5">
       {/* Compact Video / Decode / CDN Transport Telemetry */}
       <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 rounded-md border border-[var(--border-hairline)] bg-[var(--bg-raised)]/50 px-2 py-1 text-[11px] font-mono-tabular">
         <div className="flex flex-wrap items-center gap-1.5 text-[var(--text-secondary)]">

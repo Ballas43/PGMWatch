@@ -135,7 +135,7 @@ export function TopBar({
 
   return (
     <>
-    <header className="flex h-14 shrink-0 items-center justify-between gap-2 sm:gap-4 border-b border-[var(--border-hairline)] bg-[var(--bg-rail)] px-3 sm:px-4 lg:px-6">
+    <header className="flex h-12 shrink-0 items-center justify-between gap-2 sm:gap-3 border-b border-[var(--border-hairline)] bg-[var(--bg-rail)] px-3">
       <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
         <button
           type="button"

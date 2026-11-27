@@ -166,14 +166,14 @@ export function LiveWallView({
   };
 
   return (
-    <div className="space-y-8 animate-enter">
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-medium tracking-tight text-[var(--text-primary)]">
+    <div className="space-y-3 animate-enter">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5">
+          <h1 className="text-lg font-medium tracking-tight text-[var(--text-primary)]">
             Live Confidence Wall
           </h1>
-          <p className="mt-1 text-sm text-[var(--text-secondary)]">
-            Live broadcast monitoring normalized at 48 kHz with ~1.5–2.5s keyframe fault clips
+          <p className="text-xs text-[var(--text-secondary)]">
+            48 kHz broadcast monitoring · ~1.5–2.5s keyframe fault clips
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -312,8 +312,8 @@ export function LiveWallView({
         const allGroupHq = groupHqIds.length > 0 && groupHqActive === groupHqIds.length;
 
         return (
-          <section key={grp.id} className="space-y-3">
-            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--border-hairline)] pb-2">
+          <section key={grp.id} className="space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--border-hairline)] pb-1.5">
               <div className="flex flex-wrap items-center gap-2 sm:gap-3">
                 <h2 className="text-base font-medium text-[var(--text-primary)]">{grp.name}</h2>
                 <span className="rounded border border-[var(--border-hairline)] bg-[var(--bg-raised)] px-2 py-0.5 text-xs font-mono-tabular text-[var(--text-secondary)]">
@@ -381,8 +381,8 @@ export function LiveWallView({
             </div>
 
             <div
-              className={`grid grid-cols-1 items-start gap-4 sm:grid-cols-2 ${
-                members.length >= 3 ? "xl:grid-cols-3 2xl:grid-cols-4" : ""
+              className={`grid grid-cols-1 items-start gap-2.5 sm:grid-cols-2 ${
+                members.length >= 3 ? "lg:grid-cols-3 2xl:grid-cols-4" : ""
               }`}
             >
               {members.map((ch) => (

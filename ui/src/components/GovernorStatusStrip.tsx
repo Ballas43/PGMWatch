@@ -28,7 +28,7 @@ function MeterCell({
   const clamped = Math.max(0, Math.min(100, Number.isFinite(pct) ? pct : 0));
   return (
     <InfoTip entry={tip} focusable className="block cursor-help">
-      <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-raised)]/60 px-3 py-2">
+      <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-raised)]/60 px-2.5 py-1.5">
         <div className="flex items-center justify-between gap-2 text-xs">
           <span className="text-[var(--text-muted)] underline decoration-[var(--border-strong)] decoration-dotted underline-offset-[3px]">
             {label}
@@ -38,7 +38,7 @@ function MeterCell({
           </span>
         </div>
         <div
-          className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-[var(--bg-rail)]"
+          className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-[var(--bg-rail)]"
           role="progressbar"
           aria-label={label}
           aria-valuemin={0}
@@ -50,7 +50,7 @@ function MeterCell({
             style={{ width: `${clamped}%` }}
           />
         </div>
-        <div className="mt-1 truncate text-[11px] font-mono-tabular text-[var(--text-muted)]">
+        <div className="mt-0.5 truncate text-[11px] font-mono-tabular text-[var(--text-muted)]">
           {detail}
         </div>
       </div>
@@ -84,7 +84,7 @@ export function GovernorStatusStrip({ governor }: GovernorStatusStripProps) {
   return (
     <section
       aria-labelledby="governor-telemetry-heading"
-      className="rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-card)] px-4 py-3"
+      className="rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-card)] px-3 py-2"
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2.5 min-w-0">
@@ -143,7 +143,7 @@ export function GovernorStatusStrip({ governor }: GovernorStatusStripProps) {
       {expanded && (
         <div
           id="governor-meters-grid"
-          className="mt-3 grid grid-cols-1 gap-2.5 sm:grid-cols-2 lg:grid-cols-5"
+          className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-5"
         >
           <MeterCell
             label="GPU Memory (VRAM)"

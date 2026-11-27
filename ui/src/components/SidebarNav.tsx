@@ -89,9 +89,9 @@ export function SidebarNav({
   };
 
   const navContent = (
-    <div className="flex h-full flex-col justify-between p-4">
+    <div className="flex h-full flex-col justify-between p-3">
       <div>
-        <div className="flex items-center justify-between pb-6">
+        <div className="flex items-center justify-between pb-4">
           <div className="flex items-center gap-2.5">
             <BrandLogo size={30} variant="badge" />
             <div className="leading-tight">
@@ -115,7 +115,7 @@ export function SidebarNav({
           <div className="mb-2 text-xs text-[var(--text-muted)]">Operations</div>
           <div className="flex flex-col gap-1">{OPERATIONS_NAV.map(renderNavItem)}</div>
 
-          <div className="mb-2 mt-6 text-xs text-[var(--text-muted)]">System</div>
+          <div className="mb-2 mt-4 text-xs text-[var(--text-muted)]">System</div>
           <div className="flex flex-col gap-1">{SYSTEM_NAV.map(renderNavItem)}</div>
         </nav>
       </div>
@@ -249,12 +249,12 @@ export function SidebarNav({
 
   return (
     <>
-      <aside className="hidden w-60 shrink-0 border-r border-[var(--border-hairline)] bg-[var(--bg-rail)] lg:block">
+      <aside className="hidden w-52 shrink-0 border-r border-[var(--border-hairline)] bg-[var(--bg-rail)] lg:block">
         {navContent}
       </aside>
       {mobileOpen && (
         <div className="fixed inset-0 z-50 flex lg:hidden">
-          <div className="w-60 border-r border-[var(--border-hairline)] bg-[var(--bg-rail)]">
+          <div className="w-52 border-r border-[var(--border-hairline)] bg-[var(--bg-rail)]">
             {navContent}
           </div>
           <button

@@ -633,12 +633,12 @@ export function ShowSetupView({ snapshot, onRefresh }: ShowSetupViewProps) {
   };
 
   return (
-    <div className="space-y-6 animate-enter">
-      <div>
-        <h1 className="text-2xl font-medium tracking-tight text-[var(--text-primary)]">
+    <div className="space-y-4 animate-enter">
+      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5">
+        <h1 className="text-lg font-medium tracking-tight text-[var(--text-primary)]">
           Show Setup & Channels
         </h1>
-        <p className="mt-1 text-sm text-[var(--text-secondary)]">
+        <p className="text-xs text-[var(--text-secondary)]">
           Manage language categories, paste public stream URLs (zero API keys), or edit live channels and tiers
         </p>
       </div>
