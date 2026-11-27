@@ -2,10 +2,14 @@ use crate::win32::{is_on_battery, query_dxgi_adapters, resolve_dxgi_adapter_inde
 use chrono::Utc;
 use pgmwatch_core::config::GovernorConfig;
 use pgmwatch_core::models::GovernorTelemetry;
-use sysinfo::System;
+use std::time::Instant;
+use sysinfo::{Networks, System};
 
 pub struct ResourceGovernor {
     sys: System,
+    networks: Networks,
+    last_net_sample: Instant,
+    os_wan_rx_mbps: f32,
     cfg: GovernorConfig,
     last_wan_rx_mbps: f32,
     preferred_gpu_luid: String,
@@ -37,12 +41,43 @@ impl ResourceGovernor {
     pub fn new(cfg: GovernorConfig) -> Self {
         let mut sys = System::new_all();
         sys.refresh_all();
+        let networks = Networks::new_with_refreshed_list();
         Self {
             sys,
+            networks,
+            last_net_sample: Instant::now(),
+            os_wan_rx_mbps: 0.0,
             cfg,
             last_wan_rx_mbps: 0.0,
             preferred_gpu_luid: String::new(),
         }
+    }
+
+    fn sample_os_wan_rx_mbps(&mut self) -> f32 {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_net_sample).as_secs_f64();
+        if elapsed < 0.25 {
+            return self.os_wan_rx_mbps;
+        }
+        self.last_net_sample = now;
+        self.networks.refresh(true);
+        let mut rx_bytes: u64 = 0;
+        for (name, data) in &self.networks {
+            let lower = name.to_ascii_lowercase();
+            if lower.contains("loopback") || lower == "lo" {
+                continue;
+            }
+            rx_bytes = rx_bytes.saturating_add(data.received());
+        }
+        let instant_mbps = ((rx_bytes as f64) * 8.0 / (elapsed * 1_000_000.0)) as f32;
+        if instant_mbps.is_finite() && instant_mbps >= 0.0 {
+            self.os_wan_rx_mbps = if self.os_wan_rx_mbps <= 0.01 {
+                instant_mbps
+            } else {
+                self.os_wan_rx_mbps * 0.5 + instant_mbps * 0.5
+            };
+        }
+        self.os_wan_rx_mbps
     }
 
     pub fn update_config(&mut self, cfg: GovernorConfig) {
@@ -91,10 +126,14 @@ impl ResourceGovernor {
         &mut self,
         active_workers: usize,
         shed_channels: usize,
-        wan_rx_mbps: f32,
+        worker_wan_rx_mbps: f32,
         max_decode_latency_pct: f32,
         nominal_thumb_fps: f32,
     ) -> GovernorDecision {
+        // Measure real host NIC RX (captures MSE Live 60p, muxed LIGHT downloads, and HTTP overhead)
+        // and take max with reported worker media bitrates so the UI & WAN cap reflect actual load.
+        let os_rx_mbps = self.sample_os_wan_rx_mbps();
+        let wan_rx_mbps = worker_wan_rx_mbps.max(os_rx_mbps);
         self.last_wan_rx_mbps = wan_rx_mbps;
         self.sys.refresh_memory();
         self.sys.refresh_cpu_usage();
@@ -103,6 +142,7 @@ impl ResourceGovernor {
         let ram_total_mb = (self.sys.total_memory() / (1024 * 1024)).max(1);
         let ram_pct = (ram_used_mb as f32 / ram_total_mb as f32) * 100.0;
         let cpu_pct = self.sys.global_cpu_usage();
+        let wan_pct = (wan_rx_mbps / self.cfg.wan_cap_mbps.max(1.0)) * 100.0;
 
         let adapters = query_dxgi_adapters();
         let (gpu_adapter_name, vram_used_mb, vram_budget_mb, vram_pct) =
@@ -121,10 +161,12 @@ impl ResourceGovernor {
         let on_battery = is_on_battery();
 
         let stage2 = vram_pct >= self.cfg.vram_stage2_pct
-            || max_decode_latency_pct >= self.cfg.decode_latency_stage2_pct;
+            || max_decode_latency_pct >= self.cfg.decode_latency_stage2_pct
+            || wan_pct >= 100.0;
         let stage1 = stage2
             || vram_pct >= self.cfg.vram_stage1_pct
             || max_decode_latency_pct >= self.cfg.decode_latency_stage1_pct
+            || wan_pct >= self.cfg.wan_admit_max_pct
             || on_battery;
 
         let degradation_stage = if stage2 {

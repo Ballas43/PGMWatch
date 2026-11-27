@@ -374,6 +374,16 @@ pub(super) fn run_demux_loop(
             let is_video_pkt = stream_idx == video_idx;
             let is_audio_pkt = stream_idx == audio_idx;
 
+            // Count ALL downloaded packet bytes (including undecoded video packets on muxed LIGHT
+            // streams like TikTok/FLV) so per-channel rx_kbps reflects actual network consumption.
+            if pkt_size > 0
+                && !is_video_pkt
+                && !is_audio_pkt
+                && let Ok(mut tel) = shared.telemetry.lock()
+            {
+                tel.bitrate.push(Instant::now(), raw_pts_ms, pkt_size, false);
+            }
+
             if is_video_pkt || is_audio_pkt {
                 let catch_up_peer = if shared.split_av_pair {
                     sync_split_av_peer(
