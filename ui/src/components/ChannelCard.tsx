@@ -57,13 +57,13 @@ function stateStyle(state: AlertState): { dot: string; border: string; label: st
     case "AD_BREAK":
       return { dot: "bg-[#3b82f6]", border: "border-[#3b82f6]/50", label: "Ad Break" };
     case "LOGIN_GATED":
-      return { dot: "bg-[#a78bfa]", border: "border-[#a78bfa]/50", label: "Login Gated" };
+      return { dot: "bg-[#a78bfa]", border: "border-[#a78bfa]/50", label: "Login Required" };
     case "EXTRACTOR_ERR":
-      return { dot: "bg-[#a78bfa]", border: "border-[#a78bfa]/50", label: "Extractor Err" };
+      return { dot: "bg-[#a78bfa]", border: "border-[#a78bfa]/50", label: "Stream Error" };
     case "REACQUIRING":
-      return { dot: "bg-[#85858b]", border: "border-[var(--border-hairline)]", label: "Reacquiring" };
+      return { dot: "bg-[#85858b]", border: "border-[var(--border-hairline)]", label: "Reconnecting" };
     case "HEALTHY":
-      return { dot: "bg-[#4cc38a]", border: "border-[var(--border-hairline)]", label: "Nominal" };
+      return { dot: "bg-[#4cc38a]", border: "border-[var(--border-hairline)]", label: "Healthy" };
     default:
       return { dot: "bg-[#85858b]", border: "border-[var(--border-hairline)]", label: "Offline" };
   }
@@ -232,7 +232,7 @@ export function ChannelCard({
             {channel.video_shed_resource && (
               <InfoTip entry={ANALYTICS_GLOSSARY.shedChannels} focusable>
                 <span className="rounded bg-[#e5a93b]/15 px-1.5 py-0.5 text-[11px] font-mono-tabular text-[#e5a93b]">
-                  VIDEO_SHED_RESOURCE
+                  {isLight ? "AUDIO-ONLY (LOAD)" : "STEPPED DOWN (LOAD)"}
                 </span>
               </InfoTip>
             )}

@@ -220,9 +220,14 @@ async fn main() -> anyhow::Result<()> {
                                         None
                                     };
                                     bitrate_tracker.reset();
+                                    last_video_tel = VideoTelemetry::default();
+                                    last_video_faults.clear();
+                                    last_batch_faults.clear();
+                                    last_audio_faults.clear();
                                     ring.clear();
                                     av_sync_bad_ms = 0;
                                     last_rx_time = Instant::now();
+                                    last_video_time = Instant::now();
                                 }
                                 SupervisorToWorker::SetThumbnailFps { fps } => {
                                     thumb_fps = fps.max(0.2);
@@ -533,7 +538,7 @@ async fn main() -> anyhow::Result<()> {
 
                     let light_only = tier == FeedTier::Light || force_cpu_light;
                     if !light_only
-                        && bitrate_tracker.update(&last_video_tel, emit_elapsed_ms)
+                        && bitrate_tracker.update(&last_video_tel, tier, emit_elapsed_ms)
                     {
                         faults.push(FaultKind::BitrateCollapse);
                     }
@@ -576,6 +581,7 @@ struct BitrateCollapseTracker {
     warmup_ms: u64,
     baseline_kbps: Option<f32>,
     collapse_bad_ms: u64,
+    last_resolution: Option<(u32, u32)>,
 }
 
 fn is_static_vbr_saving(video: &VideoTelemetry) -> bool {
@@ -589,10 +595,34 @@ impl BitrateCollapseTracker {
         self.warmup_ms = 0;
         self.baseline_kbps = None;
         self.collapse_bad_ms = 0;
+        self.last_resolution = None;
     }
 
-    fn update(&mut self, video: &VideoTelemetry, elapsed_ms: u64) -> bool {
+    fn update(&mut self, video: &VideoTelemetry, tier: FeedTier, elapsed_ms: u64) -> bool {
+        // Audio-only streams or feeds without decoded video frames cannot have video bitrate collapse.
+        if video.width == 0 || video.height == 0 {
+            self.collapse_bad_ms = 0;
+            return false;
+        }
+
+        // Recalibrate when stream resolution changes significantly (e.g. governor step-down
+        // 1080p -> 480p or upstream ABR rendition switch) so lower-res bitrates never false-alarm.
+        let cur_res = (video.width, video.height);
+        if let Some((prev_w, prev_h)) = self.last_resolution {
+            let prev_area = (prev_w as f64) * (prev_h as f64);
+            let cur_area = (cur_res.0 as f64) * (cur_res.1 as f64);
+            if prev_area > 0.0 && (cur_area / prev_area < 0.7 || cur_area / prev_area > 1.4) {
+                self.reset();
+                self.last_resolution = Some(cur_res);
+                return false;
+            }
+        }
+        self.last_resolution = Some(cur_res);
+
         let kbps = video.bitrate_kbps;
+        if !kbps.is_finite() {
+            return false;
+        }
         if self.warmup_ms < BITRATE_WARMUP_MS {
             if kbps > 50.0 {
                 self.warmup_ms = self.warmup_ms.saturating_add(elapsed_ms);
@@ -605,7 +635,19 @@ impl BitrateCollapseTracker {
             }
             return false;
         };
-        if base > 400.0 && kbps < base * 0.35 {
+
+        let is_stepped_down_sd =
+            tier == FeedTier::Simulcast || video.width.min(video.height) <= 480;
+        let below_threshold = if is_stepped_down_sd {
+            // Stepped-down / <=480p feeds legitimately vary down to ~200 kbps on talking-head scenes;
+            // only flag collapse when bitrate is severely starved (<180 kbps) or visual quality degrades.
+            let severe_quality_drop = video.avg_qp > 42.0 || video.blockiness_score > 3.0;
+            base > 350.0 && kbps < base * 0.30 && (kbps < 180.0 || severe_quality_drop)
+        } else {
+            base > 400.0 && kbps < base * 0.35
+        };
+
+        if below_threshold {
             if is_static_vbr_saving(video) {
                 // Static/clean slides legitimately drop CRF/VBR bitrate well below 35%;
                 // pause collapse timer and preserve prior active baseline until motion resumes.
@@ -691,6 +733,8 @@ mod tests {
     #[test]
     fn test_bitrate_collapse_tracker_ignores_warmup_and_vbr_dips() {
         let mk_video = |kbps: f32, changed_pct: f32, frame_mad: f32, avg_qp: f32| VideoTelemetry {
+            width: 1920,
+            height: 1080,
             bitrate_kbps: kbps,
             changed_pct,
             frame_mad,
@@ -703,32 +747,32 @@ mod tests {
         // Cold-start HLS spike (30 Mb/s for 5s) must not lock an inflated baseline
         let burst = mk_video(30_000.0, 10.0, 3.0, 28.0);
         for _ in 0..10 {
-            assert!(!t.update(&burst, 500));
+            assert!(!t.update(&burst, FeedTier::Master, 500));
         }
         // Baseline seeds at settled 5,000 kbps after warmup
         let nominal = mk_video(5_000.0, 10.0, 3.0, 28.0);
-        assert!(!t.update(&nominal, 500));
+        assert!(!t.update(&nominal, FeedTier::Master, 500));
         // Quiet VBR scene down to 2,200 kbps (44%) for 20s must not trigger
         let mild_vbr = mk_video(2_200.0, 6.0, 2.0, 31.0);
         for _ in 0..40 {
-            assert!(!t.update(&mild_vbr, 500));
+            assert!(!t.update(&mild_vbr, FeedTier::Master, 500));
         }
         // Very low VBR bitrate (250 kbps) on a clean static slide must NOT trigger BitrateCollapse
         let static_slide = mk_video(250.0, 0.8, 0.4, 34.0);
         for _ in 0..30 {
-            assert!(!t.update(&static_slide, 500));
+            assert!(!t.update(&static_slide, FeedTier::Master, 500));
         }
         // Transient 4s drop below 35% with active motion must not trigger before 6s hysteresis
         let motion_collapse = mk_video(300.0, 12.0, 4.5, 39.0);
         for _ in 0..8 {
-            assert!(!t.update(&motion_collapse, 500));
+            assert!(!t.update(&motion_collapse, FeedTier::Master, 500));
         }
         // Recovery resets timer
-        assert!(!t.update(&mk_video(4_000.0, 9.0, 2.8, 30.0), 500));
+        assert!(!t.update(&mk_video(4_000.0, 9.0, 2.8, 30.0), FeedTier::Master, 500));
         // Sustained severe collapse (<35%) with active motion triggers once >= 6s elapses
         let severe = mk_video(200.0, 11.0, 4.0, 40.0);
         for i in 0..12 {
-            let tripped = t.update(&severe, 500);
+            let tripped = t.update(&severe, FeedTier::Master, 500);
             if i < 11 {
                 assert!(!tripped, "tripped too early at step {i}");
             } else {
@@ -738,17 +782,66 @@ mod tests {
         // Static low-motion scene with severe macroblocking/QP degradation MUST still alert
         t.reset();
         for _ in 0..10 {
-            t.update(&nominal, 500);
+            t.update(&nominal, FeedTier::Master, 500);
         }
-        assert!(!t.update(&nominal, 500));
+        assert!(!t.update(&nominal, FeedTier::Master, 500));
         let crushed_static = mk_video(180.0, 0.5, 0.3, 48.0);
         for i in 0..12 {
-            let tripped = t.update(&crushed_static, 500);
+            let tripped = t.update(&crushed_static, FeedTier::Master, 500);
             if i < 11 {
                 assert!(!tripped, "tripped too early at crushed step {i}");
             } else {
                 assert!(tripped, "expected crushed low-motion collapse at 6s");
             }
+        }
+    }
+
+    #[test]
+    fn test_bitrate_collapse_handles_stepped_down_and_audio_only_feeds() {
+        let mk_res = |w: u32, h: u32, kbps: f32, avg_qp: f32| VideoTelemetry {
+            width: w,
+            height: h,
+            bitrate_kbps: kbps,
+            changed_pct: 8.0,
+            frame_mad: 3.0,
+            avg_qp,
+            blockiness_score: 1.0,
+            ..VideoTelemetry::default()
+        };
+
+        let mut t = BitrateCollapseTracker::default();
+        let hd = mk_res(1920, 1080, 5_500.0, 26.0);
+        for _ in 0..12 {
+            assert!(!t.update(&hd, FeedTier::Master, 500));
+        }
+
+        // Governor or ABR steps down 1080p -> 480p (750 kbps): must recalibrate, never alert
+        let sd_stepdown = mk_res(854, 480, 750.0, 30.0);
+        for _ in 0..20 {
+            assert!(!t.update(&sd_stepdown, FeedTier::Simulcast, 500));
+        }
+
+        // Clean 480p VBR dip (210 kbps, clean QP) on stepped-down feed must NOT false-alarm
+        let sd_clean_dip = mk_res(854, 480, 210.0, 32.0);
+        for _ in 0..20 {
+            assert!(!t.update(&sd_clean_dip, FeedTier::Simulcast, 500));
+        }
+
+        // Severe 480p collapse (90 kbps) MUST still trigger after 6s
+        let sd_collapse = mk_res(854, 480, 90.0, 44.0);
+        for i in 0..12 {
+            let tripped = t.update(&sd_collapse, FeedTier::Simulcast, 500);
+            if i < 11 {
+                assert!(!tripped, "tripped too early at sd collapse step {i}");
+            } else {
+                assert!(tripped, "expected sd collapse at 6s");
+            }
+        }
+
+        // Audio-only stream (0x0) must never trigger video BitrateCollapse
+        let audio_only = mk_res(0, 0, 96.0, 0.0);
+        for _ in 0..20 {
+            assert!(!t.update(&audio_only, FeedTier::Simulcast, 500));
         }
     }
 }

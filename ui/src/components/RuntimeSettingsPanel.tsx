@@ -211,7 +211,7 @@ export function RuntimeSettingsPanel({ onStatus }: Props) {
             {`${draft.server.bind_host}:${draft.server.port}`}
           </span>
           <span className="rounded border border-[var(--border-hairline)] bg-[var(--bg-page)] px-2 py-1">
-            {`${adapters.length} DXGI GPU${adapters.length === 1 ? "" : "s"}`}
+            {`${adapters.length} GPU${adapters.length === 1 ? "" : "s"}`}
           </span>
           <button
             type="button"
@@ -262,7 +262,7 @@ export function RuntimeSettingsPanel({ onStatus }: Props) {
 
             {renderAdapterSelect(
               "cfg-master-luid",
-              "Master Tier GPU LUID",
+              "Master Feed GPU",
               draft.media.master_gpu_luid,
               (val) =>
                 setDraft({ ...draft, media: { ...draft.media, master_gpu_luid: val } }),
@@ -271,7 +271,7 @@ export function RuntimeSettingsPanel({ onStatus }: Props) {
 
             {renderAdapterSelect(
               "cfg-simulcast-luid",
-              "Simulcast Tier GPU LUID",
+              "Backup Feed GPU",
               draft.media.simulcast_gpu_luid,
               (val) =>
                 setDraft({ ...draft, media: { ...draft.media, simulcast_gpu_luid: val } }),
@@ -546,7 +546,7 @@ export function RuntimeSettingsPanel({ onStatus }: Props) {
             <div>
               <label htmlFor="cfg-wan-admit" className={labelCls}>
                 <InfoTip entry={RUNTIME_SETTINGS_GLOSSARY.wanAdmitMaxPct} underline focusable>
-                  <span>WAN Admit Max %</span>
+                  <span>Bandwidth Limit %</span>
                 </InfoTip>
               </label>
               <input
@@ -573,7 +573,7 @@ export function RuntimeSettingsPanel({ onStatus }: Props) {
             <div>
               <label htmlFor="cfg-vram-admit" className={labelCls}>
                 <InfoTip entry={RUNTIME_SETTINGS_GLOSSARY.vramAdmitMaxPct} underline focusable>
-                  <span>VRAM Admit Max %</span>
+                  <span>GPU Memory Limit %</span>
                 </InfoTip>
               </label>
               <input
@@ -600,7 +600,7 @@ export function RuntimeSettingsPanel({ onStatus }: Props) {
             <div>
               <label htmlFor="cfg-ram-admit" className={labelCls}>
                 <InfoTip entry={RUNTIME_SETTINGS_GLOSSARY.ramAdmitMaxPct} underline focusable>
-                  <span>RAM Admit Max %</span>
+                  <span>System RAM Limit %</span>
                 </InfoTip>
               </label>
               <input
@@ -654,7 +654,7 @@ export function RuntimeSettingsPanel({ onStatus }: Props) {
             <div>
               <label htmlFor="cfg-recovery-hyst" className={labelCls}>
                 <InfoTip entry={RUNTIME_SETTINGS_GLOSSARY.recoveryHysteresisSecs} underline focusable>
-                  <span>Recovery Hysteresis (s)</span>
+                  <span>Alert Clear Delay (s)</span>
                 </InfoTip>
               </label>
               <input

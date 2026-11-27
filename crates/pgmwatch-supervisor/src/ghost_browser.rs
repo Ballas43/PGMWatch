@@ -379,7 +379,7 @@ pub async fn export_cookies_from_auth_profile(
             tokio::time::sleep(Duration::from_millis(250)).await;
             if let Ok(Some(status)) = child.try_wait() {
                 anyhow::bail!(
-                    "Edge profile is locked by another Edge process (exit {status}). Click Sign In again, log in, then click Sync Session while the window is open."
+                    "Edge profile is locked by another Edge process ({status}). Click Sign In again, log in, then click Sync Session while the window is open."
                 );
             }
             if let Ok(count) =

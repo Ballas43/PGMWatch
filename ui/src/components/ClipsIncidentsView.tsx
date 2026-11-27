@@ -208,7 +208,7 @@ export function ClipsIncidentsView({ snapshot, onAck, onRefresh }: ClipsIncident
             Clips & Incident Log
           </h1>
           <p className="text-xs text-[var(--text-secondary)]">
-            Instant zero-reencode MP4 evidence from the ~2–6s pre-trigger buffer (or 5s forward fallback), stored with auto-FIFO quota
+            Instant MP4 clips saved from the last 2–6s of live video (oldest clips auto-delete when storage is full)
           </p>
         </div>
 
@@ -218,7 +218,7 @@ export function ClipsIncidentsView({ snapshot, onAck, onRefresh }: ClipsIncident
             <InfoTip entry={ANALYTICS_GLOSSARY.clipStorage} underline focusable>
               <span>
                 {storedFilesCount} MP4{storedFilesCount === 1 ? "" : "s"} ·{" "}
-                {formatClipBytes(clipStats?.total_bytes ?? 0)} / {(clipStats?.quota_gb ?? 10).toFixed(1)} GB FIFO
+                {formatClipBytes(clipStats?.total_bytes ?? 0)} / {(clipStats?.quota_gb ?? 10).toFixed(1)} GB max
               </span>
             </InfoTip>
           </div>

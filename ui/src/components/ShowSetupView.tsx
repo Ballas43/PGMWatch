@@ -10,6 +10,7 @@ import {
   ShowPresetSummary,
 } from "../types";
 import { ChannelsSection } from "./show-setup/ChannelsSection";
+import type { BulkChannelPatch } from "./show-setup/BulkChannelEditBar";
 import { ShowPresetsCard } from "./show-setup/ShowPresetsCard";
 import { ShowTitleCard } from "./show-setup/ShowTitleCard";
 import { StreamGroupsCard } from "./show-setup/StreamGroupsCard";
@@ -440,6 +441,55 @@ export function ShowSetupView({ snapshot, onRefresh }: ShowSetupViewProps) {
     );
   };
 
+  const bulkUpdateChannels = async (ids: string[], patch: BulkChannelPatch): Promise<boolean> => {
+    if (ids.length === 0 || Object.keys(patch).length === 0) return false;
+    const idSet = new Set(ids);
+    const updatedChannels: ChannelConfig[] = [];
+    for (const c of showChannels) {
+      if (!idSet.has(c.id)) {
+        updatedChannels.push(c);
+        continue;
+      }
+      // Preserve any unsaved inline edits on selected rows while applying bulk settings
+      const base = channelDrafts[c.id] ?? c;
+      const trimmedName = base.name.trim();
+      const trimmedUrl = base.url.trim();
+      if (!trimmedName || !trimmedUrl) {
+        setStatusMsg({
+          text: `Cannot bulk-apply: "${c.name}" has an empty unsaved name or stream URL`,
+          isError: true,
+        });
+        return false;
+      }
+      const merged: ChannelConfig = {
+        ...base,
+        ...patch,
+        name: trimmedName,
+        url: trimmedUrl,
+        platform: detectPlatform(trimmedUrl),
+      };
+      if (patch.tier !== undefined) {
+        merged.priority = patch.tier === "MASTER" ? 1 : patch.tier === "SIMULCAST" ? 2 : 3;
+      }
+      updatedChannels.push(merged);
+    }
+    const ok = await savePreset(
+      {
+        ...snapshot.show,
+        channels: updatedChannels,
+      },
+      `Updated ${ids.length} feed${ids.length === 1 ? "" : "s"} in bulk`
+    );
+    if (ok) {
+      setDirtyChannels((prev) => {
+        const next = { ...prev };
+        for (const id of ids) delete next[id];
+        return next;
+      });
+    }
+    return ok;
+  };
+
   const changeTier = async (id: string, nextTier: FeedTier) => {
     try {
       const res = await fetch(`/api/channels/${encodeURIComponent(id)}/tier`, {
@@ -738,6 +788,7 @@ export function ShowSetupView({ snapshot, onRefresh }: ShowSetupViewProps) {
         onToggleChannelEnabled={(ch) => void toggleChannelEnabled(ch)}
         onRemoveChannel={(id) => void removeChannel(id)}
         onChangeTier={(id, next) => void changeTier(id, next)}
+        onBulkUpdateChannels={bulkUpdateChannels}
       />
     </div>
   );

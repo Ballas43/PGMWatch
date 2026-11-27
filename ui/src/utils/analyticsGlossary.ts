@@ -70,7 +70,7 @@ export const ANALYTICS_GLOSSARY = {
   },
   gifts: {
     title: "Viewer Gifts",
-    summary: "Total virtual gifts sent by viewers during the live session (TikTok).",
+    summary: "Total virtual gifts, gift subs, and cheers/bits sent by viewers during the live session (TikTok & Twitch).",
   },
   uptime: {
     title: "Healthy Uptime %",
@@ -80,9 +80,9 @@ export const ANALYTICS_GLOSSARY = {
   tier: {
     title: "Monitoring Quality Tier",
     summary:
-      "MASTER pulls full source video/audio, anchors the group's Wrong-Bus LUFS reference, and is never auto-shed. SIMULCAST decodes <=480p video + audio and may auto-shed to LIGHT under heavy GPU load. LIGHT monitors audio DSP, stalls, chat, and viewers with 0% GPU video decode.",
+      "MASTER pulls full source video/audio and anchors the group's audio-match reference (steps down to 480p first if bandwidth gets tight). SIMULCAST decodes <=480p video + audio and may step down to Audio-Only under heavy load. LIGHT monitors audio, stalls, chat, and viewers with 0% GPU video decode.",
     guide:
-      "Use 1 MASTER feed per Stream Group (your main broadcast output), SIMULCAST for platform backups, and LIGHT for extra mirrors or battery/low-GPU machines.",
+      "Use 1 MASTER feed per Stream Group (your main broadcast output), SIMULCAST for platform backups, and LIGHT for extra mirrors or low-GPU machines.",
   },
   avgLufs: {
     title: "Average Loudness (Avg LUFS)",
@@ -102,9 +102,9 @@ export const ANALYTICS_GLOSSARY = {
     guide: "Example: Target -14.0 ±2.5 warns if loudness stays outside -16.5 to -11.5 LUFS.",
   },
   truePeak: {
-    title: "True Peak (dBTP)",
+    title: "Real-Time True Peak (dBTP)",
     summary:
-      "The loudest brief audio spike between digital samples. Above -1.0 dBTP risks harsh crackling/clipping.",
+      "Instantaneous loudest audio peak between digital samples with smooth auto-decay (12 dB/s). Spikes at or above -0.1 dBTP risk harsh crackling/clipping.",
     guide: "Safe range: -12 dBTP to -1.0 dBTP. Red at 0.0 dBTP means clipping.",
   },
   vuBars: {
@@ -185,12 +185,12 @@ export const ANALYTICS_GLOSSARY = {
   resolver: {
     title: "Stream Link Resolver",
     summary:
-      "Which engine extracted the live video URL (e.g., yt-dlp, Streamlink, headless Edge CDP, direct link, or simulator).",
+      "Which engine extracted the live video URL (e.g., yt-dlp, Streamlink, built-in Edge browser, direct link, or simulator).",
   },
   vram: {
     title: "Graphics Memory (VRAM)",
     summary:
-      "GPU memory used for hardware video decoding. Above 80–88%, PGMWatch sheds backup feeds to Audio-Only to stay smooth.",
+      "GPU memory used for hardware video decoding. Above 80–88%, PGMWatch steps down backup feeds to keep playback smooth.",
   },
   ram: {
     title: "System Memory (RAM)",
@@ -215,7 +215,7 @@ export const ANALYTICS_GLOSSARY = {
   governorStage: {
     title: "Auto-Protection State",
     summary:
-      "Nominal = normal operation. Stage 1 Throttle = slows thumbnail previews to save PC load. Stage 2 Shed = drops backup feeds to Audio-Only.",
+      "Healthy = normal operation. Busy = slows thumbnail previews to save PC load. Stepped Down = temporarily lowers feed quality (1080p -> 480p or Audio-Only) to protect bandwidth and GPU.",
   },
   activeWorkers: {
     title: "Active Channel Workers",
@@ -225,7 +225,7 @@ export const ANALYTICS_GLOSSARY = {
   shedChannels: {
     title: "Stepped-Down Channels",
     summary:
-      "Feeds temporarily lowered in tier (MASTER -> 480p SIMULCAST first, then SIMULCAST -> Audio-Only LIGHT) to stay within your WAN bandwidth or GPU limits.",
+      "Feeds temporarily reduced in quality (MASTER -> 480p first, then SIMULCAST -> Audio-Only) to stay within your internet bandwidth or GPU limits. They recover automatically when load drops.",
   },
   forceClip: {
     title: "Instant Pre-Trigger Clip",
@@ -235,7 +235,7 @@ export const ANALYTICS_GLOSSARY = {
       "Pulls ~2–6s back from the newest keyframe in memory (6s / 8 MB cap) into Clips & Incidents. CLI/fallback mode records 5s forward instead.",
   },
   clipStorage: {
-    title: "Replay Clip Storage Limit (Auto-FIFO)",
+    title: "Replay Clip Storage Limit (Auto-Cleanup)",
     summary:
       "MP4 replay clips do NOT fill your disk indefinitely: once stored clips exceed your quota (10 GB default), the oldest files are automatically deleted before new clips save.",
     guide:
@@ -299,18 +299,18 @@ export const RUNTIME_SETTINGS_GLOSSARY = {
       "auto (recommended) prefers iGPU/NPU; d3d11va forces Windows Direct3D11 hardware decode; cpu uses software decode (high CPU load, helpful if GPU drivers misbehave).",
   },
   masterGpuLuid: {
-    title: "Master Tier GPU LUID",
+    title: "Master Feed GPU",
     summary:
-      "Pins high-priority Master / Main streams to a specific Windows graphics adapter.",
+      "Assigns high-priority Master / Main streams to a specific Windows graphics card.",
     guide:
       "Leave on Auto unless you want Master feeds dedicated to your stronger GPU while backup feeds run on another adapter.",
   },
   simulcastGpuLuid: {
-    title: "Simulcast Tier GPU LUID",
+    title: "Backup Feed GPU",
     summary:
-      "Pins backup / simulcast streams to a specific Windows graphics adapter.",
+      "Assigns backup / simulcast streams to a specific Windows graphics card.",
     guide:
-      "On dual-GPU systems, pinning backups to your iGPU keeps your dedicated GPU free for Master feeds.",
+      "On dual-GPU systems, assigning backups to your iGPU keeps your dedicated GPU free for Master feeds.",
   },
   extraHwFrames: {
     title: "Extra Hardware Decode Frames (1–64)",
@@ -390,26 +390,26 @@ export const RUNTIME_SETTINGS_GLOSSARY = {
     summary:
       "Total internet download speed (in Mbps) that PGMWatch budgets across all active feeds.",
     guide:
-      "Used alongside WAN Admit Max % so backups step down to audio-only before saturating your internet connection.",
+      "Used alongside Bandwidth Limit % so backups step down to audio-only before saturating your internet connection.",
   },
   wanAdmitMaxPct: {
-    title: "WAN Admit Max %",
+    title: "Bandwidth Limit %",
     summary:
-      "Maximum percentage of WAN Cap allowed before new video decodes pause or backup feeds shed to Light (Audio-Only) mode.",
+      "Maximum percentage of your Bandwidth Cap allowed before PGMWatch steps down feeds (1080p -> 480p or Audio-Only) to avoid saturating your internet.",
     guide:
-      "For example, 80% on a 100 Mbps cap begins protecting Master streams around 80 Mbps.",
+      "For example, 85% on a 100 Mbps cap begins stepping down feeds around 85 Mbps.",
   },
   vramAdmitMaxPct: {
-    title: "VRAM Admit Max %",
+    title: "GPU Memory Limit %",
     summary:
-      "Maximum GPU video-memory percentage before PGMWatch stops adding hardware video decoders or degrades backup feeds.",
+      "Maximum GPU video-memory percentage before PGMWatch stops adding hardware video decoders or steps down backup feeds.",
     guide:
       "Keeps Windows desktop and Master decoders stable instead of crashing on out-of-VRAM.",
   },
   ramAdmitMaxPct: {
-    title: "System RAM Admit Max %",
+    title: "System RAM Limit %",
     summary:
-      "Maximum PC memory percentage before the Resource Governor sheds lower-priority video decode.",
+      "Maximum PC memory percentage before Auto-Protection steps down lower-priority video decode.",
     guide:
       "Default ~80–85% leaves headroom for the OS and audio monitoring.",
   },
@@ -421,9 +421,9 @@ export const RUNTIME_SETTINGS_GLOSSARY = {
       "If one channel's FFmpeg/decoder process exceeds this MB limit (e.g. driver memory leak), only that channel restarts cleanly without interrupting the wall.",
   },
   recoveryHysteresisSecs: {
-    title: "Fault Recovery Hysteresis (Seconds)",
+    title: "Alert Clear Delay (Seconds)",
     summary:
-      "How many clean, fault-free seconds a stream must maintain before a red/amber alert automatically clears back to OK.",
+      "How many clean, fault-free seconds a stream must maintain before a red/amber alert automatically clears back to Healthy.",
     guide:
       "Prevents rapid alert flickering on borderline signals (e.g. brief audio dips or static slides).",
   },
@@ -470,7 +470,7 @@ export const FAULT_GLOSSARY: Record<FaultKind, MetricGlossaryEntry> = {
   BITRATE_COLLAPSE: {
     title: "Bitrate Collapse",
     summary:
-      "Stream bitrate stayed below 35% of its rolling baseline for 6+ seconds during active motion or quality degradation (clean static VBR/CRF slides are ignored).",
+      "Stream bitrate stayed severely below its rolling baseline for 6+ seconds during active motion or quality degradation. Clean static slides, audio-only feeds, and stepped-down resolution changes automatically recalibrate without false alarms.",
   },
   PTS_DRIFT: {
     title: "PTS Discontinuity",
@@ -495,7 +495,7 @@ export const FAULT_GLOSSARY: Record<FaultKind, MetricGlossaryEntry> = {
   },
   AUDIO_MICRO_SILENCE: {
     title: "Audio Micro-Silence",
-    summary: "Brief unwanted audio dropout/mute lasting ~0.4–2 seconds.",
+    summary: "Brief unwanted audio dropout/mute lasting ~30–500 ms.",
   },
   AUDIO_DEAD_AIR: {
     title: "Audio Dead Air",
@@ -507,7 +507,7 @@ export const FAULT_GLOSSARY: Record<FaultKind, MetricGlossaryEntry> = {
   },
   AUDIO_PHASE_INVERSION: {
     title: "Audio Phase Inversion",
-    summary: "Left and Right channels are wired/encoded upside-down (`Φ < -0.5`), cancelling sound on mono speakers.",
+    summary: "Left and Right channels are wired/encoded upside-down (`Φ < -0.2`), cancelling sound on mono speakers.",
   },
   AUDIO_MAINS_HUM: {
     title: "Mains Hum / Feedback",

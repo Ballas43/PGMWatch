@@ -83,10 +83,10 @@ export function TopBar({
 
   const stageLabel =
     gov?.degradation_stage === 2
-      ? "Overloaded"
+      ? "Stepped Down"
       : gov?.degradation_stage === 1
-      ? "High Load"
-      : "Nominal";
+      ? "Busy"
+      : "Healthy";
 
   const stageColor =
     gov?.degradation_stage === 2

@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { CalendarClock, RotateCcw, X } from "lucide-react";
-import { AccountingResponse, DashboardSnapshot } from "../types";
+import { AccountingResponse, ChannelRuntimeSnapshot, DashboardSnapshot, LanguageGroupConfig } from "../types";
 import { ANALYTICS_GLOSSARY } from "../utils/analyticsGlossary";
 import { getDeviceTimeZoneLabel } from "../utils/time";
 import { formatTriStateCompact } from "../utils/telemetry";
@@ -8,6 +8,33 @@ import { CcvTimelineChart } from "./CcvTimelineChart";
 import { InfoTip } from "./InfoTip";
 import { ManualOverrideForm } from "./ManualOverrideForm";
 import { PlatformAuthPanel } from "./PlatformAuthPanel";
+
+interface ChannelCategoryGroup {
+  id: string;
+  code: string;
+  name: string;
+  items: ChannelRuntimeSnapshot[];
+}
+
+function groupChannelsByCategory(
+  channels: ChannelRuntimeSnapshot[],
+  groups: LanguageGroupConfig[]
+): ChannelCategoryGroup[] {
+  const result: ChannelCategoryGroup[] = [];
+  const seenIds = new Set<string>();
+  for (const g of groups) {
+    const items = channels.filter((ch) => ch.config.group_id === g.id);
+    if (items.length > 0) {
+      result.push({ id: g.id, code: g.language_code, name: g.name, items });
+      for (const ch of items) seenIds.add(ch.config.id);
+    }
+  }
+  const ungrouped = channels.filter((ch) => !seenIds.has(ch.config.id));
+  if (ungrouped.length > 0) {
+    result.push({ id: "__ungrouped", code: "OTHER", name: "Ungrouped", items: ungrouped });
+  }
+  return result;
+}
 
 function isoToLocalInput(iso?: string | null): string {
   if (!iso) return "";
@@ -422,70 +449,117 @@ export function AccountingView({ snapshot, onRefresh }: AccountingViewProps) {
                 </th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-[var(--border-hairline)] font-mono-tabular">
-              {(snapshot?.channels ?? []).map((ch) => (
-                <tr key={ch.config.id} className="hover:bg-[var(--bg-raised)]/40">
-                  <td className="py-2.5 pr-2 font-sans text-[var(--text-primary)]">
-                    <span>{ch.config.name}</span>
-                    {ch.config.exclude_from_accounting && (
-                      <span className="ml-1.5 rounded border border-[var(--border-hairline)] bg-[var(--bg-raised)] px-1 py-0.5 font-mono-tabular text-[10px] text-[var(--text-muted)]">
-                        Excluded
-                      </span>
-                    )}
-                    {(ch.config.broadcast_delay_secs ?? 0) > 0 && (
-                      <span className="ml-1.5 font-mono-tabular text-[10px] text-[var(--accent-text)]">
-                        +{ch.config.broadcast_delay_secs}s
-                      </span>
-                    )}
-                  </td>
-                  <td className="py-2.5 pr-2">
-                    <span
-                      title={ch.ccv.note ?? ch.ccv.status}
-                      className={
-                        ch.ccv.status === "VALUE"
-                          ? "text-[var(--positive-text)]"
-                          : ch.ccv.status === "UNAVAILABLE"
-                          ? "text-[var(--warning-text)]"
-                          : "text-[var(--text-muted)]"
-                      }
-                    >
-                      {ch.ccv.status === "VALUE"
-                        ? "Live"
-                        : ch.ccv.status === "UNAVAILABLE"
-                        ? "Unavailable"
-                        : "N/A"}
-                    </span>
-                  </td>
-                  <td className="py-2.5 pr-2 text-right text-[var(--text-primary)]">
-                    {ch.ccv.value !== null
-                      ? ch.ccv.value.toLocaleString()
-                      : ch.ccv.status === "UNAVAILABLE"
-                      ? "Unavailable"
-                      : "N/A"}
-                  </td>
-                  <td className="py-2.5 pr-2 text-right text-[var(--text-secondary)]" title={ch.total_views.note ?? undefined}>
-                    {formatTriStateCompact(ch.total_views)}
-                  </td>
-                  <td className="py-2.5 pr-2 text-right text-[var(--text-secondary)]" title={ch.likes.note ?? undefined}>
-                    {formatTriStateCompact(ch.likes)}
-                  </td>
-                  <td className="py-2.5 pr-2 text-right text-[var(--text-secondary)]" title={ch.chat_rate_per_min.note ?? undefined}>
-                    {formatTriStateCompact(ch.chat_rate_per_min)}
-                  </td>
-                  <td className="py-2.5 pr-2 text-right text-[var(--text-secondary)]" title={ch.shares.note ?? undefined}>
-                    {formatTriStateCompact(ch.shares)}
-                  </td>
-                  <td className="py-2.5 pr-2 text-right text-[var(--text-secondary)]" title={ch.gifts_count.note ?? undefined}>
-                    {formatTriStateCompact(ch.gifts_count)}
-                  </td>
-                  <td className="py-2.5 pr-2 text-right text-[var(--text-secondary)]">
-                    {ch.ccv.coverage_pct.toFixed(0)}%
-                  </td>
-                  <td className="py-2.5 text-right text-[var(--text-muted)]">
-                    {ch.ccv.source === "MANUAL_STUDIO" ? "Studio Manual" : "Auto"}
-                  </td>
-                </tr>
-              ))}
+            <tbody className="font-mono-tabular">
+              {groupChannelsByCategory(
+                snapshot?.channels ?? [],
+                snapshot?.show.groups ?? []
+              ).map((grp, grpIdx) => {
+                  const liveSum = grp.items.reduce(
+                    (acc, ch) =>
+                      !ch.config.exclude_from_accounting && ch.ccv.status === "VALUE" && ch.ccv.value !== null
+                        ? acc + ch.ccv.value
+                        : acc,
+                    0
+                  );
+                  const grpPeak = sum?.group_pcv[grp.id];
+                  return (
+                    <Fragment key={grp.id}>
+                      <tr
+                        className={`bg-[var(--bg-raised)]/80 ${
+                          grpIdx > 0 ? "border-t-2 border-[var(--border-strong)]" : "border-t border-[var(--border-hairline)]"
+                        }`}
+                      >
+                        <td colSpan={10} className="px-2 py-2 font-sans">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex items-center gap-2">
+                              <span className="rounded border border-[var(--border-strong)] bg-[var(--bg-card)] px-1.5 py-0.5 font-mono-tabular text-[10px] font-semibold text-[var(--text-primary)]">
+                                {grp.code}
+                              </span>
+                              <span className="text-xs font-semibold text-[var(--text-primary)]">
+                                {grp.name}
+                              </span>
+                              <span className="text-[11px] text-[var(--text-muted)]">
+                                ({grp.items.length} {grp.items.length === 1 ? "channel" : "channels"})
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-3 font-mono-tabular text-[11px] text-[var(--text-secondary)]">
+                              <span>Live: {liveSum.toLocaleString()}</span>
+                              {grpPeak !== undefined && (
+                                <span className="text-[var(--text-muted)]">Peak: {grpPeak.toLocaleString()}</span>
+                              )}
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                      {grp.items.map((ch) => (
+                        <tr
+                          key={ch.config.id}
+                          className="border-t border-[var(--border-hairline)] hover:bg-[var(--bg-raised)]/40"
+                        >
+                          <td className="py-2.5 pl-3 pr-2 font-sans text-[var(--text-primary)]">
+                            <span>{ch.config.name}</span>
+                            {ch.config.exclude_from_accounting && (
+                              <span className="ml-1.5 rounded border border-[var(--border-hairline)] bg-[var(--bg-raised)] px-1 py-0.5 font-mono-tabular text-[10px] text-[var(--text-muted)]">
+                                Excluded
+                              </span>
+                            )}
+                            {(ch.config.broadcast_delay_secs ?? 0) > 0 && (
+                              <span className="ml-1.5 font-mono-tabular text-[10px] text-[var(--accent-text)]">
+                                +{ch.config.broadcast_delay_secs}s
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2.5 pr-2">
+                            <span
+                              title={ch.ccv.note ?? ch.ccv.status}
+                              className={
+                                ch.ccv.status === "VALUE"
+                                  ? "text-[var(--positive-text)]"
+                                  : ch.ccv.status === "UNAVAILABLE"
+                                  ? "text-[var(--warning-text)]"
+                                  : "text-[var(--text-muted)]"
+                              }
+                            >
+                              {ch.ccv.status === "VALUE"
+                                ? "Live"
+                                : ch.ccv.status === "UNAVAILABLE"
+                                ? "Unavailable"
+                                : "N/A"}
+                            </span>
+                          </td>
+                          <td className="py-2.5 pr-2 text-right text-[var(--text-primary)]">
+                            {ch.ccv.value !== null
+                              ? ch.ccv.value.toLocaleString()
+                              : ch.ccv.status === "UNAVAILABLE"
+                              ? "Unavailable"
+                              : "N/A"}
+                          </td>
+                          <td className="py-2.5 pr-2 text-right text-[var(--text-secondary)]" title={ch.total_views.note ?? undefined}>
+                            {formatTriStateCompact(ch.total_views)}
+                          </td>
+                          <td className="py-2.5 pr-2 text-right text-[var(--text-secondary)]" title={ch.likes.note ?? undefined}>
+                            {formatTriStateCompact(ch.likes)}
+                          </td>
+                          <td className="py-2.5 pr-2 text-right text-[var(--text-secondary)]" title={ch.chat_rate_per_min.note ?? undefined}>
+                            {formatTriStateCompact(ch.chat_rate_per_min)}
+                          </td>
+                          <td className="py-2.5 pr-2 text-right text-[var(--text-secondary)]" title={ch.shares.note ?? undefined}>
+                            {formatTriStateCompact(ch.shares)}
+                          </td>
+                          <td className="py-2.5 pr-2 text-right text-[var(--text-secondary)]" title={ch.gifts_count.note ?? undefined}>
+                            {formatTriStateCompact(ch.gifts_count)}
+                          </td>
+                          <td className="py-2.5 pr-2 text-right text-[var(--text-secondary)]">
+                            {ch.ccv.coverage_pct.toFixed(0)}%
+                          </td>
+                          <td className="py-2.5 text-right text-[var(--text-muted)]">
+                            {ch.ccv.source === "MANUAL_STUDIO" ? "Studio Manual" : "Auto"}
+                          </td>
+                        </tr>
+                      ))}
+                    </Fragment>
+                  );
+                })}
             </tbody>
           </table>
         </div>

@@ -14,6 +14,12 @@ function barTone(pct: number): string {
   return "bg-[var(--positive)]";
 }
 
+function govStageLabel(stage: number): string {
+  if (stage === 2) return "High Load (Stepped Down)";
+  if (stage === 1) return "Busy (Slower Previews)";
+  return "Healthy";
+}
+
 function MeterCell({
   label,
   pct,
@@ -65,14 +71,7 @@ export function GovernorStatusStrip({ governor }: GovernorStatusStripProps) {
       ? (governor.wan_rx_mbps / governor.wan_cap_mbps) * 100
       : 0;
 
-  const stageLabel =
-    govStageLabel(governor.degradation_stage);
-
-  function govStageLabel(stage: number): string {
-    if (stage === 2) return "Overloaded (Audio-Only)";
-    if (stage === 1) return "High Load (Slow Preview)";
-    return "Nominal";
-  }
+  const stageLabel = govStageLabel(governor.degradation_stage);
 
   const stageBadgeClass =
     governor.degradation_stage === 2
@@ -116,7 +115,7 @@ export function GovernorStatusStrip({ governor }: GovernorStatusStripProps) {
             <InfoTip entry={ANALYTICS_GLOSSARY.shedChannels} focusable>
               <span className="inline-flex items-center gap-1 rounded border border-[var(--warning)]/50 bg-[var(--warning-soft)] px-2 py-0.5 text-[11px] font-mono-tabular text-[var(--warning-text)]">
                 <ShieldAlert size={11} strokeWidth={1.5} aria-hidden="true" />
-                <span>{governor.shed_channels} downgraded</span>
+                <span>{governor.shed_channels} stepped down</span>
               </span>
             </InfoTip>
           )}

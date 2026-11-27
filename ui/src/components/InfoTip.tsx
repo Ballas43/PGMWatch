@@ -39,8 +39,10 @@ export function InfoTip({
       Math.min(window.innerWidth - tipWidth - 8, rect.left + rect.width / 2 - tipWidth / 2)
     );
     const spaceBelow = window.innerHeight - rect.bottom;
-    const above = spaceBelow < 140 && rect.top > 140;
-    const top = above ? Math.max(8, rect.top - 8) : Math.min(window.innerHeight - 8, rect.bottom + 8);
+    const above = spaceBelow < 160 && rect.top > 160;
+    const top = above
+      ? Math.max(160, rect.top - 8)
+      : Math.min(window.innerHeight - 160, rect.bottom + 8);
     setCoords({ top, left, above });
   }, [open]);
 

@@ -3,6 +3,7 @@ import { Plus, Trash2 } from "lucide-react";
 import { ANALYTICS_GLOSSARY } from "../../utils/analyticsGlossary";
 import { ChannelConfig, FeedTier, LanguageGroupConfig } from "../../types";
 import { InfoTip } from "../InfoTip";
+import { BulkChannelEditBar, type BulkChannelPatch } from "./BulkChannelEditBar";
 
 interface ChannelsSectionProps {
   groups: LanguageGroupConfig[];
@@ -32,6 +33,7 @@ interface ChannelsSectionProps {
   onToggleChannelEnabled: (ch: ChannelConfig) => void;
   onRemoveChannel: (id: string) => void;
   onChangeTier: (id: string, nextTier: FeedTier) => void;
+  onBulkUpdateChannels: (ids: string[], patch: BulkChannelPatch) => Promise<boolean>;
 }
 
 const FEED_TIER_GUIDE: Array<{
@@ -42,24 +44,24 @@ const FEED_TIER_GUIDE: Array<{
 }> = [
   {
     id: "MASTER",
-    badge: "Priority 1 · Never Shed",
+    badge: "Priority 1 · Primary Feed",
     headline: "Full source video + audio reference",
     detail:
-      "Pulls best available resolution, sets the group's Wrong-Bus LUFS baseline, runs full A/V fault & freeze checks, and stays locked under load.",
+      "Pulls best available resolution, sets the group's audio-match reference, and runs full A/V fault & freeze checks (steps down to 480p first if bandwidth gets tight).",
   },
   {
     id: "SIMULCAST",
     badge: "Priority 2 · Auto-Managed",
     headline: "<=480p video + audio vs Master",
     detail:
-      "Saves bandwidth by decoding up to 480p with full freeze, black, clip & LUFS checks. Resource Governor sheds to LIGHT under heavy GPU pressure.",
+      "Saves bandwidth by decoding up to 480p with full freeze, black, clip & LUFS checks. Auto-steps down to Audio-Only under heavy GPU or bandwidth pressure.",
   },
   {
     id: "LIGHT",
     badge: "Priority 3 · 0% GPU Decode",
     headline: "Audio-only DSP + network & stats",
     detail:
-      "Skips video decoding completely to save GPU/VRAM while still checking LUFS, dead air, clipping, Wrong Bus, stalls, CCV, and live chat.",
+      "Skips video decoding completely to save GPU/VRAM while still checking LUFS, dead air, clipping, Wrong Bus, stalls, live viewers, and live chat.",
   },
 ];
 
@@ -91,7 +93,41 @@ export function ChannelsSection({
   onToggleChannelEnabled,
   onRemoveChannel,
   onChangeTier,
+  onBulkUpdateChannels,
 }: ChannelsSectionProps) {
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+
+  // Prune any deleted channel IDs from the selection
+  useEffect(() => {
+    const valid = new Set(showChannels.map((c) => c.id));
+    setSelectedIds((prev) => {
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (valid.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [showChannels]);
+
+  const allSelected = showChannels.length > 0 && selectedIds.size === showChannels.length;
+  const toggleSelected = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+  const toggleSelectAll = () => {
+    if (allSelected) setSelectedIds(new Set());
+    else setSelectedIds(new Set(showChannels.map((c) => c.id)));
+  };
+  const selectByGroup = (gid: string) => {
+    setSelectedIds(new Set(showChannels.filter((c) => c.group_id === gid).map((c) => c.id)));
+  };
+
   return (
     <>
       <form
@@ -281,9 +317,26 @@ export function ChannelsSection({
       </form>
 
       <div className="overflow-x-auto rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-card)] p-4">
+        <BulkChannelEditBar
+          groups={groups}
+          selectedCount={selectedIds.size}
+          totalCount={showChannels.length}
+          onSelectAll={() => setSelectedIds(new Set(showChannels.map((c) => c.id)))}
+          onClearSelection={() => setSelectedIds(new Set())}
+          onSelectByGroup={selectByGroup}
+          onApplyBulk={(patch) => onBulkUpdateChannels(Array.from(selectedIds), patch)}
+        />
         <table className="w-full text-left text-xs">
           <thead>
             <tr className="border-b border-[var(--border-hairline)] text-[var(--text-muted)]">
+              <th scope="col" className="pb-2.5 pr-2 w-6">
+                <input
+                  type="checkbox"
+                  aria-label="Select all channels"
+                  checked={allSelected}
+                  onChange={toggleSelectAll}
+                />
+              </th>
               <th scope="col" className="pb-2.5 pr-2 font-medium">Channel Name</th>
               <th scope="col" className="pb-2.5 pr-2 font-medium">Category</th>
               <th scope="col" className="pb-2.5 pr-2 font-medium">Platform</th>
@@ -312,15 +365,26 @@ export function ChannelsSection({
             {showChannels.map((ch) => {
               const draft = channelDrafts[ch.id] ?? ch;
               const isDirty = Boolean(dirtyChannels[ch.id]);
+              const isSelected = selectedIds.has(ch.id);
               return (
                 <tr
                   key={ch.id}
                   className={
-                    ch.enabled
+                    isSelected
+                      ? "bg-[var(--accent-soft)]/35 hover:bg-[var(--accent-soft)]/50"
+                      : ch.enabled
                       ? "hover:bg-[var(--bg-raised)]/40"
                       : "bg-[var(--bg-page)]/40 opacity-55 hover:bg-[var(--bg-raised)]/40"
                   }
                 >
+                  <td className="py-2 pr-2">
+                    <input
+                      type="checkbox"
+                      aria-label={`Select ${ch.name} for bulk edit`}
+                      checked={isSelected}
+                      onChange={() => toggleSelected(ch.id)}
+                    />
+                  </td>
                   <td className="py-2 pr-2">
                     <input
                       aria-label={`Name for ${ch.name}`}

@@ -29,6 +29,7 @@ pub struct AudioDspAnalyzer {
     hum_candidate_hz: Option<f32>,
     last_hum_freq: Option<f32>,
     last_hum_peak_db: f32,
+    decayed_true_peak_dbtp: f32,
 }
 
 impl AudioDspAnalyzer {
@@ -67,6 +68,7 @@ impl AudioDspAnalyzer {
             hum_candidate_hz: None,
             last_hum_freq: None,
             last_hum_peak_db: 0.0,
+            decayed_true_peak_dbtp: -96.0,
         })
     }
 
@@ -108,6 +110,7 @@ impl AudioDspAnalyzer {
         self.hum_candidate_hz = None;
         self.last_hum_freq = None;
         self.last_hum_peak_db = 0.0;
+        self.decayed_true_peak_dbtp = -96.0;
     }
 
     /// Analyze interleaved 48 kHz Stereo F32LE frames and return telemetry + triggered faults.
@@ -168,9 +171,15 @@ impl AudioDspAnalyzer {
         let integrated_lufs = sanitize_lufs(self.ebur_avg.loudness_global());
         let short_term_lufs = sanitize_lufs(self.ebur.loudness_shortterm());
 
-        let tp_l = self.ebur.true_peak(0).unwrap_or(0.0);
-        let tp_r = self.ebur.true_peak(1).unwrap_or(0.0);
-        let true_peak_dbtp = linear_to_dbfs(tp_l.max(tp_r));
+        let tp_l = self.ebur.prev_true_peak(0).unwrap_or(0.0);
+        let tp_r = self.ebur.prev_true_peak(1).unwrap_or(0.0);
+        let instant_true_peak_dbtp = linear_to_dbfs(tp_l.max(tp_r)).clamp(-96.0, 24.0);
+        const TRUE_PEAK_DECAY_DB_PER_SEC: f32 = 12.0;
+        let block_secs = frame_count as f32 / CANONICAL_SAMPLE_RATE as f32;
+        let decay_db = TRUE_PEAK_DECAY_DB_PER_SEC * block_secs;
+        self.decayed_true_peak_dbtp =
+            instant_true_peak_dbtp.max((self.decayed_true_peak_dbtp - decay_db).max(-96.0));
+        let true_peak_dbtp = self.decayed_true_peak_dbtp;
 
         // 8192-pt FFT stationary AC mains hum detector (50/60 Hz fundamental & 100/120 Hz harmonic)
         if self.mono_ring.len() == FFT_SIZE {
@@ -210,8 +219,8 @@ impl AudioDspAnalyzer {
 
         let mut faults = Vec::new();
 
-        // Digital clipping check: True Peak >= -0.1 dBTP (Warn) / +0.3 dBTP (Crit) or >=3 consecutive clipped samples
-        if true_peak_dbtp >= -0.1 || max_consec_clip >= 3 {
+        // Digital clipping check: instantaneous True Peak >= -0.1 dBTP or >=3 consecutive clipped samples
+        if instant_true_peak_dbtp >= -0.1 || max_consec_clip >= 3 {
             faults.push(FaultKind::AudioClipping);
         }
 
@@ -385,7 +394,7 @@ fn sanitize_lufs(val: Result<f64, ebur128::Error>) -> f32 {
 }
 
 fn linear_to_dbfs(val: f64) -> f32 {
-    if val <= 1e-6 {
+    if !val.is_finite() || val <= 1e-6 {
         -120.0
     } else {
         (20.0 * val.log10()) as f32
@@ -648,6 +657,53 @@ mod tests {
         assert!(
             opp_corr < 0.15,
             "Expected wrong-bus anti-correlated streams < 0.15, got {opp_corr}"
+        );
+    }
+
+    #[test]
+    fn test_realtime_true_peak_auto_decays_and_does_not_latch_clipping() {
+        let mut dsp = AudioDspAnalyzer::new(Platform::Youtube).expect("dsp init");
+        // 100ms block at 48kHz stereo = 4800 frames
+        let mut loud = Vec::with_capacity(4800 * 2);
+        for i in 0..4800 {
+            let s = (2.0 * std::f32::consts::PI * 1000.0 * (i as f32 / 48_000.0)).sin();
+            loud.push(s);
+            loud.push(s);
+        }
+        let (tel_loud, faults_loud) = dsp.process_f32_interleaved(&loud, None);
+        assert!(
+            tel_loud.true_peak_dbtp >= -0.5,
+            "Expected instantaneous true peak near 0 dBTP, got {}",
+            tel_loud.true_peak_dbtp
+        );
+        assert!(faults_loud.contains(&FaultKind::AudioClipping));
+
+        // Follow with 1.0s of quiet (-26 dBFS) audio in 100ms blocks:
+        // clipping fault must clear immediately and true peak must decay smoothly (~12 dB/s).
+        let mut quiet = Vec::with_capacity(4800 * 2);
+        for i in 0..4800 {
+            let s = 0.05 * (2.0 * std::f32::consts::PI * 1000.0 * (i as f32 / 48_000.0)).sin();
+            quiet.push(s);
+            quiet.push(s);
+        }
+        let mut last_tp = tel_loud.true_peak_dbtp;
+        for _ in 0..10 {
+            let (tel_q, faults_q) = dsp.process_f32_interleaved(&quiet, None);
+            assert!(
+                !faults_q.contains(&FaultKind::AudioClipping),
+                "AudioClipping must not latch after signal drops"
+            );
+            assert!(
+                tel_q.true_peak_dbtp < last_tp,
+                "Expected true peak to decay each block ({} -> {})",
+                last_tp,
+                tel_q.true_peak_dbtp
+            );
+            last_tp = tel_q.true_peak_dbtp;
+        }
+        assert!(
+            last_tp < -10.0,
+            "Expected ~12 dB decay after 1s of quiet audio, got {last_tp}"
         );
     }
 }
