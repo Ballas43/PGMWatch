@@ -705,8 +705,10 @@ impl UrlResolver {
             if !resp.status().is_success() {
                 continue;
             }
+            let content_len = resp.content_length();
             let Ok(html) = resp.text().await else { continue };
-            if let Some(found) = extract_facebook_dash_manifest_url(&html) {
+            crate::stats::record_http_rx_bytes(content_len, html.len());
+            if let Some(found) = extract_facebook_dash_manifest_url(&html, url) {
                 mpd_url = Some(found);
                 break;
             }
@@ -755,23 +757,67 @@ impl UrlResolver {
     }
 }
 
-fn extract_facebook_dash_manifest_url(html: &str) -> Option<String> {
-    let anchor = html.find("\"dash_manifest_urls\"")?;
-    let window = &html[anchor..html.len().min(anchor + 4096)];
-    let key = "\"manifest_url\":\"";
-    let start = window.find(key)? + key.len();
-    let rest = &window[start..];
-    let end = rest.find('"')?;
-    let raw = &rest[..end];
-    let unescaped = raw
-        .replace("\\/", "/")
-        .replace("\\u0026", "&")
-        .replace("&amp;", "&");
-    if unescaped.starts_with("http") && unescaped.contains(".mpd") {
-        Some(unescaped)
-    } else {
-        None
+fn extract_fb_video_id_from_url(url: &str) -> Option<&str> {
+    let lower = url.to_ascii_lowercase();
+    if let Some(pos) = lower.find("/videos/") {
+        let rest = &url[pos + "/videos/".len()..];
+        let digits = rest
+            .split(['/', '?', '#', '&'])
+            .find(|seg| seg.len() >= 6 && seg.chars().all(|c| c.is_ascii_digit()));
+        if digits.is_some() {
+            return digits;
+        }
     }
+    if let Some(qpos) = url.find('?') {
+        for pair in url[qpos + 1..].split('&') {
+            if let Some(val) = pair.strip_prefix("v=") {
+                let clean = val.split('#').next().unwrap_or("");
+                if clean.len() >= 6 && clean.chars().all(|c| c.is_ascii_digit()) {
+                    return Some(clean);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_facebook_dash_manifest_url(html: &str, page_url: &str) -> Option<String> {
+    let target_vid = extract_fb_video_id_from_url(page_url);
+    let key = "\"manifest_url\":\"";
+    let mut first_valid: Option<String> = None;
+    let mut offset = 0usize;
+    while let Some(rel) = html[offset..].find("\"dash_manifest_urls\"") {
+        let anchor = offset + rel;
+        let win_end = html.ceil_char_boundary((anchor + 4096).min(html.len()));
+        let window = &html[anchor..win_end];
+        if let Some(kpos) = window.find(key) {
+            let start = kpos + key.len();
+            let rest = &window[start..];
+            if let Some(end) = rest.find('"') {
+                let raw = &rest[..end];
+                let unescaped = raw
+                    .replace("\\/", "/")
+                    .replace("\\u0026", "&")
+                    .replace("&amp;", "&");
+                if unescaped.starts_with("http") && unescaped.contains(".mpd") {
+                    if let Some(vid) = target_vid {
+                        let ctx_start = html.floor_char_boundary(anchor.saturating_sub(2048));
+                        let ctx = &html[ctx_start..win_end];
+                        if ctx.contains(vid) || unescaped.contains(vid) {
+                            return Some(unescaped);
+                        }
+                    } else {
+                        return Some(unescaped);
+                    }
+                    if first_valid.is_none() {
+                        first_valid = Some(unescaped);
+                    }
+                }
+            }
+        }
+        offset = anchor + "\"dash_manifest_urls\"".len();
+    }
+    first_valid
 }
 
 fn select_streamlink_quality(platform: Platform, tier: FeedTier) -> &'static str {
@@ -1284,7 +1330,11 @@ mod tests {
         ));
         let sample_ssr = r#"{"videoDeliveryLegacyFields":null,"videoDeliveryResponseFragment":{"videoDeliveryResponseResult":{"dash_manifest_urls":[{"manifest_url":"https:\/\/scontent.fpen3-1.fna.fbcdn.net\/live-dash\/1168362549283504.mpd?_nc_zt=28\u0026ccb=2-4"}]}}}"#;
         assert_eq!(
-            extract_facebook_dash_manifest_url(sample_ssr).as_deref(),
+            extract_facebook_dash_manifest_url(
+                sample_ssr,
+                "https://www.facebook.com/page/videos/1168362549283504"
+            )
+            .as_deref(),
             Some("https://scontent.fpen3-1.fna.fbcdn.net/live-dash/1168362549283504.mpd?_nc_zt=28&ccb=2-4")
         );
     }

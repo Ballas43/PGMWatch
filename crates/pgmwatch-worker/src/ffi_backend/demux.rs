@@ -143,10 +143,12 @@ pub(super) fn run_demux_loop(
         }
         if is_network {
             let is_http = lower_url.starts_with("http://") || lower_url.starts_with("https://");
+            let is_manifest = lower_url.contains(".m3u8") || lower_url.contains(".mpd");
             ff::av_dict_set(&mut opts, c"rw_timeout".as_ptr(), c"10000000".as_ptr(), 0);
-            if is_http {
+            if is_http && !is_manifest {
                 ff::av_dict_set(&mut opts, c"reconnect".as_ptr(), c"1".as_ptr(), 0);
                 ff::av_dict_set(&mut opts, c"reconnect_streamed".as_ptr(), c"1".as_ptr(), 0);
+                ff::av_dict_set(&mut opts, c"reconnect_delay_max".as_ptr(), c"5".as_ptr(), 0);
             }
             if !lower_url.starts_with("srt://")
                 && let Some(ip) = media_opts
@@ -256,6 +258,11 @@ pub(super) fn run_demux_loop(
                     (*ctx).extra_hw_frames = media_opts.extra_hw_frames as c_int;
                 }
             }
+            if !hw_on {
+                // Cap SW decode threads to 2 per worker so 37+ concurrent workers don't spawn
+                // hundreds of FFmpeg thread-pool OS threads.
+                (*ctx).thread_count = 2;
+            }
             if ff::avcodec_open2(ctx, dec, ptr::null_mut()) < 0 {
                 let mut tmp = ctx;
                 ff::avcodec_free_context(&mut tmp);
@@ -334,6 +341,10 @@ pub(super) fn run_demux_loop(
         }
 
         let mut swr_guard = SwrGuard(ptr::null_mut());
+        let mut swr_src_rate: c_int = 0;
+        let mut swr_src_fmt: c_int = -1;
+        let mut swr_src_ch: c_int = 0;
+        let mut audio_out_buf: Vec<f32> = Vec::with_capacity(AUDIO_CHUNK_SAMPLES);
         let mut sws_guard = SwsGuard(ptr::null_mut());
         let mut sws_src_w = 0;
         let mut sws_src_h = 0;
@@ -356,13 +367,17 @@ pub(super) fn run_demux_loop(
         while !shared.stop_flag.load(Ordering::Relaxed) {
             let rd = ff::av_read_frame(ifmt, pkt_guard.0);
             if rd < 0 {
-                if rd == ff::AVERROR_EOF {
-                    shared.ended.store(true, Ordering::Relaxed);
+                if !shared.stop_flag.load(Ordering::Relaxed) {
+                    shared.ended.store(true, Ordering::Release);
                 }
                 break;
             }
 
             let stream_idx = (*pkt_guard.0).stream_index;
+            if stream_idx < 0 || (stream_idx as u32) >= (*ifmt).nb_streams {
+                ff::av_packet_unref(pkt_guard.0);
+                continue;
+            }
             let pkt_size = (*pkt_guard.0).size.max(0) as usize;
             let st = *(*ifmt).streams.add(stream_idx as usize);
             let tb = (*st).time_base;
@@ -474,12 +489,19 @@ pub(super) fn run_demux_loop(
                         tel.av_sync_ms = tel.av_sync_tracker.push_audio(ap_ms, Instant::now());
                     }
 
-                    if swr_guard.0.is_null() {
+                    let cur_rate = (*aframe_guard.0).sample_rate.max(8000);
+                    let cur_fmt = (*aframe_guard.0).format;
+                    let cur_ch = (*aframe_guard.0).ch_layout.nb_channels;
+                    if swr_guard.0.is_null()
+                        || swr_src_rate != cur_rate
+                        || swr_src_fmt != cur_fmt
+                        || swr_src_ch != cur_ch
+                    {
+                        swr_guard = SwrGuard(ptr::null_mut());
                         let mut out_ch: ff::AVChannelLayout = std::mem::zeroed();
                         ff::av_channel_layout_default(&mut out_ch, CANONICAL_CHANNELS as c_int);
                         let mut swr: *mut ff::SwrContext = ptr::null_mut();
-                        let src_rate = (*aframe_guard.0).sample_rate.max(8000);
-                        let src_fmt: ff::AVSampleFormat = std::mem::transmute_copy(&(*aframe_guard.0).format);
+                        let src_fmt: ff::AVSampleFormat = std::mem::transmute_copy(&cur_fmt);
                         if ff::swr_alloc_set_opts2(
                             &mut swr,
                             &out_ch,
@@ -487,13 +509,20 @@ pub(super) fn run_demux_loop(
                             CANONICAL_SAMPLE_RATE as c_int,
                             &(*aframe_guard.0).ch_layout,
                             src_fmt,
-                            src_rate,
+                            cur_rate,
                             0,
                             ptr::null_mut(),
                         ) >= 0
-                            && ff::swr_init(swr) >= 0
+                            && !swr.is_null()
                         {
-                            swr_guard = SwrGuard(swr);
+                            // Wrap in guard BEFORE swr_init so a failed init never leaks SwrContext.
+                            let candidate = SwrGuard(swr);
+                            if ff::swr_init(candidate.0) >= 0 {
+                                swr_guard = candidate;
+                                swr_src_rate = cur_rate;
+                                swr_src_fmt = cur_fmt;
+                                swr_src_ch = cur_ch;
+                            }
                         }
                     }
 
@@ -502,8 +531,11 @@ pub(super) fn run_demux_loop(
                             * CANONICAL_SAMPLE_RATE as i64)
                             / (*aframe_guard.0).sample_rate.max(1) as i64
                             + 64) as usize;
-                        let mut out_buf = vec![0.0f32; out_cap * CANONICAL_CHANNELS as usize];
-                        let out_ptr = out_buf.as_mut_ptr() as *mut u8;
+                        let needed = out_cap * CANONICAL_CHANNELS as usize;
+                        if audio_out_buf.len() < needed {
+                            audio_out_buf.resize(needed, 0.0);
+                        }
+                        let out_ptr = audio_out_buf.as_mut_ptr() as *mut u8;
                         let converted = ff::swr_convert(
                             swr_guard.0,
                             &out_ptr,
@@ -513,7 +545,7 @@ pub(super) fn run_demux_loop(
                         );
                         if converted > 0 {
                             let n_floats = converted as usize * CANONICAL_CHANNELS as usize;
-                            pcm_accum.extend_from_slice(&out_buf[..n_floats]);
+                            pcm_accum.extend_from_slice(&audio_out_buf[..n_floats]);
                             while pcm_accum.len() >= AUDIO_CHUNK_SAMPLES {
                                 let chunk: Vec<f32> = pcm_accum.drain(..AUDIO_CHUNK_SAMPLES).collect();
                                 if let Ok(mut aq) = shared.audio_queue.lock() {
@@ -555,26 +587,36 @@ pub(super) fn run_demux_loop(
                         break;
                     }
 
+                    let need_rgb = !rgb_buf.is_empty()
+                        && last_thumb_push.elapsed() >= Duration::from_millis(240);
                     let mut src_frame = vframe_guard.0;
                     if (*vframe_guard.0).format == ff::AVPixelFormat::AV_PIX_FMT_D3D11 as c_int {
-                        let xfer = ff::av_hwframe_transfer_data(swframe_guard.0, vframe_guard.0, 0);
-                        if xfer < 0 {
-                            hw_fail_streak += 1;
-                            ff::av_frame_unref(vframe_guard.0);
-                            if hw_fail_streak >= 3 {
-                                shared.gpu_fault_pending.store(true, Ordering::Release);
-                                shared.hw_accelerated.store(false, Ordering::Release);
-                                if let Some((sw_ctx, _)) = open_video_ctx(st, false, ptr::null_mut()) {
-                                    vctx_guard = CodecGuard(sw_ctx);
-                                    hw_active = false;
+                        // Only transfer GPU VRAM -> CPU RAM on the first frame (to verify D3D11VA
+                        // surface health) and when a thumbnail/SIMD analysis frame is actually due
+                        // (~4 fps instead of 60 fps, cutting PCIe DMA readback by ~93%).
+                        if need_rgb || frames_decoded_hw == 0 {
+                            let xfer =
+                                ff::av_hwframe_transfer_data(swframe_guard.0, vframe_guard.0, 0);
+                            if xfer < 0 {
+                                hw_fail_streak += 1;
+                                ff::av_frame_unref(vframe_guard.0);
+                                if hw_fail_streak >= 3 {
+                                    shared.gpu_fault_pending.store(true, Ordering::Release);
+                                    shared.hw_accelerated.store(false, Ordering::Release);
+                                    if let Some((sw_ctx, _)) =
+                                        open_video_ctx(st, false, ptr::null_mut())
+                                    {
+                                        vctx_guard = CodecGuard(sw_ctx);
+                                        hw_active = false;
+                                    }
+                                    hw_fail_streak = 0;
                                 }
-                                hw_fail_streak = 0;
+                                continue;
                             }
-                            continue;
+                            src_frame = swframe_guard.0;
                         }
                         hw_fail_streak = 0;
                         frames_decoded_hw += 1;
-                        src_frame = swframe_guard.0;
                     } else if hw_active {
                         frames_decoded_hw += 1;
                         hw_fail_streak = 0;
@@ -607,7 +649,7 @@ pub(super) fn run_demux_loop(
                         tel.avg_qp = 0.0;
                     }
 
-                    if !rgb_buf.is_empty() && last_thumb_push.elapsed() >= Duration::from_millis(240) {
+                    if need_rgb {
                         let fw = (*src_frame).width;
                         let fh = (*src_frame).height;
                         let ffmt: ff::AVPixelFormat = std::mem::transmute_copy(&(*src_frame).format);
@@ -648,7 +690,7 @@ pub(super) fn run_demux_loop(
                                     dst_strides.as_mut_ptr(),
                                 );
                                 if let Ok(mut guard) = shared.latest_rgb.lock() {
-                                    *guard = rgb_buf.clone();
+                                    guard.clone_from(&rgb_buf);
                                     shared.rgb_seq.fetch_add(1, Ordering::Release);
                                     last_thumb_push = Instant::now();
                                 }

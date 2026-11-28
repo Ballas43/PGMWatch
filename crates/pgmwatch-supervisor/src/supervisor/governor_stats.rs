@@ -253,6 +253,7 @@ impl SupervisorState {
             let mut active_bind_ip = stats_state.cfg.read().await.server.outbound_bind_ip.clone();
             let mut client = build_stats_http_client(&active_bind_ip);
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut shutdown_rx = stats_state.subscribe_shutdown();
             let mut tick = 0u64;
             loop {
@@ -281,12 +282,20 @@ impl SupervisorState {
     }
 
     async fn run_governor_tick(self: &Arc<Self>) {
-        let (active_workers, shed_channels, wan_kbps, max_lat_pct) = {
+        let active_worker_ids: std::collections::HashSet<String> = {
+            let workers = self.workers.lock().await;
+            workers.keys().cloned().collect()
+        };
+        let active_workers = active_worker_ids.len();
+        let (shed_channels, wan_kbps, max_lat_pct) = {
             let map = self.channels.read().await;
             let mut wan = 0.0f32;
             let mut max_lat = 0.0f32;
             let mut shed = 0usize;
             for c in map.values() {
+                if !active_worker_ids.contains(&c.config.id) {
+                    continue;
+                }
                 // Account for wire-level container/TLS/TCP-IP framing on top of demuxed AVPacket bytes:
                 // MPEG-TS HLS (YouTube/Twitch) adds ~14% overhead; fMP4/FLV/RTMP adds ~8%.
                 let wire_overhead = match c.config.platform {
@@ -301,8 +310,7 @@ impl SupervisorState {
                     shed += 1;
                 }
             }
-            let worker_count = self.workers.lock().await.len();
-            (worker_count, shed, wan, max_lat)
+            (shed, wan, max_lat)
         };
 
         let aux_rx_mbps = {
@@ -349,7 +357,17 @@ impl SupervisorState {
 
         *self.governor_tel.write().await = decision.telemetry.clone();
 
-        {
+        let fps_changed = {
+            let mut last = self.last_thumb_fps.lock().await;
+            let changed = last
+                .map(|prev| (prev - decision.target_thumbnail_fps).abs() > 0.01)
+                .unwrap_or(true);
+            if changed {
+                *last = Some(decision.target_thumbnail_fps);
+            }
+            changed
+        };
+        if fps_changed {
             let mut workers = self.workers.lock().await;
             for w in workers.values_mut() {
                 let _ = send_worker_cmd(
@@ -379,7 +397,7 @@ impl SupervisorState {
                 let mut map = self.channels.write().await;
                 let candidates: Vec<ShedCandidate> = map
                     .values()
-                    .filter(|c| c.config.enabled)
+                    .filter(|c| c.config.enabled && active_worker_ids.contains(&c.config.id))
                     .map(|c| ShedCandidate {
                         id: c.config.id.clone(),
                         configured_tier: c.config.tier,
@@ -444,12 +462,15 @@ impl SupervisorState {
             };
             if ticks >= 8 {
                 *self.recovery_healthy_ticks.lock().await = 0;
-                // Recover stepped-down MASTER channels first, then shed SIMULCAST channels.
+                // Recover stepped-down MASTER channels first (Simulcast->Master, or Stage-3 Light->Simulcast),
+                // then shed SIMULCAST channels (Light->Simulcast).
                 let recover_cand: Option<(ChannelConfig, FeedTier)> = {
                     let map = self.channels.read().await;
                     map.values()
                         .filter(|c| {
-                            c.effective_tier == FeedTier::Simulcast
+                            c.config.enabled
+                                && active_worker_ids.contains(&c.config.id)
+                                && c.effective_tier == FeedTier::Simulcast
                                 && c.config.tier == FeedTier::Master
                                 && !c.forced_light
                         })
@@ -458,11 +479,21 @@ impl SupervisorState {
                         .or_else(|| {
                             map.values()
                                 .filter(|c| {
-                                    c.effective_tier == FeedTier::Light
-                                        && c.config.tier == FeedTier::Simulcast
+                                    c.config.enabled
+                                        && active_worker_ids.contains(&c.config.id)
+                                        && c.effective_tier == FeedTier::Light
+                                        && matches!(
+                                            c.config.tier,
+                                            FeedTier::Master | FeedTier::Simulcast
+                                        )
                                         && !c.forced_light
                                 })
-                                .min_by_key(|c| c.config.priority)
+                                .min_by_key(|c| {
+                                    (
+                                        if c.config.tier == FeedTier::Master { 0u8 } else { 1u8 },
+                                        c.config.priority,
+                                    )
+                                })
                                 .map(|c| (c.config.clone(), FeedTier::Simulcast))
                         })
                 };
@@ -481,21 +512,28 @@ impl SupervisorState {
                                 )
                                 .await
                             {
-                                st.mse_hubs.invalidate(&ch.id).await;
                                 let expected_prev = if target_tier == FeedTier::Master {
                                     FeedTier::Simulcast
                                 } else {
                                     FeedTier::Light
                                 };
-                                {
+                                let upgraded = {
                                     let mut map = st.channels.write().await;
                                     if let Some(m) = map.get_mut(&ch.id)
+                                        && m.config.enabled
                                         && m.effective_tier == expected_prev
                                         && !m.forced_light
                                     {
                                         m.effective_tier = target_tier;
+                                        true
+                                    } else {
+                                        false
                                     }
+                                };
+                                if !upgraded {
+                                    return;
                                 }
+                                st.mse_hubs.invalidate(&ch.id).await;
                                 st.resolved_media
                                     .write()
                                     .await
@@ -620,55 +658,67 @@ impl SupervisorState {
             mode_b: &mode_b_map,
             facebook_cookie: fb_cookie_header.as_deref(),
         };
-        let mut new_samples = Vec::with_capacity(configs.len());
         let scrape_heavy_html = force_refresh || tick % 3 == 1;
 
-        for ch in configs {
-            let cached_heavy = if !scrape_heavy_html
-                && !ch.url.starts_with("sim://")
-                && matches!(ch.platform, Platform::Youtube | Platform::Facebook)
-            {
-                let map = self.channels.read().await;
-                map.get(&ch.id)
-                    .filter(|m| {
-                        m.ccv.status == MetricStatus::Value
-                            && (ch.platform != Platform::Youtube
-                                || m.likes.status == MetricStatus::Value)
-                    })
-                    .map(|m| ChannelStatsUpdate {
-                        channel_id: ch.id.clone(),
-                        ccv: m.ccv.clone(),
-                        total_views: m.total_views.clone(),
-                        likes: m.likes.clone(),
-                        chat_rate_per_min: chat_rates
-                            .get(&ch.id)
-                            .copied()
-                            .map(|v| TriStateMetric::value(v, 100.0))
-                            .unwrap_or_else(|| m.chat_rate_per_min.clone()),
-                        shares: m.shares.clone(),
-                        gifts_count: m.gifts_count.clone(),
-                        extras: HashMap::new(),
-                    })
-            } else {
-                None
-            };
+        // Scrape channels concurrently (bounded to 6 in-flight requests) so 37+ channels finish
+        // within a single 10s stats tick instead of blocking sequentially for 40-90s.
+        use futures_util::stream::{self, StreamExt};
+        let stat_caches_ref = &stat_caches;
+        let chat_rates_ref = &chat_rates;
+        let updates: Vec<(ChannelConfig, ChannelStatsUpdate)> = stream::iter(configs)
+            .map(|ch| async move {
+                let cached_heavy = if !scrape_heavy_html
+                    && !ch.url.starts_with("sim://")
+                    && matches!(ch.platform, Platform::Youtube | Platform::Facebook)
+                {
+                    let map = self.channels.read().await;
+                    map.get(&ch.id)
+                        .filter(|m| {
+                            m.ccv.status == MetricStatus::Value
+                                && (ch.platform != Platform::Youtube
+                                    || m.likes.status == MetricStatus::Value)
+                        })
+                        .map(|m| ChannelStatsUpdate {
+                            channel_id: ch.id.clone(),
+                            ccv: m.ccv.clone(),
+                            total_views: m.total_views.clone(),
+                            likes: m.likes.clone(),
+                            chat_rate_per_min: chat_rates_ref
+                                .get(&ch.id)
+                                .copied()
+                                .map(|v| TriStateMetric::value(v, 100.0))
+                                .unwrap_or_else(|| m.chat_rate_per_min.clone()),
+                            shares: m.shares.clone(),
+                            gifts_count: m.gifts_count.clone(),
+                            extras: HashMap::new(),
+                        })
+                } else {
+                    None
+                };
 
-            let update = if let Some(cached) = cached_heavy {
-                cached
-            } else {
-                collect_platform_stats(
-                    client,
-                    &ch.id,
-                    &ch.url,
-                    ch.platform,
-                    tick,
-                    &stat_caches,
-                )
-                .await
-            };
+                let update = if let Some(cached) = cached_heavy {
+                    cached
+                } else {
+                    collect_platform_stats(
+                        client,
+                        &ch.id,
+                        &ch.url,
+                        ch.platform,
+                        tick,
+                        stat_caches_ref,
+                    )
+                    .await
+                };
+                (ch, update)
+            })
+            .buffer_unordered(6)
+            .collect()
+            .await;
 
-            {
-                let mut map = self.channels.write().await;
+        let mut new_samples = Vec::with_capacity(updates.len());
+        {
+            let mut map = self.channels.write().await;
+            for (ch, update) in &updates {
                 if let Some(m) = map.get_mut(&ch.id) {
                     m.ccv = update.ccv.clone();
                     m.total_views = update.total_views.clone();
@@ -678,7 +728,8 @@ impl SupervisorState {
                     m.gifts_count = update.gifts_count.clone();
                 }
             }
-
+        }
+        for (ch, update) in updates {
             let sample = GridSample {
                 bucket_utc: bucket,
                 channel_id: ch.id,

@@ -48,15 +48,20 @@ mod imp {
             unsafe {
                 let job = CreateJobObjectW(None, None)?;
                 let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-                info.BasicLimitInformation.LimitFlags =
-                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
-                info.ProcessMemoryLimit = (process_memory_limit_mb as usize) * 1024 * 1024;
-                SetInformationJobObject(
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                if process_memory_limit_mb > 0 {
+                    info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+                    info.ProcessMemoryLimit = (process_memory_limit_mb as usize) * 1024 * 1024;
+                }
+                if let Err(err) = SetInformationJobObject(
                     job,
                     JobObjectExtendedLimitInformation,
                     &info as *const _ as *const _,
                     size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                )?;
+                ) {
+                    let _ = CloseHandle(job);
+                    return Err(err.into());
+                }
                 Ok(Self { handle: job })
             }
         }
@@ -355,7 +360,11 @@ mod imp {
                     std::ptr::null_mut(),
                     &mut val,
                 );
-                if status == 0 && val.c_status == 0 && val.double_value.is_finite() {
+                // PDH_CSTATUS_VALID_DATA (0) and PDH_CSTATUS_NEW_DATA (1) are both valid readings.
+                if status == 0
+                    && (val.c_status == 0 || val.c_status == 1)
+                    && val.double_value.is_finite()
+                {
                     Some((val.double_value as f32).clamp(0.0, 100.0))
                 } else {
                     None

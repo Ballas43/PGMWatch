@@ -39,8 +39,9 @@ pub fn check_wan_admission(
 
 impl ResourceGovernor {
     pub fn new(cfg: GovernorConfig) -> Self {
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        let mut sys = System::new();
+        sys.refresh_cpu_all();
+        sys.refresh_memory();
         Self {
             sys,
             cpu_utility: WindowsCpuUtilitySampler::new(),

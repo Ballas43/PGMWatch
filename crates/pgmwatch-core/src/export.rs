@@ -234,13 +234,27 @@ pub fn build_accounting_workbook(
             .set_font_color(Color::RGB(0xEDEDED));
 
         let mut ch_peak: HashMap<String, i64> = HashMap::new();
+        let mut ch_latest: HashMap<String, (chrono::DateTime<chrono::Utc>, i64)> = HashMap::new();
         let mut ch_source: HashMap<String, MetricSource> = HashMap::new();
         for s in &effective_samples {
             if let Some(v) = s.ccv {
                 let p = ch_peak.entry(s.channel_id.clone()).or_insert(0);
                 *p = (*p).max(v);
+                match ch_latest.get_mut(&s.channel_id) {
+                    Some((ts, val)) if s.bucket_utc >= *ts => {
+                        *ts = s.bucket_utc;
+                        *val = v;
+                    }
+                    None => {
+                        ch_latest.insert(s.channel_id.clone(), (s.bucket_utc, v));
+                    }
+                    _ => {}
+                }
             }
-            ch_source.insert(s.channel_id.clone(), s.source);
+            let entry = ch_source.entry(s.channel_id.clone()).or_insert(s.source);
+            if s.source == MetricSource::ManualStudio {
+                *entry = MetricSource::ManualStudio;
+            }
         }
 
         // Group channels in show.groups order, followed by any ungrouped channels.
@@ -307,14 +321,24 @@ pub fn build_accounting_workbook(
                 ws.write_string(row, 2, ch.config.platform.display_name())?;
                 ws.write_string(row, 3, tier_label(ch.effective_tier))?;
                 ws.write_string(row, 4, status_label(ch.ccv.status))?;
-                match ch.ccv.value {
-                    Some(v) if ch.ccv.status == MetricStatus::Value => {
+                let effective_latest = ch_latest
+                    .get(&ch.config.id)
+                    .map(|(_, v)| *v as f64)
+                    .or_else(|| {
+                        if ch.ccv.status == MetricStatus::Value {
+                            ch.ccv.value
+                        } else {
+                            None
+                        }
+                    });
+                match effective_latest {
+                    Some(v) => {
                         ws.write_number_with_format(row, 5, v, &num_fmt)?;
                         if !ch.config.exclude_from_accounting {
                             cat_latest += v;
                         }
                     }
-                    _ => {
+                    None => {
                         ws.write_string(
                             row,
                             5,

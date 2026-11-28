@@ -452,7 +452,10 @@ export function ChannelsSection({
                       ariaLabel={`Target LUFS for ${ch.name}`}
                       value={draft.target_lufs ?? null}
                       onCommit={(nextVal) =>
-                        onUpdateChannelDraft(ch.id, { target_lufs: nextVal })
+                        onUpdateChannelDraft(ch.id, {
+                          target_lufs:
+                            nextVal == null ? null : Math.max(-36, Math.min(-5, nextVal)),
+                        })
                       }
                     />
                   </td>

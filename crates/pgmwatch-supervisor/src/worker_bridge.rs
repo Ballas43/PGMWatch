@@ -393,6 +393,7 @@ impl SupervisorState {
                 .insert(ch.id.clone(), resolved);
             self.mse_hubs.invalidate(&ch.id).await;
 
+            let worker_pid = child.id();
             {
                 let mut workers = self.workers.lock().await;
                 let prev_faults = workers
@@ -432,6 +433,40 @@ impl SupervisorState {
                     }
                 }
                 tracing::debug!("Worker stdout closed for {ch_id}");
+                // Clean up crashed/exited worker if it is still the active handle for this channel,
+                // zero stale RX/decode metrics, and mark enabled channels for auto-poller recovery.
+                let removed = {
+                    let mut workers = st.workers.lock().await;
+                    let is_same = workers
+                        .get(&ch_id)
+                        .is_some_and(|w| w.child.id() == worker_pid);
+                    if is_same {
+                        workers.remove(&ch_id)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(mut handle) = removed {
+                    let _ = handle.child.wait().await;
+                    let mut map = st.channels.write().await;
+                    if let Some(m) = map.get_mut(&ch_id) {
+                        m.rx_kbps = 0.0;
+                        m.video.decode_ms = 0.0;
+                        if m.config.enabled
+                            && !matches!(
+                                m.tracker.state,
+                                AlertState::Offline
+                                    | AlertState::LoginGated
+                                    | AlertState::ExtractorErr
+                            )
+                        {
+                            m.tracker.set_external_state(
+                                AlertState::ExtractorErr,
+                                "Worker process exited unexpectedly; auto-retrying",
+                            );
+                        }
+                    }
+                }
             });
         })
     }
@@ -439,6 +474,19 @@ impl SupervisorState {
     pub async fn stop_worker(&self, channel_id: &str) {
         self.mse_hubs.invalidate(channel_id).await;
         self.resolved_media.write().await.remove(channel_id);
+        let source_url = {
+            let mut map = self.channels.write().await;
+            if let Some(m) = map.get_mut(channel_id) {
+                m.rx_kbps = 0.0;
+                m.video.decode_ms = 0.0;
+                Some(m.config.url.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(url) = source_url {
+            self.dash_relay.clear_source(&url).await;
+        }
         let mut workers = self.workers.lock().await;
         if let Some(mut handle) = workers.remove(channel_id) {
             let _ = send_worker_cmd(&mut handle.stdin, &SupervisorToWorker::Shutdown).await;
@@ -566,6 +614,18 @@ impl SupervisorState {
                 ..
             } => {
                 if token_expired {
+                    // Deduplicate concurrent/rapid re-resolve requests for the same channel.
+                    {
+                        let mut inflight = self.reresolve_inflight.lock().await;
+                        let now = std::time::Instant::now();
+                        if inflight
+                            .get(&channel_id)
+                            .is_some_and(|t| now.duration_since(*t) < std::time::Duration::from_secs(15))
+                        {
+                            return;
+                        }
+                        inflight.insert(channel_id.clone(), now);
+                    }
                     let ch_info = {
                         let map = self.channels.read().await;
                         map.get(&channel_id)
@@ -615,6 +675,9 @@ impl SupervisorState {
                                     }
                                 }
                                 Err(err) => {
+                                    // Stop the wedged/ended worker so it doesn't leak a process
+                                    // and so the offline auto-poller can cleanly restart it later.
+                                    st.stop_worker(&ch.id).await;
                                     let target_state = match err {
                                         crate::resolver::ResolveError::LoginGated(_) => AlertState::LoginGated,
                                         crate::resolver::ResolveError::Offline(_) => AlertState::Offline,

@@ -2,10 +2,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   attachStereoRmsTap,
   getSharedAudioContext,
-  StereoMeterSample,
   StereoRmsTap,
   unlockSharedAudioContext,
 } from "../utils/audioAnalyser";
+import { liveTelemetryStore } from "../utils/liveTelemetryStore";
 
 export function usePflAudio() {
   const ctxRef = useRef<AudioContext | null>(null);
@@ -16,7 +16,6 @@ export function usePflAudio() {
   const allowedChannelRef = useRef<string | null>(null);
   const [allowedChannel, setAllowedChannelState] = useState<string | null>(null);
   const [muted, setMutedState] = useState(false);
-  const [pflMeter, setPflMeter] = useState<StereoMeterSample | null>(null);
   const mutedRef = useRef(false);
   mutedRef.current = muted;
 
@@ -60,7 +59,7 @@ export function usePflAudio() {
     } else {
       nextTimeRef.current = 0;
     }
-    setPflMeter(null);
+    liveTelemetryStore.setPflMeter(null);
   }, []);
 
   const ensureContext = useCallback(() => {
@@ -104,7 +103,7 @@ export function usePflAudio() {
 
   useEffect(() => {
     if (!allowedChannel || muted) {
-      setPflMeter(null);
+      liveTelemetryStore.setPflMeter(null);
       return;
     }
 
@@ -116,13 +115,9 @@ export function usePflAudio() {
         const tap = tapRef.current;
         const ctx = ctxRef.current;
         if (tap && ctx && ctx.state === "running" && activeSourcesRef.current.size > 0) {
-          setPflMeter(tap.readDb());
+          liveTelemetryStore.setPflMeter(tap.readDb());
         } else if (ctx && ctx.state === "running" && allowedChannelRef.current === allowedChannel) {
-          setPflMeter((prev) =>
-            prev && prev.leftDb === -100 && prev.rightDb === -100
-              ? prev
-              : { leftDb: -100, rightDb: -100 }
-          );
+          liveTelemetryStore.setPflMeter({ leftDb: -100, rightDb: -100 });
         }
       }
       rafId = window.requestAnimationFrame(tick);
@@ -131,7 +126,7 @@ export function usePflAudio() {
 
     return () => {
       window.cancelAnimationFrame(rafId);
-      setPflMeter(null);
+      liveTelemetryStore.setPflMeter(null);
     };
   }, [allowedChannel, muted]);
 
@@ -214,5 +209,5 @@ export function usePflAudio() {
     [ensureGainAndTap]
   );
 
-  return { ensureContext, setAllowedChannel, stopAll, pushPcmPacket, muted, setMuted, pflMeter };
+  return { ensureContext, setAllowedChannel, stopAll, pushPcmPacket, muted, setMuted };
 }

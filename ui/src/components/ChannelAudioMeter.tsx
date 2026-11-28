@@ -160,8 +160,8 @@ export function ChannelAudioMeter({
         </InfoTip>
         <div className="h-1.5 flex-1 overflow-hidden rounded-sm bg-[var(--bg-raised)]">
           <div
-            className={`h-full ${pflSyncMode ? "transition-none" : "transition-[width] duration-75"} ${vuBarColor(audio.left_rms_dbfs)}`}
-            style={{ width: `${dbToPct(audio.left_rms_dbfs)}%` }}
+            className={`h-full w-full origin-left will-change-transform ${pflSyncMode ? "transition-none" : "transition-transform duration-75"} ${vuBarColor(audio.left_rms_dbfs)}`}
+            style={{ transform: `scaleX(${dbToPct(audio.left_rms_dbfs) / 100})` }}
           />
         </div>
         <InfoTip
@@ -180,8 +180,8 @@ export function ChannelAudioMeter({
         </InfoTip>
         <div className="h-1.5 flex-1 overflow-hidden rounded-sm bg-[var(--bg-raised)]">
           <div
-            className={`h-full ${pflSyncMode ? "transition-none" : "transition-[width] duration-75"} ${vuBarColor(audio.right_rms_dbfs)}`}
-            style={{ width: `${dbToPct(audio.right_rms_dbfs)}%` }}
+            className={`h-full w-full origin-left will-change-transform ${pflSyncMode ? "transition-none" : "transition-transform duration-75"} ${vuBarColor(audio.right_rms_dbfs)}`}
+            style={{ transform: `scaleX(${dbToPct(audio.right_rms_dbfs) / 100})` }}
           />
         </div>
         <InfoTip

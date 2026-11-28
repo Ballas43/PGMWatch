@@ -125,6 +125,7 @@ pub struct AvSyncTracker {
     cal_started_at: Option<Instant>,
     baseline_offset_ms: Option<f32>,
     recent_drifts: VecDeque<(Instant, f32)>,
+    median_scratch: Vec<f32>,
     last_sample_at: Option<Instant>,
     smoothed_drift_ms: f32,
 }
@@ -139,6 +140,7 @@ impl AvSyncTracker {
             cal_started_at: None,
             baseline_offset_ms: None,
             recent_drifts: VecDeque::with_capacity(256),
+            median_scratch: Vec::with_capacity(256),
             last_sample_at: None,
             smoothed_drift_ms: 0.0,
         }
@@ -264,9 +266,14 @@ impl AvSyncTracker {
         let filtered_drift = if stalled || self.recent_drifts.len() < 5 {
             raw_drift
         } else {
-            let mut vals: Vec<f32> = self.recent_drifts.iter().map(|&(_, v)| v).collect();
-            vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            vals[vals.len() / 2]
+            self.median_scratch.clear();
+            self.median_scratch
+                .extend(self.recent_drifts.iter().map(|&(_, v)| v));
+            let mid = self.median_scratch.len() / 2;
+            let (_, &mut med, _) = self
+                .median_scratch
+                .select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+            med
         };
 
         // Slowly adapt baseline only for tiny steady-state interleave shifts inside the normal band

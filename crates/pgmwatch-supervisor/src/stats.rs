@@ -574,7 +574,7 @@ fn extract_json_field_number(haystack: &str, key: &str) -> Option<f64> {
                 // Support both direct numeric values (`"reaction_count":33`) and nested
                 // Facebook/GraphQL objects (`"reaction_count":{"count":33}`).
                 let candidate = if let Some(inner) = val_part.strip_prefix('{') {
-                    let window = &inner[..inner.len().min(96)];
+                    let window = &inner[..inner.floor_char_boundary(inner.len().min(96))];
                     if let Some(num) = extract_direct_count_in_object(window) {
                         return Some(num);
                     }
@@ -684,7 +684,7 @@ fn extract_facebook_field_number(
             if let Some(after_colon) = trimmed_ws.strip_prefix(':') {
                 let val_part = after_colon.trim_start_matches(|c: char| c.is_ascii_whitespace());
                 let parsed = if let Some(inner) = val_part.strip_prefix('{') {
-                    let obj_win = &inner[..inner.len().min(96)];
+                    let obj_win = &inner[..inner.floor_char_boundary(inner.len().min(96))];
                     extract_direct_count_in_object(obj_win)
                 } else {
                     let digits: String = val_part

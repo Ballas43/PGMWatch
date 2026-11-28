@@ -12,8 +12,10 @@ pub struct AudioDspAnalyzer {
     target_lufs: f32,
     lufs_tolerance: f32,
     ebur: EbuR128,
-    ebur_avg: EbuR128,
     fft: Arc<dyn rustfft::Fft<f32>>,
+    hann_window: Vec<f32>,
+    fft_buf: Vec<Complex<f32>>,
+    fft_scratch: Vec<Complex<f32>>,
     mono_ring: VecDeque<f32>,
     master_lufs_history: VecDeque<f32>,
     self_lufs_history: VecDeque<f32>,
@@ -23,8 +25,10 @@ pub struct AudioDspAnalyzer {
     missing_channel_ms: u64,
     phase_inv_ms: u64,
     hum_ms: u64,
+    hum_sample_ms: u64,
     wrong_bus_ms: u64,
     wrong_bus_sample_ms: u64,
+    last_wrong_bus_corr: f32,
     consecutive_clip_samples: u32,
     hum_candidate_hz: Option<f32>,
     last_hum_freq: Option<f32>,
@@ -37,22 +41,26 @@ impl AudioDspAnalyzer {
         let ebur = EbuR128::new(
             CANONICAL_CHANNELS,
             CANONICAL_SAMPLE_RATE,
-            Mode::S | Mode::TRUE_PEAK,
-        )?;
-        let ebur_avg = EbuR128::new(
-            CANONICAL_CHANNELS,
-            CANONICAL_SAMPLE_RATE,
-            Mode::I,
+            Mode::I | Mode::S | Mode::TRUE_PEAK,
         )?;
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(FFT_SIZE);
+        let fft_scratch_len = fft.get_inplace_scratch_len();
+        let hann_window: Vec<f32> = (0..FFT_SIZE)
+            .map(|i| {
+                0.5 * (1.0
+                    - ((2.0 * std::f32::consts::PI * i as f32) / (FFT_SIZE as f32 - 1.0)).cos())
+            })
+            .collect();
 
         Ok(Self {
             target_lufs: platform.target_lufs(),
             lufs_tolerance: platform.lufs_tolerance(),
             ebur,
-            ebur_avg,
             fft,
+            hann_window,
+            fft_buf: vec![Complex::new(0.0, 0.0); FFT_SIZE],
+            fft_scratch: vec![Complex::new(0.0, 0.0); fft_scratch_len],
             mono_ring: VecDeque::with_capacity(FFT_SIZE * 2),
             master_lufs_history: VecDeque::with_capacity(180),
             self_lufs_history: VecDeque::with_capacity(180),
@@ -62,8 +70,10 @@ impl AudioDspAnalyzer {
             missing_channel_ms: 0,
             phase_inv_ms: 0,
             hum_ms: 0,
+            hum_sample_ms: 0,
             wrong_bus_ms: 0,
             wrong_bus_sample_ms: 0,
+            last_wrong_bus_corr: 1.0,
             consecutive_clip_samples: 0,
             hum_candidate_hz: None,
             last_hum_freq: None,
@@ -88,12 +98,9 @@ impl AudioDspAnalyzer {
         if let Ok(fresh) = EbuR128::new(
             CANONICAL_CHANNELS,
             CANONICAL_SAMPLE_RATE,
-            Mode::S | Mode::TRUE_PEAK,
+            Mode::I | Mode::S | Mode::TRUE_PEAK,
         ) {
             self.ebur = fresh;
-        }
-        if let Ok(fresh) = EbuR128::new(CANONICAL_CHANNELS, CANONICAL_SAMPLE_RATE, Mode::I) {
-            self.ebur_avg = fresh;
         }
         self.mono_ring.clear();
         self.master_lufs_history.clear();
@@ -104,8 +111,10 @@ impl AudioDspAnalyzer {
         self.missing_channel_ms = 0;
         self.phase_inv_ms = 0;
         self.hum_ms = 0;
+        self.hum_sample_ms = 0;
         self.wrong_bus_ms = 0;
         self.wrong_bus_sample_ms = 0;
+        self.last_wrong_bus_corr = 1.0;
         self.consecutive_clip_samples = 0;
         self.hum_candidate_hz = None;
         self.last_hum_freq = None;
@@ -126,7 +135,6 @@ impl AudioDspAnalyzer {
 
         let block_ms = ((frame_count as f64 / CANONICAL_SAMPLE_RATE as f64) * 1000.0).round() as u64;
         let _ = self.ebur.add_frames_f32(interleaved);
-        let _ = self.ebur_avg.add_frames_f32(interleaved);
 
         let mut left_sq = 0.0f64;
         let mut right_sq = 0.0f64;
@@ -168,7 +176,7 @@ impl AudioDspAnalyzer {
             1.0
         };
 
-        let integrated_lufs = sanitize_lufs(self.ebur_avg.loudness_global());
+        let integrated_lufs = sanitize_lufs(self.ebur.loudness_global());
         let short_term_lufs = sanitize_lufs(self.ebur.loudness_shortterm());
 
         let tp_l = self.ebur.prev_true_peak(0).unwrap_or(0.0);
@@ -182,24 +190,35 @@ impl AudioDspAnalyzer {
         let true_peak_dbtp = self.decayed_true_peak_dbtp;
 
         // 8192-pt FFT stationary AC mains hum detector (50/60 Hz fundamental & 100/120 Hz harmonic)
+        // Throttled to 2 Hz (every 500ms) since persistence gate is 2000ms.
         if self.mono_ring.len() == FFT_SIZE {
-            let (freq, peak_db) = self.detect_narrowband_hum();
-            if peak_db > 20.0 {
-                if let Some(f) = freq {
-                    let stationary = self
-                        .hum_candidate_hz
-                        .map(|prev| (prev - f).abs() <= 12.0)
-                        .unwrap_or(true);
-                    if stationary {
-                        self.hum_ms += block_ms;
+            self.hum_sample_ms += block_ms;
+            if self.hum_sample_ms >= 500 {
+                let hum_step_ms = self.hum_sample_ms;
+                self.hum_sample_ms = 0;
+                let (freq, peak_db) = self.detect_narrowband_hum();
+                if peak_db > 20.0 {
+                    if let Some(f) = freq {
+                        let stationary = self
+                            .hum_candidate_hz
+                            .map(|prev| (prev - f).abs() <= 12.0)
+                            .unwrap_or(true);
+                        if stationary {
+                            self.hum_ms += hum_step_ms;
+                        } else {
+                            self.hum_ms = hum_step_ms;
+                        }
+                        self.hum_candidate_hz = Some(f);
+                        if self.hum_ms >= 2000 {
+                            self.last_hum_freq = Some(f);
+                            self.last_hum_peak_db = peak_db;
+                        } else {
+                            self.last_hum_freq = None;
+                            self.last_hum_peak_db = 0.0;
+                        }
                     } else {
-                        self.hum_ms = block_ms;
-                    }
-                    self.hum_candidate_hz = Some(f);
-                    if self.hum_ms >= 2000 {
-                        self.last_hum_freq = Some(f);
-                        self.last_hum_peak_db = peak_db;
-                    } else {
+                        self.hum_ms = 0;
+                        self.hum_candidate_hz = None;
                         self.last_hum_freq = None;
                         self.last_hum_peak_db = 0.0;
                     }
@@ -209,11 +228,6 @@ impl AudioDspAnalyzer {
                     self.last_hum_freq = None;
                     self.last_hum_peak_db = 0.0;
                 }
-            } else {
-                self.hum_ms = 0;
-                self.hum_candidate_hz = None;
-                self.last_hum_freq = None;
-                self.last_hum_peak_db = 0.0;
             }
         }
 
@@ -301,18 +315,23 @@ impl AudioDspAnalyzer {
                 }
                 self.master_lufs_history.push_back(master_lufs);
                 self.self_lufs_history.push_back(short_term_lufs);
+
+                if self.master_lufs_history.len() >= WRONG_BUS_WINDOW
+                    && self.self_lufs_history.len() >= WRONG_BUS_WINDOW
+                {
+                    self.last_wrong_bus_corr = max_lag_pearson_corr(
+                        &mut self.master_lufs_history,
+                        &mut self.self_lufs_history,
+                        WRONG_BUS_WINDOW,
+                        WRONG_BUS_MAX_LAG,
+                    );
+                }
             }
 
             if self.master_lufs_history.len() >= WRONG_BUS_WINDOW
                 && self.self_lufs_history.len() >= WRONG_BUS_WINDOW
             {
-                let corr = max_lag_pearson_corr(
-                    &mut self.master_lufs_history,
-                    &mut self.self_lufs_history,
-                    WRONG_BUS_WINDOW,
-                    WRONG_BUS_MAX_LAG,
-                );
-                if corr < 0.15 {
+                if self.last_wrong_bus_corr < 0.15 {
                     self.wrong_bus_ms += block_ms;
                 } else {
                     self.wrong_bus_ms = 0;
@@ -324,6 +343,7 @@ impl AudioDspAnalyzer {
         } else {
             self.wrong_bus_ms = 0;
             self.wrong_bus_sample_ms = 0;
+            self.last_wrong_bus_corr = 1.0;
             self.master_lufs_history.clear();
             self.self_lufs_history.clear();
         }
@@ -342,26 +362,30 @@ impl AudioDspAnalyzer {
         (telemetry, faults)
     }
 
-    fn detect_narrowband_hum(&self) -> (Option<f32>, f32) {
-        let mut buffer: Vec<Complex<f32>> = Vec::with_capacity(FFT_SIZE);
-        for (i, &sample) in self.mono_ring.iter().enumerate() {
-            // Hann window
-            let w = 0.5
-                * (1.0 - ((2.0 * std::f32::consts::PI * i as f32) / (FFT_SIZE as f32 - 1.0)).cos());
-            buffer.push(Complex::new(sample * w, 0.0));
-        }
-        self.fft.process(&mut buffer);
-
-        let bin_hz = CANONICAL_SAMPLE_RATE as f32 / FFT_SIZE as f32;
-        let mags: Vec<f32> = buffer[..FFT_SIZE / 2]
+    fn detect_narrowband_hum(&mut self) -> (Option<f32>, f32) {
+        for (i, (&sample, &w)) in self
+            .mono_ring
             .iter()
-            .map(|c| 20.0 * (c.norm() / FFT_SIZE as f32 + 1e-9).log10())
-            .collect();
+            .zip(self.hann_window.iter())
+            .enumerate()
+        {
+            self.fft_buf[i] = Complex::new(sample * w, 0.0);
+        }
+        self.fft
+            .process_with_scratch(&mut self.fft_buf, &mut self.fft_scratch);
+
+        // Only bins 0..=30 are needed: bin 30 = 175.8 Hz, covering 44-68 Hz & 94-128 Hz plus +-4 shoulder bins.
+        const HUM_BINS: usize = 31;
+        let bin_hz = CANONICAL_SAMPLE_RATE as f32 / FFT_SIZE as f32;
+        let mut mags = [0.0f32; HUM_BINS];
+        for (bin, mag) in mags.iter_mut().enumerate() {
+            *mag = 20.0 * (self.fft_buf[bin].norm() / FFT_SIZE as f32 + 1e-9).log10();
+        }
 
         let mut best_freq = None;
         let mut best_prominence = 0.0f32;
 
-        for bin in 5..(mags.len().saturating_sub(5)) {
+        for bin in 5..(HUM_BINS - 5) {
             let freq = bin as f32 * bin_hz;
             // Restrict detection to 50/60 Hz mains hum and 100/120 Hz 2nd-harmonic bands
             // so normal vocals, music, and mid/high game SFX never masquerade as mains hum.

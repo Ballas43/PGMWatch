@@ -1,17 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { BookmarkPlus, CheckCheck, MonitorPlay, PauseCircle, PlayCircle, RefreshCw, RotateCcw } from "lucide-react";
-import { AudioTelemetry, DashboardSnapshot } from "../types";
-import { StereoMeterSample } from "../utils/audioAnalyser";
+import { DashboardSnapshot } from "../types";
 import { BrandLogo } from "./BrandLogo";
 import { canChannelUseHq, ChannelCard } from "./ChannelCard";
 import { GovernorStatusStrip } from "./GovernorStatusStrip";
 
 interface LiveWallViewProps {
   snapshot: DashboardSnapshot | null;
-  thumbs: Record<string, string>;
-  meters: Record<string, AudioTelemetry>;
   globalPflMuted: boolean;
-  pcmPflMeter: StereoMeterSample | null;
   onMseAudioChange: (id: string, hasMseAudio: boolean) => void;
   onAck: (id: string) => void;
   onAckAll: () => Promise<void> | void;
@@ -36,10 +32,7 @@ interface LiveWallViewProps {
 
 export function LiveWallView({
   snapshot,
-  thumbs,
-  meters,
   globalPflMuted,
-  pcmPflMeter,
   onMseAudioChange,
   onAck,
   onAckAll,
@@ -385,10 +378,7 @@ export function LiveWallView({
                 <ChannelCard
                   key={ch.config.id}
                   channel={ch}
-                  liveThumbB64={thumbs[ch.config.id]}
-                  liveAudio={meters[ch.config.id]}
                   globalPflMuted={globalPflMuted}
-                  livePflMeter={snapshot.active_pfl_channel_id === ch.config.id ? pcmPflMeter : null}
                   hqEnabled={Boolean(hqByChannel[ch.config.id])}
                   onSetHqEnabled={handleSetChannelHq}
                   onMseAudioChange={onMseAudioChange}

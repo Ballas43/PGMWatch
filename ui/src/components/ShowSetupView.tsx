@@ -21,12 +21,19 @@ interface ShowSetupViewProps {
 }
 
 function detectPlatform(url: string): Platform {
-  const lower = url.toLowerCase();
-  if (lower.includes("youtube.com") || lower.includes("youtu.be") || lower.includes("yt")) return "youtube";
-  if (lower.includes("twitch.tv") || lower.includes("tw")) return "twitch";
-  if (lower.includes("facebook.com") || lower.includes("fb")) return "facebook";
-  if (lower.includes("tiktok.com") || lower.includes("tt")) return "tiktok";
-  if (lower.includes("bigo.tv")) return "bigo";
+  const trimmed = url.trim().toLowerCase();
+  let host = "";
+  try {
+    host = new URL(trimmed.includes("://") ? trimmed : `https://${trimmed}`).hostname;
+  } catch {
+    host = trimmed.split("/")[0] ?? "";
+  }
+  const matches = (domain: string) => host === domain || host.endsWith(`.${domain}`);
+  if (matches("youtube.com") || matches("youtu.be") || trimmed.startsWith("sim://yt")) return "youtube";
+  if (matches("twitch.tv") || trimmed.startsWith("sim://tw")) return "twitch";
+  if (matches("facebook.com") || matches("fb.watch") || matches("fb.gg") || trimmed.startsWith("sim://fb")) return "facebook";
+  if (matches("tiktok.com") || trimmed.startsWith("sim://tt")) return "tiktok";
+  if (matches("bigo.tv") || trimmed.startsWith("sim://bigo")) return "bigo";
   return "custom";
 }
 
@@ -110,7 +117,10 @@ export function ShowSetupView({ snapshot, onRefresh }: ShowSetupViewProps) {
     void refreshPresetList();
   }, [activeShowId, showTitleValue, groups.length, showChannels.length, activeSegmentId, refreshPresetList]);
   const groupsSig = groups
-    .map((g) => `${g.id}\0${g.language_code}\0${g.name}\0${g.complaint_keywords.join(",")}`)
+    .map(
+      (g) =>
+        `${g.id}\0${g.language_code}\0${g.name}\0${Boolean(g.intermission_active)}\0${g.complaint_keywords.join(",")}`
+    )
     .join("\n");
   const channelsSig = showChannels
     .map(
@@ -388,10 +398,20 @@ export function ShowSetupView({ snapshot, onRefresh }: ShowSetupViewProps) {
       setStatusMsg({ text: "Channel name and stream URL cannot be empty", isError: true });
       return;
     }
+    const clampedLufs =
+      draft.target_lufs != null && Number.isFinite(draft.target_lufs)
+        ? Math.max(-36, Math.min(-5, draft.target_lufs))
+        : null;
+    const clampedTol =
+      draft.lufs_tolerance != null && Number.isFinite(draft.lufs_tolerance)
+        ? Math.max(0.5, Math.min(10, draft.lufs_tolerance))
+        : null;
     const updated: ChannelConfig = {
       ...draft,
       name: trimmedName,
       url: trimmedUrl,
+      target_lufs: clampedLufs,
+      lufs_tolerance: clampedTol,
       platform: detectPlatform(trimmedUrl),
       priority: draft.tier === "MASTER" ? 1 : draft.tier === "SIMULCAST" ? 2 : 3,
     };

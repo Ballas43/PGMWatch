@@ -390,33 +390,47 @@ async fn run_twitch_chat_loop(state: Arc<SupervisorState>, channel_id: String, u
                 .await
                 .insert(channel_id.clone(), total_gifts as f64);
 
-            while let Some(Ok(msg)) = ws.next().await {
-                if let Message::Text(txt) = msg {
-                    for line in txt.lines() {
-                        if line.starts_with("PING") {
-                            let _ = ws.send(Message::Text("PONG :tmi.twitch.tv".into())).await;
-                            continue;
-                        }
-                        let gift_delta = parse_twitch_irc_gift_count(line);
-                        if gift_delta > 0 {
-                            total_gifts = total_gifts.saturating_add(gift_delta);
-                            state
-                                .twitch_gifts
-                                .write()
-                                .await
-                                .insert(channel_id.clone(), total_gifts as f64);
-                        }
-                        if let Some((viewer, body)) = parse_twitch_irc_privmsg(line) {
-                            let now = Instant::now();
-                            tracker.record(&channel_id, now);
-                            if let Some(rate) = tracker.rate_per_min(&channel_id, now) {
-                                state.chat_rates.write().await.insert(channel_id.clone(), rate);
+            let mut decay_tick = tokio::time::interval(Duration::from_secs(10));
+            decay_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = decay_tick.tick() => {
+                        let rate = tracker.rate_per_min(&channel_id, Instant::now()).unwrap_or(0.0);
+                        state.chat_rates.write().await.insert(channel_id.clone(), rate);
+                    }
+                    maybe_msg = ws.next() => {
+                        let Some(Ok(msg)) = maybe_msg else {
+                            break;
+                        };
+                        if let Message::Text(txt) = msg {
+                            for line in txt.lines() {
+                                if line.starts_with("PING") {
+                                    let _ = ws.send(Message::Text("PONG :tmi.twitch.tv".into())).await;
+                                    continue;
+                                }
+                                let gift_delta = parse_twitch_irc_gift_count(line);
+                                if gift_delta > 0 {
+                                    total_gifts = total_gifts.saturating_add(gift_delta);
+                                    state
+                                        .twitch_gifts
+                                        .write()
+                                        .await
+                                        .insert(channel_id.clone(), total_gifts as f64);
+                                }
+                                if let Some((viewer, body)) = parse_twitch_irc_privmsg(line) {
+                                    let now = Instant::now();
+                                    tracker.record(&channel_id, now);
+                                    if let Some(rate) = tracker.rate_per_min(&channel_id, now) {
+                                        state.chat_rates.write().await.insert(channel_id.clone(), rate);
+                                    }
+                                    state.ingest_chat_complaint_message(&channel_id, &viewer, &body).await;
+                                }
                             }
-                            state.ingest_chat_complaint_message(&channel_id, &viewer, &body).await;
                         }
                     }
                 }
             }
+            state.chat_rates.write().await.insert(channel_id.clone(), 0.0);
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
@@ -429,6 +443,7 @@ async fn run_youtube_chat_loop(
     url: String,
 ) {
     let mut tracker = ChatRateTracker::new();
+    let mut bootstrap_misses: u32 = 0;
 
     loop {
         let Ok(resp) = client
@@ -437,19 +452,26 @@ async fn run_youtube_chat_loop(
             .send()
             .await
         else {
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            tokio::time::sleep(Duration::from_secs(15)).await;
             continue;
         };
         let content_len = resp.content_length();
         let Ok(html) = resp.text().await else {
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            tokio::time::sleep(Duration::from_secs(15)).await;
             continue;
         };
         crate::stats::record_http_rx_bytes(content_len, html.len());
         let Some((api_key, mut continuation)) = extract_youtube_chat_bootstrap(&html) else {
-            tokio::time::sleep(Duration::from_secs(15)).await;
+            bootstrap_misses = bootstrap_misses.saturating_add(1);
+            let backoff_secs = match bootstrap_misses {
+                1 => 15,
+                2 => 60,
+                _ => 180,
+            };
+            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
             continue;
         };
+        bootstrap_misses = 0;
 
         state.chat_rates.write().await.insert(channel_id.clone(), 0.0);
         let endpoint = format!(

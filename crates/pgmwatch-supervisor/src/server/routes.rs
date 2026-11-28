@@ -754,9 +754,9 @@ pub(super) async fn get_channel_fmp4_stream(
     }
     let ch_opt = {
         let map = st.channels.read().await;
-        map.get(&id).map(|m| m.config.clone())
+        map.get(&id).map(|m| (m.config.clone(), m.effective_tier))
     };
-    let Some(ch) = ch_opt else {
+    let Some((ch, eff_tier)) = ch_opt else {
         return (StatusCode::NOT_FOUND, "Channel not found").into_response();
     };
     if !ch.enabled || ch.url.trim().to_ascii_lowercase().starts_with("sim://") {
@@ -767,7 +767,7 @@ pub(super) async fn get_channel_fmp4_stream(
     } else {
         match st
             .resolver
-            .resolve(&ch.url, ch.platform, ch.tier, ch.live_streams_only)
+            .resolve(&ch.url, ch.platform, eff_tier, ch.live_streams_only)
             .await
         {
             Ok(resolved) => {

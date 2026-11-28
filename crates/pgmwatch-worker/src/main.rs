@@ -57,7 +57,7 @@ struct Args {
     lufs_tolerance: Option<f32>,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -139,20 +139,29 @@ async fn main() -> anyhow::Result<()> {
         tokio::sync::watch::channel((current_url.clone(), headers.clone()));
     let (probe_outcome_tx, probe_outcome_rx) =
         tokio::sync::watch::channel::<Option<ProbeOutcome>>(None);
+    let probe_outcome_clear_tx = probe_outcome_tx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
-            tokio::select! {
-                _ = interval.tick() => {}
+            let target_changed = tokio::select! {
+                _ = interval.tick() => false,
                 res = probe_target_rx.changed() => {
                     if res.is_err() {
                         break;
                     }
+                    true
                 }
+            };
+            if target_changed {
+                probe.reset();
+                let _ = probe_outcome_tx.send(None);
             }
             let (u, h) = probe_target_rx.borrow().clone();
             let outcome = probe.probe(&u, &h).await;
-            let _ = probe_outcome_tx.send(Some(outcome));
+            // Only publish if the target hasn't changed again while the HTTP request was in flight.
+            if probe_target_rx.borrow().0 == outcome.url {
+                let _ = probe_outcome_tx.send(Some(outcome));
+            }
         }
     });
 
@@ -179,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
     let mut last_audio_faults: Vec<FaultKind> = Vec::new();
     let mut last_video_faults: Vec<FaultKind> = Vec::new();
     let mut last_batch_faults: Vec<FaultKind> = Vec::new();
+    let mut pending_transient_faults: Vec<FaultKind> = Vec::new();
     let mut last_batch_ad_break = false;
     let mut last_rx_kbps = 0.0f32;
     let mut last_rx_time = Instant::now();
@@ -186,7 +196,8 @@ async fn main() -> anyhow::Result<()> {
     let mut last_video_time = Instant::now();
     let mut last_thumb_time = Instant::now();
     let mut last_telemetry_emit = Instant::now() - Duration::from_secs(2);
-    let mut token_expired_sent_for: Option<String> = None;
+    let mut last_reacquire_emit: Option<Instant> = None;
+    const REACQUIRE_COOLDOWN: Duration = Duration::from_secs(45);
     let mut has_media_packet = current_url.starts_with("sim://");
 
     loop {
@@ -202,8 +213,9 @@ async fn main() -> anyhow::Result<()> {
                                     current_audio_url = audio_url;
                                     tier = new_tier;
                                     headers = new_headers;
-                                    token_expired_sent_for = None;
+                                    last_reacquire_emit = None;
                                     has_media_packet = current_url.starts_with("sim://");
+                                    let _ = probe_outcome_clear_tx.send(None);
                                     let _ = probe_target_tx.send((current_url.clone(), headers.clone()));
                                     // Drop & close the previous socket/threads BEFORE opening the new URL
                                     // so tier changes don't double-download two streams simultaneously.
@@ -221,10 +233,12 @@ async fn main() -> anyhow::Result<()> {
                                         None
                                     };
                                     bitrate_tracker.reset();
+                                    simd.reset();
                                     last_video_tel = VideoTelemetry::default();
                                     last_video_faults.clear();
                                     last_batch_faults.clear();
                                     last_audio_faults.clear();
+                                    pending_transient_faults.clear();
                                     ring.clear();
                                     av_sync_bad_ms = 0;
                                     last_rx_time = Instant::now();
@@ -308,16 +322,22 @@ async fn main() -> anyhow::Result<()> {
             _ = tick_interval.tick() => {
                 tick += 1;
 
-                let last_probe_outcome = probe_outcome_rx.borrow().clone();
+                let last_probe_outcome = probe_outcome_rx
+                    .borrow()
+                    .clone()
+                    .filter(|p| p.url == current_url);
+                let reacquire_ready = last_reacquire_emit
+                    .map(|t| t.elapsed() >= REACQUIRE_COOLDOWN)
+                    .unwrap_or(true);
                 if let Some(ref p) = last_probe_outcome
                     && p.token_expired
-                    && token_expired_sent_for.as_deref() != Some(current_url.as_str())
+                    && reacquire_ready
                 {
-                    token_expired_sent_for = Some(current_url.clone());
+                    last_reacquire_emit = Some(Instant::now());
                     let _ = emit(&WorkerToSupervisor::StreamError {
                         channel_id: args.channel_id.clone(),
                         code: "TOKEN_EXPIRED".into(),
-                        message: "Upstream URL returned 401/403/410; re-resolving".into(),
+                        message: "Upstream URL returned 401/403/404/410; re-resolving".into(),
                         token_expired: true,
                         gpu_fault: false,
                     }).await;
@@ -369,15 +389,18 @@ async fn main() -> anyhow::Result<()> {
                     }
                     if batch.corrupt_decode {
                         last_batch_faults.push(FaultKind::CorruptDecode);
+                        pending_transient_faults.push(FaultKind::CorruptDecode);
                     }
                     if batch.pts_drift {
                         last_batch_faults.push(FaultKind::PtsDrift);
+                        pending_transient_faults.push(FaultKind::PtsDrift);
                     }
                     if is_av_sync_drifted(batch.av_sync_ms, &mut av_sync_bad_ms, 100) {
                         last_batch_faults.push(FaultKind::AvSyncDrift);
                     }
                     if batch.gpu_fault {
                         last_batch_faults.push(FaultKind::WorkerGpuFault);
+                        pending_transient_faults.push(FaultKind::WorkerGpuFault);
                         let _ = emit(&WorkerToSupervisor::StreamError {
                             channel_id: args.channel_id.clone(),
                             code: "GPU_DECODE_FAULT".into(),
@@ -401,6 +424,11 @@ async fn main() -> anyhow::Result<()> {
                         last_audio_rx_time = Instant::now();
                         let (audio_tel, a_faults) =
                             dsp.process_f32_interleaved(&batch.pcm_f32, group_ref_lufs);
+                        for &f in &a_faults {
+                            if matches!(f, FaultKind::AudioClipping | FaultKind::AudioMicroSilence) {
+                                pending_transient_faults.push(f);
+                            }
+                        }
                         last_audio_tel = audio_tel.clone();
                         last_audio_faults = a_faults;
 
@@ -451,6 +479,11 @@ async fn main() -> anyhow::Result<()> {
                         let v_elapsed_ms = (last_video_time.elapsed().as_millis() as u64).clamp(50, 2000);
                         last_video_time = Instant::now();
                         let vres = simd.analyze_y_plane(&batch.y_plane, v_elapsed_ms, batch.avg_qp);
+                        for &f in &vres.faults {
+                            if matches!(f, FaultKind::VideoBlink) {
+                                pending_transient_faults.push(f);
+                            }
+                        }
                         last_video_faults = vres.faults;
                         last_video_tel = VideoTelemetry {
                             width: if batch.width > 0 {
@@ -527,16 +560,21 @@ async fn main() -> anyhow::Result<()> {
                     let mut faults = last_audio_faults.clone();
                     faults.extend(last_video_faults.iter().copied());
                     faults.extend(last_batch_faults.iter().copied());
+                    for f in pending_transient_faults.drain(..) {
+                        if !faults.contains(&f) {
+                            faults.push(f);
+                        }
+                    }
 
                     if last_rx_time.elapsed() >= stall_threshold {
                         faults.push(FaultKind::StreamStall);
                         // Self-heal prolonged stalls (>30s with zero packets, e.g. expired Facebook/CDN
-                        // edge URL or stuck HLS demux socket) by asking supervisor to re-resolve once.
+                        // edge URL or stuck HLS demux socket) by asking supervisor to re-resolve.
                         if last_rx_time.elapsed() >= Duration::from_secs(30)
                             && !current_url.starts_with("sim://")
-                            && token_expired_sent_for.as_deref() != Some(current_url.as_str())
+                            && reacquire_ready
                         {
-                            token_expired_sent_for = Some(current_url.clone());
+                            last_reacquire_emit = Some(Instant::now());
                             let _ = emit(&WorkerToSupervisor::StreamError {
                                 channel_id: args.channel_id.clone(),
                                 code: "STALL_REACQUIRE".into(),
@@ -570,11 +608,14 @@ async fn main() -> anyhow::Result<()> {
                         && has_media_packet
                         && (last_audio_rx_time.elapsed() >= Duration::from_secs(20)
                             || av_sync_bad_ms >= 20_000);
+                    let split_reacquire_ready = last_reacquire_emit
+                        .map(|t| t.elapsed() >= REACQUIRE_COOLDOWN)
+                        .unwrap_or(true);
                     if split_track_stalled
                         && !current_url.starts_with("sim://")
-                        && token_expired_sent_for.as_deref() != Some(current_url.as_str())
+                        && split_reacquire_ready
                     {
-                        token_expired_sent_for = Some(current_url.clone());
+                        last_reacquire_emit = Some(Instant::now());
                         let _ = emit(&WorkerToSupervisor::StreamError {
                             channel_id: args.channel_id.clone(),
                             code: "TRACK_STALL_REACQUIRE".into(),
@@ -761,9 +802,9 @@ fn spawn_clip_save(
 
 async fn emit(msg: &WorkerToSupervisor) -> anyhow::Result<()> {
     let mut stdout = tokio::io::stdout();
-    let line = serde_json::to_string(msg)?;
+    let mut line = serde_json::to_string(msg)?;
+    line.push('\n');
     stdout.write_all(line.as_bytes()).await?;
-    stdout.write_all(b"\n").await?;
     stdout.flush().await?;
     Ok(())
 }

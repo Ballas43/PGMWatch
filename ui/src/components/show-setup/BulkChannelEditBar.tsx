@@ -105,7 +105,12 @@ export function BulkChannelEditBar({
     return patch;
   };
 
-  const hasChanges = Object.keys(buildPatch()).length > 0;
+  const invalidCustom =
+    (lufsMode === "custom" &&
+      (lufsCustom.trim() === "" || !Number.isFinite(Number(lufsCustom.trim())))) ||
+    (tolMode === "custom" &&
+      (tolCustom.trim() === "" || !Number.isFinite(Number(tolCustom.trim()))));
+  const hasChanges = !invalidCustom && Object.keys(buildPatch()).length > 0;
 
   const handleApply = async () => {
     const patch = buildPatch();

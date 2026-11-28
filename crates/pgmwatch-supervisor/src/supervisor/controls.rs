@@ -61,6 +61,8 @@ impl SupervisorState {
             let m = map.get_mut(channel_id)?;
             m.config.enabled = enabled;
             if !enabled {
+                m.rx_kbps = 0.0;
+                m.video.decode_ms = 0.0;
                 m.tracker.set_external_state(AlertState::Offline, "Paused by operator");
             } else {
                 m.tracker.set_external_state(AlertState::Reacquiring, "Resuming monitor");

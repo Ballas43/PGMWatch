@@ -172,14 +172,31 @@ impl DashRelayState {
 
         match kind {
             RelayKind::HlsProxy { playlist_url } => {
+                let cache_key = format!("hls-trimmed:{playlist_url}");
+                {
+                    let cache = self.mpd_cache.lock().await;
+                    if let Some(hit) = cache.get(&cache_key)
+                        && hit.fetched_at.elapsed() < HLS_PROXY_CACHE_TTL
+                    {
+                        return Ok(hit.xml.clone());
+                    }
+                }
                 let raw_m3u8 = self
                     .fetch_manifest_cached(&playlist_url, &headers, HLS_PROXY_CACHE_TTL)
                     .await?;
-                Ok(trim_hls_dvr_playlist(
+                let trimmed = trim_hls_dvr_playlist(
                     &playlist_url,
                     &raw_m3u8,
                     HLS_DVR_KEEP_SEGMENTS,
-                ))
+                );
+                self.mpd_cache.lock().await.insert(
+                    cache_key,
+                    CachedMpd {
+                        xml: trimmed.clone(),
+                        fetched_at: Instant::now(),
+                    },
+                );
+                Ok(trimmed)
             }
             RelayKind::DashMpd {
                 mpd_url,
@@ -276,25 +293,79 @@ impl DashRelayState {
     }
 }
 
+fn resolve_hls_tag_uri(line: &str, base: Option<&Url>) -> String {
+    let Some(b) = base else {
+        return line.to_string();
+    };
+    let Some(uri_idx) = line.find("URI=\"") else {
+        return line.to_string();
+    };
+    let val_start = uri_idx + 5;
+    let Some(val_end_rel) = line[val_start..].find('"') else {
+        return line.to_string();
+    };
+    let raw_uri = &line[val_start..val_start + val_end_rel];
+    if raw_uri.starts_with("http://") || raw_uri.starts_with("https://") {
+        return line.to_string();
+    }
+    let resolved = b
+        .join(raw_uri)
+        .map(String::from)
+        .unwrap_or_else(|_| raw_uri.to_string());
+    format!(
+        "{}{}{}",
+        &line[..val_start],
+        resolved,
+        &line[val_start + val_end_rel..]
+    )
+}
+
+fn resolve_all_relative_uris(base: Option<&Url>, body: &str) -> String {
+    let Some(b) = base else {
+        return body.to_string();
+    };
+    let mut out = String::with_capacity(body.len() + 256);
+    for raw_line in body.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('#') {
+            if line.starts_with("#EXT-X-MAP:") || line.starts_with("#EXT-X-KEY:") {
+                out.push_str(&resolve_hls_tag_uri(line, Some(b)));
+            } else {
+                out.push_str(line);
+            }
+        } else if line.starts_with("http://") || line.starts_with("https://") {
+            out.push_str(line);
+        } else {
+            let resolved = b.join(line).map(String::from).unwrap_or_else(|_| line.to_string());
+            out.push_str(&resolved);
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// Trims oversized live DVR HLS media playlists (e.g., YouTube's 720-segment 1-hour DVR
 /// playlist) down to the trailing `keep_segments` live-edge segments while preserving
 /// `#EXT-X-MEDIA-SEQUENCE`, `#EXT-X-DISCONTINUITY-SEQUENCE`, `#EXT-X-KEY`, and `#EXT-X-MAP`,
 /// and resolving any relative segment URIs against `base_url`.
 pub fn trim_hls_dvr_playlist(base_url: &str, body: &str, keep_segments: usize) -> String {
     let keep = keep_segments.max(3);
+    let base = Url::parse(base_url).ok();
     if body.contains("#EXT-X-ENDLIST") || body.contains("#EXT-X-STREAM-INF") {
-        return body.to_string();
+        return resolve_all_relative_uris(base.as_ref(), body);
     }
 
-    let base = Url::parse(base_url).ok();
-    let mut header_lines: Vec<String> = Vec::new();
+    let mut header_lines: Vec<&str> = Vec::new();
     let mut media_seq: u64 = 0;
     let mut has_media_seq = false;
     let mut disc_seq: u64 = 0;
     let mut has_disc_seq = false;
 
-    let mut segments: Vec<Vec<String>> = Vec::new();
-    let mut pending_seg_tags: Vec<String> = Vec::new();
+    let mut segments: Vec<Vec<&str>> = Vec::new();
+    let mut pending_seg_tags: Vec<&str> = Vec::new();
     let mut in_segments = false;
 
     for raw_line in body.lines() {
@@ -327,46 +398,41 @@ pub fn trim_hls_dvr_playlist(base_url: &str, body: &str, keep_segments: usize) -
             if is_seg_tag || !line.starts_with('#') {
                 in_segments = true;
             } else {
-                header_lines.push(line.to_string());
+                header_lines.push(line);
                 continue;
             }
         }
 
         if line.starts_with('#') {
-            pending_seg_tags.push(line.to_string());
+            pending_seg_tags.push(line);
         } else {
-            let resolved_uri = if let Some(ref b) = base {
-                b.join(line).map(String::from).unwrap_or_else(|_| line.to_string())
-            } else {
-                line.to_string()
-            };
-            pending_seg_tags.push(resolved_uri);
+            pending_seg_tags.push(line);
             segments.push(std::mem::take(&mut pending_seg_tags));
         }
     }
 
     if segments.len() <= HLS_DVR_TRIM_THRESHOLD || segments.len() <= keep {
-        return body.to_string();
+        return resolve_all_relative_uris(base.as_ref(), body);
     }
 
     let drop_count = segments.len() - keep;
     let mut dropped_discontinuities = 0u64;
-    let mut last_dropped_key: Option<String> = None;
-    let mut last_dropped_map: Option<String> = None;
+    let mut last_dropped_key: Option<&str> = None;
+    let mut last_dropped_map: Option<&str> = None;
     for seg in &segments[..drop_count] {
-        for l in seg {
+        for &l in seg {
             if l == "#EXT-X-DISCONTINUITY" {
                 dropped_discontinuities += 1;
             } else if l.starts_with("#EXT-X-KEY:") {
-                last_dropped_key = Some(l.clone());
+                last_dropped_key = Some(l);
             } else if l.starts_with("#EXT-X-MAP:") {
-                last_dropped_map = Some(l.clone());
+                last_dropped_map = Some(l);
             }
         }
     }
 
     let mut out = String::with_capacity(keep * 512 + 512);
-    for h in &header_lines {
+    for &h in &header_lines {
         out.push_str(h);
         out.push('\n');
     }
@@ -383,20 +449,34 @@ pub fn trim_hls_dvr_playlist(base_url: &str, body: &str, keep_segments: usize) -
         ));
     }
     if let Some(map_tag) = last_dropped_map {
-        out.push_str(&map_tag);
+        out.push_str(&resolve_hls_tag_uri(map_tag, base.as_ref()));
         out.push('\n');
     }
     if let Some(key_tag) = last_dropped_key {
-        out.push_str(&key_tag);
+        out.push_str(&resolve_hls_tag_uri(key_tag, base.as_ref()));
         out.push('\n');
     }
+    // Only call Url::join on the kept trailing segments (e.g. 12 instead of 720).
     for seg in &segments[drop_count..] {
-        for l in seg {
-            out.push_str(l);
+        for &l in seg {
+            if l.starts_with('#') {
+                if l.starts_with("#EXT-X-MAP:") || l.starts_with("#EXT-X-KEY:") {
+                    out.push_str(&resolve_hls_tag_uri(l, base.as_ref()));
+                } else {
+                    out.push_str(l);
+                }
+            } else if l.starts_with("http://") || l.starts_with("https://") {
+                out.push_str(l);
+            } else if let Some(ref b) = base {
+                let resolved = b.join(l).map(String::from).unwrap_or_else(|_| l.to_string());
+                out.push_str(&resolved);
+            } else {
+                out.push_str(l);
+            }
             out.push('\n');
         }
     }
-    for tail in &pending_seg_tags {
+    for &tail in &pending_seg_tags {
         out.push_str(tail);
         out.push('\n');
     }
@@ -516,7 +596,8 @@ pub fn pick_dash_video_audio_rep_ids(
     if periods.is_empty() {
         let _ = collect_representations(&root, None, &dummy_base, &mut candidates);
     } else {
-        for period in periods {
+        // Prefer the latest <Period> first (live edge in multi-period dynamic MPDs).
+        for period in periods.into_iter().rev() {
             let _ = collect_representations(period, None, &dummy_base, &mut candidates);
         }
     }
@@ -561,7 +642,13 @@ pub fn pick_dash_video_audio_rep_ids(
         .map(|(id, _)| (*id).to_string());
 
     if audio_only {
-        return (best_audio, None);
+        let fallback_low = best_audio.or_else(|| {
+            videos
+                .iter()
+                .min_by_key(|(_, h, bw)| (*h, *bw))
+                .map(|(id, _, _)| (*id).to_string())
+        });
+        return (fallback_low, None);
     }
 
     let best_video = if let Some(cap_h) = max_video_height {
@@ -595,7 +682,8 @@ fn parse_dash_representation_to_segments(
     if periods.is_empty() {
         collect_representations(&root, None, &mpd_resolved, &mut candidates)?;
     } else {
-        for period in periods {
+        // Iterate periods in reverse so dynamic multi-period MPDs select the live-edge period first.
+        for period in periods.into_iter().rev() {
             let period_base = resolve_base_url(&mpd_resolved, period)?;
             collect_representations(period, None, &period_base, &mut candidates)?;
         }
@@ -1198,7 +1286,7 @@ mod tests {
         let vod = "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5.0,\nseg0.ts\n#EXT-X-ENDLIST\n";
         assert_eq!(
             trim_hls_dvr_playlist("https://example.com/vod.m3u8", vod, 12),
-            vod
+            "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5.0,\nhttps://example.com/seg0.ts\n#EXT-X-ENDLIST\n"
         );
     }
 

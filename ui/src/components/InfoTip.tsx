@@ -24,6 +24,7 @@ export function InfoTip({
   const [open, setOpen] = useState(false);
   const [coords, setCoords] = useState<{ top: number; left: number; above: boolean } | null>(null);
   const triggerRef = useRef<HTMLSpanElement | null>(null);
+  const tipRef = useRef<HTMLDivElement | null>(null);
   const tooltipId = useId();
 
   useEffect(() => {
@@ -34,17 +35,18 @@ export function InfoTip({
     if (!open || !triggerRef.current) return;
     const rect = triggerRef.current.getBoundingClientRect();
     const tipWidth = Math.min(280, window.innerWidth - 16);
+    const tipHeight = tipRef.current?.offsetHeight ?? 140;
     const left = Math.max(
       8,
       Math.min(window.innerWidth - tipWidth - 8, rect.left + rect.width / 2 - tipWidth / 2)
     );
     const spaceBelow = window.innerHeight - rect.bottom;
-    const above = spaceBelow < 160 && rect.top > 160;
+    const above = spaceBelow < tipHeight + 16 && rect.top > tipHeight + 16;
     const top = above
-      ? Math.max(160, rect.top - 8)
-      : Math.min(window.innerHeight - 160, rect.bottom + 8);
+      ? Math.max(tipHeight + 8, rect.top - 8)
+      : Math.min(window.innerHeight - tipHeight - 8, rect.bottom + 8);
     setCoords({ top, left, above });
-  }, [open]);
+  }, [open, entry.title, entry.summary, entry.guide]);
 
   useEffect(() => {
     if (!open) return;
@@ -85,6 +87,7 @@ export function InfoTip({
         coords &&
         createPortal(
           <div
+            ref={tipRef}
             id={tooltipId}
             role="tooltip"
             className="pointer-events-none fixed z-[9999] w-[min(280px,calc(100vw-16px))] rounded-lg border border-[var(--border-strong)] bg-[var(--bg-popover)] px-3 py-2 text-left text-[11px] leading-relaxed text-[var(--text-primary)] shadow-xl"

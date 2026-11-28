@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
   Check,
@@ -13,9 +13,10 @@ import {
   Trash2,
   Volume2,
 } from "lucide-react";
-import { AlertState, AudioTelemetry, ChannelRuntimeSnapshot } from "../types";
+import { AlertState, ChannelRuntimeSnapshot } from "../types";
 import { ANALYTICS_GLOSSARY } from "../utils/analyticsGlossary";
 import { StereoMeterSample } from "../utils/audioAnalyser";
+import { useChannelMeter, useChannelThumb, usePflMeter } from "../utils/liveTelemetryStore";
 import { ChannelAudioMeter, formatAvgLufs } from "./ChannelAudioMeter";
 import { ChannelDiagnosticsDrawer } from "./ChannelDiagnosticsDrawer";
 import { ChannelSignalStrip } from "./ChannelSignalStrip";
@@ -24,10 +25,7 @@ import { LiveMseVideo } from "./LiveMseVideo";
 
 interface ChannelCardProps {
   channel: ChannelRuntimeSnapshot;
-  liveThumbB64?: string;
-  liveAudio?: AudioTelemetry;
   globalPflMuted?: boolean;
-  livePflMeter?: StereoMeterSample | null;
   hqEnabled?: boolean;
   onSetHqEnabled?: (id: string, next: boolean) => void;
   onMseAudioChange?: (id: string, hasMseAudio: boolean) => void;
@@ -95,12 +93,9 @@ export function canChannelUseHq(channel: ChannelRuntimeSnapshot): boolean {
   );
 }
 
-export function ChannelCard({
+export const ChannelCard = memo(function ChannelCard({
   channel,
-  liveThumbB64,
-  liveAudio,
   globalPflMuted = false,
-  livePflMeter = null,
   hqEnabled: controlledHqEnabled,
   onSetHqEnabled,
   onMseAudioChange,
@@ -114,6 +109,8 @@ export function ChannelCard({
   onWipeAuth,
   onRetryChannel,
 }: ChannelCardProps) {
+  const liveThumbB64 = useChannelThumb(channel.config.id);
+  const liveAudio = useChannelMeter(channel.config.id);
   const [localHqEnabled, setLocalHqEnabled] = useState(false);
   const hqEnabled = controlledHqEnabled ?? localHqEnabled;
   const setHqEnabled = (nextOrUpdater: boolean | ((prev: boolean) => boolean)) => {
@@ -164,13 +161,26 @@ export function ChannelCard({
     !isLight &&
     !isPaused &&
     channel.alert_state !== "OFFLINE" &&
+    channel.alert_state !== "REACQUIRING" &&
     channel.alert_state !== "EXTRACTOR_ERR" &&
     channel.alert_state !== "LOGIN_GATED" &&
     !thumb &&
     channel.video.width === 0 &&
     channel.video.height === 0;
-  const canUseMse = canChannelUseHq(channel);
+  const canUseMse = canChannelUseHq(channel) && !isAudioOnlyStream;
   const showMse = canUseMse && hqEnabled;
+
+  const handleMseStatusChange = useCallback(
+    (active: boolean, fps: number | null, hasAudio: boolean) => {
+      const audioActive = active && hasAudio;
+      setMseActive((prev) => (prev === active ? prev : active));
+      setMseHasAudio((prev) => (prev === audioActive ? prev : audioActive));
+      if (fps !== null) setMseFps((prev) => (prev === fps ? prev : fps));
+      if (!active) setMseFps(null);
+      mseAudioCbRef.current?.(channel.config.id, audioActive);
+    },
+    [channel.config.id]
+  );
 
   useEffect(() => {
     if (!showMse) {
@@ -183,6 +193,7 @@ export function ChannelCard({
   }, [showMse, channel.config.id]);
 
   const useMseAudio = showMse && mseActive && mseHasAudio;
+  const livePflMeter = usePflMeter(channel.pfl_active && !globalPflMuted && !useMseAudio);
   const activePflMeter =
     channel.pfl_active && !globalPflMuted
       ? useMseAudio
@@ -295,14 +306,7 @@ export function ChannelCard({
                 streamKey={`${channel.resolved_via ?? ""}:${channel.effective_tier}:${channel.config.url}`}
                 className={`pointer-events-none absolute inset-0 ${mediaClass}`}
                 unmuted={channel.pfl_active && !globalPflMuted}
-                onStatusChange={(active, fps, hasAudio) => {
-                  const audioActive = active && hasAudio;
-                  setMseActive((prev) => (prev === active ? prev : active));
-                  setMseHasAudio((prev) => (prev === audioActive ? prev : audioActive));
-                  if (fps !== null) setMseFps((prev) => (prev === fps ? prev : fps));
-                  if (!active) setMseFps(null);
-                  mseAudioCbRef.current?.(channel.config.id, audioActive);
-                }}
+                onStatusChange={handleMseStatusChange}
                 onAudioMeter={setMseAudioMeter}
               />
             )}
@@ -337,7 +341,9 @@ export function ChannelCard({
             <>
               <span className="text-[#9ca3af]">·</span>
               <span className="text-[#93c5fd]">
-                +{Math.round((channel.config.broadcast_delay_secs ?? 0) / 60)}m delay
+                {(channel.config.broadcast_delay_secs ?? 0) < 60
+                  ? `+${channel.config.broadcast_delay_secs}s delay`
+                  : `+${Math.round((channel.config.broadcast_delay_secs ?? 0) / 60)}m delay`}
               </span>
             </>
           )}
@@ -429,7 +435,7 @@ export function ChannelCard({
             : -14)
         }
         lufsTolerance={channel.effective_lufs_tolerance ?? channel.config.lufs_tolerance ?? 2.5}
-        isCustomTarget={channel.config.target_lufs != null}
+        isCustomTarget={channel.config.target_lufs != null || channel.config.lufs_tolerance != null}
         onResetLufs={onResetLufs}
         onSetLufsTarget={onSetLufsTarget}
       />
@@ -559,7 +565,8 @@ export function ChannelCard({
           </>
         )}
 
-        {(channel.alert_state === "EXTRACTOR_ERR" || channel.alert_state === "OFFLINE") && (
+        {!isPaused &&
+          (channel.alert_state === "EXTRACTOR_ERR" || channel.alert_state === "OFFLINE") && (
           <button
             type="button"
             onClick={() => onRetryChannel(channel.config.id)}
@@ -581,4 +588,4 @@ export function ChannelCard({
       )}
     </article>
   );
-}
+});

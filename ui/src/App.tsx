@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AccountingView } from "./components/AccountingView";
 import { BrandLogo } from "./components/BrandLogo";
 import { ClipsIncidentsView } from "./components/ClipsIncidentsView";
@@ -51,14 +51,20 @@ interface MonitorConsoleProps {
 function MonitorConsole({ theme, onChangeTheme, onServerStopped }: MonitorConsoleProps) {
   const [view, setView] = useState<NavView>("wall");
   const [mobileOpen, setMobileOpen] = useState(false);
-  const { ensureContext, setAllowedChannel, stopAll, pushPcmPacket, muted, setMuted, pflMeter } =
+  const { ensureContext, setAllowedChannel, stopAll, pushPcmPacket, muted, setMuted } =
     usePflAudio();
-  const { snapshot, thumbs, meters, connected, error, refresh } = usePgmWatchSocket(pushPcmPacket);
+  const { snapshot, connected, error, refresh } = usePgmWatchSocket(pushPcmPacket);
   const [actionError, setActionError] = useState<string | null>(null);
   const [mseAudioChannels, setMseAudioChannels] = useState<Record<string, boolean>>({});
   const [shuttingDown, setShuttingDown] = useState(false);
 
-  const handleShutdownServer = async () => {
+  const pflChannelId = snapshot?.active_pfl_channel_id ?? null;
+  const pflChannelIdRef = useRef<string | null>(null);
+  pflChannelIdRef.current = pflChannelId;
+  const mseAudioRef = useRef(mseAudioChannels);
+  mseAudioRef.current = mseAudioChannels;
+
+  const handleShutdownServer = useCallback(async () => {
     setShuttingDown(true);
     stopAll();
     try {
@@ -72,7 +78,7 @@ function MonitorConsole({ theme, onChangeTheme, onServerStopped }: MonitorConsol
     } catch {
       onServerStopped();
     }
-  };
+  }, [onServerStopped, stopAll]);
 
   const handleMseAudioChange = useCallback((id: string, hasMseAudio: boolean) => {
     setMseAudioChannels((prev) => {
@@ -81,7 +87,6 @@ function MonitorConsole({ theme, onChangeTheme, onServerStopped }: MonitorConsol
     });
   }, []);
 
-  const pflChannelId = snapshot?.active_pfl_channel_id ?? null;
   const pflHandledByMse = Boolean(pflChannelId && mseAudioChannels[pflChannelId]);
 
   useEffect(() => {
@@ -90,24 +95,96 @@ function MonitorConsole({ theme, onChangeTheme, onServerStopped }: MonitorConsol
     setAllowedChannel(pflHandledByMse ? null : pflChannelId);
   }, [pflChannelId, pflHandledByMse, setAllowedChannel]);
 
-  const postAction = async (url: string, body?: unknown) => {
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: body ? { "Content-Type": "application/json" } : undefined,
-        body: body ? JSON.stringify(body) : undefined,
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-        setActionError(err.error ?? `Action failed (${res.status})`);
-        return;
+  const postAction = useCallback(
+    async (url: string, body?: unknown) => {
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: body ? { "Content-Type": "application/json" } : undefined,
+          body: body ? JSON.stringify(body) : undefined,
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+          setActionError(err.error ?? `Action failed (${res.status})`);
+          return;
+        }
+        setActionError(null);
+        await refresh();
+      } catch (err) {
+        setActionError(err instanceof Error ? err.message : "Network request failed");
       }
-      setActionError(null);
-      await refresh();
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : "Network request failed");
-    }
-  };
+    },
+    [refresh]
+  );
+
+  const handleAck = useCallback(
+    (id: string) => void postAction(`/api/channels/${encodeURIComponent(id)}/ack`),
+    [postAction]
+  );
+  const handleAckAll = useCallback(() => postAction("/api/ack_all"), [postAction]);
+  const handleRetryOffline = useCallback(
+    () => postAction("/api/channels/retry_offline"),
+    [postAction]
+  );
+  const handleToggleChannelEnabled = useCallback(
+    (id: string, enabled: boolean) =>
+      postAction(`/api/channels/${encodeURIComponent(id)}/enabled`, { enabled }),
+    [postAction]
+  );
+  const handleAddBookmark = useCallback(
+    (channelId: string | null, note: string) =>
+      postAction("/api/bookmarks", { channel_id: channelId, note }),
+    [postAction]
+  );
+  const handleForceClip = useCallback(
+    (id: string) => void postAction(`/api/channels/${encodeURIComponent(id)}/clip`),
+    [postAction]
+  );
+  const handleTogglePfl = useCallback(
+    (id: string) => {
+      const turningOff = pflChannelIdRef.current === id;
+      if (turningOff) {
+        setAllowedChannel(null);
+        stopAll();
+      } else {
+        ensureContext();
+        setAllowedChannel(mseAudioRef.current[id] ? null : id);
+      }
+      void postAction(`/api/channels/${encodeURIComponent(id)}/pfl`);
+    },
+    [ensureContext, postAction, setAllowedChannel, stopAll]
+  );
+  const handleResetLufs = useCallback(
+    (id: string) => postAction(`/api/channels/${encodeURIComponent(id)}/lufs/reset`),
+    [postAction]
+  );
+  const handleSetLufsTarget = useCallback(
+    (id: string, target_lufs: number | null, lufs_tolerance: number | null) =>
+      postAction(`/api/channels/${encodeURIComponent(id)}/lufs/target`, {
+        target_lufs,
+        lufs_tolerance,
+      }),
+    [postAction]
+  );
+  const handleResetAllLufs = useCallback(() => postAction("/api/lufs/reset"), [postAction]);
+  const handleToggleGroupIntermission = useCallback(
+    (groupId: string, active: boolean) =>
+      void postAction("/api/intermission", { group_id: groupId, active }),
+    [postAction]
+  );
+  const handleLoginFallback = useCallback(
+    (id: string) => void postAction(`/api/channels/${encodeURIComponent(id)}/auth/login`),
+    [postAction]
+  );
+  const handleWipeAuth = useCallback(
+    (id: string) => void postAction(`/api/channels/${encodeURIComponent(id)}/auth/wipe`),
+    [postAction]
+  );
+  const handleRetryChannel = useCallback(
+    (id: string) => void postAction(`/api/channels/${encodeURIComponent(id)}/retry`),
+    [postAction]
+  );
+  const handleNavigateSetup = useCallback(() => setView("setup"), []);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -200,55 +277,23 @@ function MonitorConsole({ theme, onChangeTheme, onServerStopped }: MonitorConsol
             {view === "wall" && (
               <LiveWallView
                 snapshot={snapshot}
-                thumbs={thumbs}
-                meters={meters}
                 globalPflMuted={muted}
-                pcmPflMeter={pflHandledByMse || muted ? null : pflMeter}
                 onMseAudioChange={handleMseAudioChange}
-                onAck={(id) => void postAction(`/api/channels/${encodeURIComponent(id)}/ack`)}
-                onAckAll={() => postAction("/api/ack_all")}
-                onRetryOffline={() => postAction("/api/channels/retry_offline")}
-                onToggleChannelEnabled={(id, enabled) =>
-                  postAction(`/api/channels/${encodeURIComponent(id)}/enabled`, { enabled })
-                }
-                onAddBookmark={(channelId, note) =>
-                  postAction("/api/bookmarks", { channel_id: channelId, note })
-                }
-                onForceClip={(id) => void postAction(`/api/channels/${encodeURIComponent(id)}/clip`)}
-                onTogglePfl={(id) => {
-                  const turningOff = snapshot?.active_pfl_channel_id === id;
-                  if (turningOff) {
-                    setAllowedChannel(null);
-                    stopAll();
-                  } else {
-                    ensureContext();
-                    setAllowedChannel(mseAudioChannels[id] ? null : id);
-                  }
-                  void postAction(`/api/channels/${encodeURIComponent(id)}/pfl`);
-                }}
-                onResetLufs={(id) =>
-                  postAction(`/api/channels/${encodeURIComponent(id)}/lufs/reset`)
-                }
-                onSetLufsTarget={(id, target_lufs, lufs_tolerance) =>
-                  postAction(`/api/channels/${encodeURIComponent(id)}/lufs/target`, {
-                    target_lufs,
-                    lufs_tolerance,
-                  })
-                }
-                onResetAllLufs={() => postAction("/api/lufs/reset")}
-                onToggleGroupIntermission={(groupId, active) =>
-                  void postAction("/api/intermission", { group_id: groupId, active })
-                }
-                onLoginFallback={(id) =>
-                  void postAction(`/api/channels/${encodeURIComponent(id)}/auth/login`)
-                }
-                onWipeAuth={(id) =>
-                  void postAction(`/api/channels/${encodeURIComponent(id)}/auth/wipe`)
-                }
-                onRetryChannel={(id) =>
-                  void postAction(`/api/channels/${encodeURIComponent(id)}/retry`)
-                }
-                onNavigateSetup={() => setView("setup")}
+                onAck={handleAck}
+                onAckAll={handleAckAll}
+                onRetryOffline={handleRetryOffline}
+                onToggleChannelEnabled={handleToggleChannelEnabled}
+                onAddBookmark={handleAddBookmark}
+                onForceClip={handleForceClip}
+                onTogglePfl={handleTogglePfl}
+                onResetLufs={handleResetLufs}
+                onSetLufsTarget={handleSetLufsTarget}
+                onResetAllLufs={handleResetAllLufs}
+                onToggleGroupIntermission={handleToggleGroupIntermission}
+                onLoginFallback={handleLoginFallback}
+                onWipeAuth={handleWipeAuth}
+                onRetryChannel={handleRetryChannel}
+                onNavigateSetup={handleNavigateSetup}
               />
             )}
 

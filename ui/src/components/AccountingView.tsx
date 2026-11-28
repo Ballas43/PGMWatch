@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { CalendarClock, RotateCcw, X } from "lucide-react";
 import { AccountingResponse, ChannelRuntimeSnapshot, DashboardSnapshot, LanguageGroupConfig } from "../types";
 import { ANALYTICS_GLOSSARY } from "../utils/analyticsGlossary";
@@ -75,6 +75,18 @@ export function AccountingView({ snapshot, onRefresh }: AccountingViewProps) {
   const [dirtyWindow, setDirtyWindow] = useState(false);
   const [savingWindow, setSavingWindow] = useState(false);
   const [windowErr, setWindowErr] = useState<string | null>(null);
+  const confirmTimerRef = useRef<number | null>(null);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (confirmTimerRef.current !== null) {
+        window.clearTimeout(confirmTimerRef.current);
+      }
+    };
+  }, []);
 
   const showId = snapshot?.show.show_id;
   const savedStart = snapshot?.show.scheduled_start_at ?? null;
@@ -94,20 +106,31 @@ export function AccountingView({ snapshot, onRefresh }: AccountingViewProps) {
     }
   }, [savedStart, savedEnd, dirtyWindow]);
 
-  const loadAccounting = async () => {
-    const res = await fetch("/api/accounting");
-    if (res.ok) {
-      setAccounting(await res.json());
+  const loadAccounting = useCallback(async (signal?: AbortSignal) => {
+    try {
+      const res = await fetch("/api/accounting", { signal });
+      if (res.ok && mountedRef.current) {
+        setAccounting(await res.json());
+      }
+    } catch {
+      // Ignore abort or transient polling failures
     }
-  };
-
-  useEffect(() => {
-    void loadAccounting();
-    const t = window.setInterval(() => void loadAccounting(), 10000);
-    return () => window.clearInterval(t);
   }, []);
 
-  const saveScheduleWindow = async (nextStart: string | null, nextEnd: string | null) => {
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadAccounting(controller.signal);
+    const t = window.setInterval(() => void loadAccounting(controller.signal), 10000);
+    return () => {
+      controller.abort();
+      window.clearInterval(t);
+    };
+  }, [loadAccounting]);
+
+  const saveScheduleWindow = async (
+    nextStart: string | null,
+    nextEnd: string | null
+  ): Promise<boolean> => {
     setSavingWindow(true);
     setWindowErr(null);
     try {
@@ -122,13 +145,15 @@ export function AccountingView({ snapshot, onRefresh }: AccountingViewProps) {
       if (!res.ok) {
         const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
         setWindowErr(body.error ?? `Failed to save window (HTTP ${res.status})`);
-        return;
+        return false;
       }
       setDirtyWindow(false);
       await loadAccounting();
       onRefresh();
+      return true;
     } catch (err) {
       setWindowErr(err instanceof Error ? err.message : "Network error");
+      return false;
     } finally {
       setSavingWindow(false);
     }
@@ -137,7 +162,10 @@ export function AccountingView({ snapshot, onRefresh }: AccountingViewProps) {
   const resetGraph = async () => {
     if (!confirmReset) {
       setConfirmReset(true);
-      window.setTimeout(() => setConfirmReset(false), 4000);
+      if (confirmTimerRef.current !== null) {
+        window.clearTimeout(confirmTimerRef.current);
+      }
+      confirmTimerRef.current = window.setTimeout(() => setConfirmReset(false), 4000);
       return;
     }
     setResetting(true);
@@ -211,9 +239,12 @@ export function AccountingView({ snapshot, onRefresh }: AccountingViewProps) {
               type="button"
               disabled={savingWindow}
               onClick={() => {
-                setStartInput("");
-                setEndInput("");
-                void saveScheduleWindow(null, null);
+                void saveScheduleWindow(null, null).then((ok) => {
+                  if (ok) {
+                    setStartInput("");
+                    setEndInput("");
+                  }
+                });
               }}
               className="inline-flex h-7 items-center gap-1 rounded border border-[var(--border-hairline)] bg-[var(--bg-raised)] px-2 text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] disabled:opacity-50"
             >

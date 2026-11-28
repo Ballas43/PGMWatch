@@ -10,12 +10,15 @@ pub struct ManifestProbe {
 
 #[derive(Debug, Clone)]
 pub struct ProbeOutcome {
+    pub url: String,
     pub ad_break: bool,
     pub stalled: bool,
     pub cdn_starvation: bool,
     pub cdn_ratio: f32,
     pub token_expired: bool,
 }
+
+const MAX_MANIFEST_BYTES: usize = 512 * 1024;
 
 impl ManifestProbe {
     pub fn new(bind_ip: Option<&str>) -> anyhow::Result<Self> {
@@ -37,6 +40,13 @@ impl ManifestProbe {
         })
     }
 
+    pub fn reset(&mut self) {
+        self.last_media_seq = None;
+        self.unchanged_polls = 0;
+        self.consecutive_errors = 0;
+        self.consecutive_slow_downloads = 0;
+    }
+
     pub async fn probe(&mut self, url: &str, headers: &[(String, String)]) -> ProbeOutcome {
         let lower = url.to_ascii_lowercase();
         if lower.starts_with("sim://")
@@ -45,6 +55,7 @@ impl ManifestProbe {
             || lower.starts_with("srt://")
         {
             return ProbeOutcome {
+                url: url.to_string(),
                 ad_break: lower.contains("ad_break"),
                 stalled: false,
                 cdn_starvation: false,
@@ -64,6 +75,7 @@ impl ManifestProbe {
         // the live socket directly.
         if !is_playlist_url {
             return ProbeOutcome {
+                url: url.to_string(),
                 ad_break: false,
                 stalled: false,
                 cdn_starvation: false,
@@ -79,11 +91,12 @@ impl ManifestProbe {
         }
 
         match req.send().await {
-            Ok(resp) => {
+            Ok(mut resp) => {
                 self.consecutive_errors = 0;
                 let status = resp.status();
                 if matches!(status.as_u16(), 401 | 403 | 404 | 410) {
                     return ProbeOutcome {
+                        url: url.to_string(),
                         ad_break: false,
                         stalled: false,
                         cdn_starvation: false,
@@ -97,14 +110,20 @@ impl ManifestProbe {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
                     .to_ascii_lowercase();
-                let is_text_manifest = is_playlist_url
-                    || ct.contains("mpegurl")
-                    || ct.contains("dash+xml")
-                    || ct.starts_with("text/");
+                let is_binary_media = ct.starts_with("video/")
+                    || ct.starts_with("audio/")
+                    || ct.contains("octet-stream");
+                let is_text_manifest = !is_binary_media
+                    && (ct.is_empty()
+                        || ct.contains("mpegurl")
+                        || ct.contains("dash+xml")
+                        || ct.contains("xml")
+                        || ct.starts_with("text/"));
                 let elapsed = started.elapsed().as_secs_f32();
                 if !is_text_manifest {
                     drop(resp);
                     return ProbeOutcome {
+                        url: url.to_string(),
                         ad_break: false,
                         stalled: false,
                         cdn_starvation: false,
@@ -113,7 +132,15 @@ impl ManifestProbe {
                     };
                 }
 
-                let body = resp.text().await.unwrap_or_default();
+                let mut buf = Vec::with_capacity(8192);
+                while let Ok(Some(chunk)) = resp.chunk().await {
+                    let remaining = MAX_MANIFEST_BYTES.saturating_sub(buf.len());
+                    if remaining == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                }
+                let body = String::from_utf8_lossy(&buf);
                 let target_dur = parse_hls_target_duration(&body).unwrap_or(2.0);
                 let cdn_ratio = elapsed / target_dur.max(0.5);
                 if cdn_ratio > 0.85 {
@@ -137,6 +164,7 @@ impl ManifestProbe {
                 }
 
                 ProbeOutcome {
+                    url: url.to_string(),
                     ad_break,
                     stalled: self.unchanged_polls >= 4,
                     cdn_starvation: self.consecutive_slow_downloads >= 3,
@@ -147,6 +175,7 @@ impl ManifestProbe {
             Err(_) => {
                 self.consecutive_errors += 1;
                 ProbeOutcome {
+                    url: url.to_string(),
                     ad_break: false,
                     stalled: self.consecutive_errors >= 3,
                     cdn_starvation: false,

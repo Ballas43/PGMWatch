@@ -34,6 +34,13 @@ impl VideoSimdAnalyzer {
         }
     }
 
+    pub fn reset(&mut self) {
+        self.prev_y = None;
+        self.frozen_ms = 0;
+        self.black_ms = 0;
+        self.macroblock_ms = 0;
+    }
+
     pub fn analyze_y_plane(
         &mut self,
         y_plane: &[u8],
@@ -74,7 +81,12 @@ impl VideoSimdAnalyzer {
         } else {
             (16.0, 100.0)
         };
-        self.prev_y = Some(slice.to_vec());
+        if let Some(ref mut prev) = self.prev_y {
+            prev.clear();
+            prev.extend_from_slice(slice);
+        } else {
+            self.prev_y = Some(slice.to_vec());
+        }
 
         let blockiness_score = compute_block_gradient_ratio(slice, self.width, self.height);
 

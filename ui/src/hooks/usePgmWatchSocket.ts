@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
-import { AudioTelemetry, DashboardSnapshot } from "../types";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { DashboardSnapshot } from "../types";
+import { liveTelemetryStore } from "../utils/liveTelemetryStore";
 
 export interface PflPacketHandler {
   (channelId: string, sampleRate: number, channels: number, pcmB64: string): void;
@@ -7,8 +8,6 @@ export interface PflPacketHandler {
 
 export function usePgmWatchSocket(onPflAudio: PflPacketHandler) {
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
-  const [thumbs, setThumbs] = useState<Record<string, string>>({});
-  const [meters, setMeters] = useState<Record<string, AudioTelemetry>>({});
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const pflHandlerRef = useRef(onPflAudio);
@@ -49,25 +48,12 @@ export function usePgmWatchSocket(onPflAudio: PflPacketHandler) {
           if (msg.event === "snapshot" && msg.snapshot) {
             const snap: DashboardSnapshot = msg.snapshot;
             const validIds = new Set(snap.channels.map((c) => c.config.id));
+            liveTelemetryStore.pruneChannels(validIds);
             setSnapshot(snap);
-            setThumbs((prev) => {
-              const next: Record<string, string> = {};
-              for (const id of validIds) {
-                if (prev[id]) next[id] = prev[id];
-              }
-              return next;
-            });
-            setMeters((prev) => {
-              const next: Record<string, AudioTelemetry> = {};
-              for (const id of validIds) {
-                if (prev[id]) next[id] = prev[id];
-              }
-              return next;
-            });
           } else if (msg.event === "thumbnail" && msg.channel_id && msg.jpeg_b64) {
-            setThumbs((prev) => ({ ...prev, [msg.channel_id]: msg.jpeg_b64 }));
+            liveTelemetryStore.setThumb(msg.channel_id, msg.jpeg_b64);
           } else if (msg.event === "meter" && msg.channel_id && msg.audio) {
-            setMeters((prev) => ({ ...prev, [msg.channel_id]: msg.audio }));
+            liveTelemetryStore.setMeter(msg.channel_id, msg.audio);
           } else if (msg.event === "pfl_audio") {
             pflHandlerRef.current(
               msg.channel_id,
@@ -98,12 +84,12 @@ export function usePgmWatchSocket(onPflAudio: PflPacketHandler) {
     };
   }, []);
 
-  const refresh = async () => {
+  const refresh = useCallback(async () => {
     const res = await fetch("/api/snapshot");
     if (res.ok) {
       setSnapshot(await res.json());
     }
-  };
+  }, []);
 
-  return { snapshot, thumbs, meters, connected, error, refresh };
+  return { snapshot, connected, error, refresh };
 }
