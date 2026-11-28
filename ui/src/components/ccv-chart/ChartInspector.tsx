@@ -8,6 +8,7 @@ interface ChartInspectorProps {
   activeMatch?: MatchBand;
   series: ChartSeries[];
   hiddenIds: Record<string, boolean>;
+  isDragging: boolean;
   isShowingPinned: boolean;
   isShowingLatest: boolean;
 }
@@ -17,6 +18,7 @@ export function ChartInspector({
   activeMatch,
   series,
   hiddenIds,
+  isDragging,
   isShowingPinned,
   isShowingLatest,
 }: ChartInspectorProps) {
@@ -54,7 +56,9 @@ export function ChartInspector({
           )}
         </div>
         <div className="flex items-center gap-1.5 text-[10.5px] text-[var(--text-muted)]">
-          {isShowingPinned ? (
+          {isDragging ? (
+            <span>Scrubbing · release to pin</span>
+          ) : isShowingPinned ? (
             <span className="inline-flex items-center gap-1 rounded border border-[var(--accent)]/40 bg-[var(--accent-soft)]/70 px-1.5 py-0.5 text-[var(--accent-text)]">
               <Pin size={10} strokeWidth={2} aria-hidden="true" />
               <span>Pinned · drag or click chart to move</span>
@@ -62,7 +66,7 @@ export function ChartInspector({
           ) : isShowingLatest ? (
             <span>Latest interval · click or drag chart to pin</span>
           ) : (
-            <span>Scrubbing · release to pin</span>
+            <span>Hovering · click to pin</span>
           )}
         </div>
       </div>

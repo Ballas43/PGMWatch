@@ -499,8 +499,11 @@ impl SupervisorState {
         if let Some(url) = source_url {
             self.dash_relay.clear_source(&url).await;
         }
-        let mut workers = self.workers.lock().await;
-        if let Some(mut handle) = workers.remove(channel_id) {
+        let removed = {
+            let mut workers = self.workers.lock().await;
+            workers.remove(channel_id)
+        };
+        if let Some(mut handle) = removed {
             let _ = send_worker_cmd(&mut handle.stdin, &SupervisorToWorker::Shutdown).await;
             let _ = handle.child.kill().await;
             let _ = handle.child.wait().await;

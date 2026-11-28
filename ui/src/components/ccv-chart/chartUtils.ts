@@ -188,13 +188,15 @@ export function computeMatchBands(
   matches: DashboardSnapshot["matches"],
   xFor: (i: number) => number
 ): MatchBand[] {
+  if (timeline.length === 0) return [];
   const times = timeline.map((p) => new Date(p.bucket_utc).getTime());
   return matches
     .map((m) => {
       const startMs = new Date(m.started_at).getTime();
       const endMs = m.ended_at ? new Date(m.ended_at).getTime() : Date.now();
+      if (endMs < times[0]) return null;
       const startIdx = times.findIndex((t) => t >= startMs);
-      if (startIdx < 0) return null;
+      if (startIdx < 0 || times[startIdx] > endMs) return null;
       let endIdx = startIdx;
       for (let idx = times.length - 1; idx >= startIdx; idx--) {
         if (times[idx] <= endMs) {

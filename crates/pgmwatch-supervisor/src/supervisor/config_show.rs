@@ -202,16 +202,21 @@ impl SupervisorState {
                 map.insert(ch.id.clone(), new_managed_channel(ch.clone()));
             }
         }
-        {
+        let resolved_incidents: Vec<_> = {
             let mut incidents = self.incidents.write().await;
+            let mut updated = Vec::new();
             for inc in incidents.iter_mut() {
                 if inc.resolved_at.is_none() {
                     inc.resolved_at = Some(now);
                     inc.acknowledged = true;
                     inc.duration_secs = (now - inc.started_at).num_milliseconds() as f64 / 1000.0;
-                    self.db.enqueue(DbCommand::UpsertIncident(inc.clone())).await;
+                    updated.push(inc.clone());
                 }
             }
+            updated
+        };
+        for inc in resolved_incidents {
+            self.db.enqueue(DbCommand::UpsertIncident(inc)).await;
         }
         self.persist_show_preset(&preset).await;
         *self.show.write().await = preset;

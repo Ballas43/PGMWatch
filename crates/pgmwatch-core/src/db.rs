@@ -66,6 +66,16 @@ impl DbHandle {
         }
     }
 
+    pub async fn checkpoint_wal_now(&self) {
+        self.flush_pending().await;
+        if let Err(err) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await
+        {
+            tracing::warn!("SQLite WAL checkpoint on shutdown failed: {err}");
+        }
+    }
+
     pub async fn load_grid_samples(&self, show_start: Option<DateTime<Utc>>) -> anyhow::Result<Vec<GridSample>> {
         let rows = if let Some(since) = show_start {
             sqlx::query(
@@ -544,10 +554,22 @@ async fn flush_batch(pool: &SqlitePool, pending: &mut Vec<DbCommand>) {
             }
         };
 
+        let mut cmd_err: Option<anyhow::Error> = None;
         for cmd in &batch {
             if let Err(err) = apply_command(&mut tx, cmd).await {
-                tracing::warn!("SQLite batch command error: {err}");
+                cmd_err = Some(err);
+                break;
             }
+        }
+        if let Some(err) = cmd_err {
+            let _ = tx.rollback().await;
+            if attempt < backoffs_ms.len() {
+                tracing::warn!("SQLite batch command failed (attempt {}); retrying batch: {err}", attempt + 1);
+                tokio::time::sleep(std::time::Duration::from_millis(backoffs_ms[attempt])).await;
+                continue;
+            }
+            tracing::error!("Failed to apply SQLite WAL batch after retries: {err}");
+            return;
         }
 
         match tx.commit().await {

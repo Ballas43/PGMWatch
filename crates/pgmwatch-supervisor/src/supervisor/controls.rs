@@ -262,8 +262,10 @@ impl SupervisorState {
         match group_id {
             None => {
                 *self.global_intermission.write().await = active;
-                let mut windows = self.global_hold_windows.write().await;
-                record_hold_transition(&mut windows, active, now);
+                {
+                    let mut windows = self.global_hold_windows.write().await;
+                    record_hold_transition(&mut windows, active, now);
+                }
                 self.db.enqueue(DbCommand::SetGlobalIntermission(active)).await;
             }
             Some(gid) => {
@@ -273,9 +275,11 @@ impl SupervisorState {
                         grp.intermission_active = active;
                     }
                 }
-                let mut group_map = self.group_hold_windows.write().await;
-                let windows = group_map.entry(gid.to_string()).or_default();
-                record_hold_transition(windows, active, now);
+                {
+                    let mut group_map = self.group_hold_windows.write().await;
+                    let windows = group_map.entry(gid.to_string()).or_default();
+                    record_hold_transition(windows, active, now);
+                }
                 self.db
                     .enqueue(DbCommand::SetGroupIntermission {
                         group_id: gid.to_string(),
@@ -339,17 +343,23 @@ impl SupervisorState {
     }
 
     pub async fn end_active_match(&self) -> Option<MatchMarker> {
-        let mut active = self.active_match.write().await;
-        if let Some(mut m) = active.take() {
-            m.ended_at = Some(Utc::now());
-            let mut list = self.matches.write().await;
-            if let Some(existing) = list.iter_mut().find(|x| x.id == m.id) {
-                existing.ended_at = m.ended_at;
+        let ended = {
+            let mut active = self.active_match.write().await;
+            if let Some(mut m) = active.take() {
+                m.ended_at = Some(Utc::now());
+                let mut list = self.matches.write().await;
+                if let Some(existing) = list.iter_mut().find(|x| x.id == m.id) {
+                    existing.ended_at = m.ended_at;
+                }
+                Some(m)
+            } else {
+                None
             }
+        };
+        if let Some(ref m) = ended {
             self.db.enqueue(DbCommand::UpsertMatch(m.clone())).await;
-            return Some(m);
         }
-        None
+        ended
     }
 }
 

@@ -205,7 +205,7 @@ async fn run_app(
     state.mse_hubs.invalidate_all().await;
     tracing::info!("Stopping active channel workers...");
     state.stop_all_workers().await;
-    state.db.flush_pending().await;
+    state.db.checkpoint_wal_now().await;
     tracing::info!("PGMWatch shutdown complete");
     Ok(())
 }

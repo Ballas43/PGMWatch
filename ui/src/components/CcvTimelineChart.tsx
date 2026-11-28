@@ -52,7 +52,10 @@ export function CcvTimelineChart({
     if (pinnedIdx !== null && pinnedIdx >= timeline.length) {
       setPinnedIdx(null);
     }
-  }, [pinnedIdx, timeline.length]);
+    if (hoverIdx !== null && hoverIdx >= timeline.length) {
+      setHoverIdx(null);
+    }
+  }, [hoverIdx, pinnedIdx, timeline.length]);
 
   const { channelSeries, categorySeries, peakIdx } = useMemo(
     () => buildChartSeries(timeline, channels, groups),
@@ -117,10 +120,12 @@ export function CcvTimelineChart({
     return Math.round(ratio * (timeline.length - 1));
   };
 
-  const activeIdx =
+  const rawActiveIdx =
     hoverIdx !== null ? hoverIdx : pinnedIdx !== null ? pinnedIdx : timeline.length - 1;
-  const activePoint = timeline[activeIdx] ?? timeline[timeline.length - 1];
-  const isShowingPinned = hoverIdx === null && pinnedIdx !== null;
+  const activeIdx = Math.max(0, Math.min(timeline.length - 1, rawActiveIdx));
+  const activePoint = timeline[activeIdx];
+  const isShowingPinned =
+    pinnedIdx !== null && !isDragging && (hoverIdx === null || hoverIdx === pinnedIdx);
   const isShowingLatest = hoverIdx === null && pinnedIdx === null;
   const activeMatch = matchBands.find((b) => activeIdx >= b.startIdx && activeIdx <= b.endIdx);
 
@@ -166,7 +171,10 @@ export function CcvTimelineChart({
         <div className="flex flex-wrap items-center gap-1.5 font-mono-tabular">
           <button
             type="button"
-            onClick={() => setPinnedIdx(peakIdx)}
+            onClick={() => {
+              setHoverIdx(null);
+              setPinnedIdx(peakIdx);
+            }}
             className="inline-flex items-center gap-1 rounded-md border border-[var(--border-hairline)] bg-[var(--bg-raised)] px-2 py-1 text-[var(--text-secondary)] transition-colors hover:border-[var(--border-strong)] hover:text-[var(--text-primary)]"
             title="Pin inspector to Peak CCV timestamp"
           >
@@ -240,9 +248,11 @@ export function CcvTimelineChart({
         onKeyDown={(e) => {
           if (e.key === "ArrowLeft") {
             e.preventDefault();
+            setHoverIdx(null);
             setPinnedIdx((prev) => Math.max(0, (prev ?? activeIdx) - 1));
           } else if (e.key === "ArrowRight") {
             e.preventDefault();
+            setHoverIdx(null);
             setPinnedIdx((prev) => Math.min(timeline.length - 1, (prev ?? activeIdx) + 1));
           } else if (e.key === "Escape") {
             setPinnedIdx(null);
@@ -449,6 +459,7 @@ export function CcvTimelineChart({
         activeMatch={activeMatch}
         series={mode === "combined" ? categorySeries : activeSeriesList}
         hiddenIds={hiddenIds}
+        isDragging={isDragging}
         isShowingPinned={isShowingPinned}
         isShowingLatest={isShowingLatest}
       />
