@@ -349,6 +349,9 @@ export function ChannelsSection({
                 <InfoTip entry={ANALYTICS_GLOSSARY.lufsTarget} underline focusable>LUFS Target</InfoTip>
               </th>
               <th scope="col" className="pb-2.5 pr-2 font-medium">
+                <InfoTip entry={ANALYTICS_GLOSSARY.lufsTarget} underline focusable>± Range</InfoTip>
+              </th>
+              <th scope="col" className="pb-2.5 pr-2 font-medium">
                 <InfoTip entry={ANALYTICS_GLOSSARY.channelDelay} underline focusable>Delay (s)</InfoTip>
               </th>
               <th scope="col" className="pb-2.5 pr-2 font-medium">
@@ -450,6 +453,18 @@ export function ChannelsSection({
                       value={draft.target_lufs ?? null}
                       onCommit={(nextVal) =>
                         onUpdateChannelDraft(ch.id, { target_lufs: nextVal })
+                      }
+                    />
+                  </td>
+                  <td className="py-2 pr-2">
+                    <ChannelLufsInput
+                      ariaLabel={`LUFS range tolerance for ${ch.name}`}
+                      value={draft.lufs_tolerance ?? null}
+                      onCommit={(nextVal) =>
+                        onUpdateChannelDraft(ch.id, {
+                          lufs_tolerance:
+                            nextVal == null ? null : Math.max(0.5, Math.min(10, nextVal)),
+                        })
                       }
                     />
                   </td>

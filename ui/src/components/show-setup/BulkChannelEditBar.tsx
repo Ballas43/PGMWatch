@@ -7,6 +7,7 @@ export interface BulkChannelPatch {
   tier?: FeedTier;
   orientation_vertical?: boolean;
   target_lufs?: number | null;
+  lufs_tolerance?: number | null;
   broadcast_delay_secs?: number;
   exclude_from_accounting?: boolean;
   live_streams_only?: boolean;
@@ -39,6 +40,8 @@ export function BulkChannelEditBar({
   const [canvasVal, setCanvasVal] = useState<string>(KEEP);
   const [lufsMode, setLufsMode] = useState<string>(KEEP);
   const [lufsCustom, setLufsCustom] = useState<string>("-14");
+  const [tolMode, setTolMode] = useState<string>(KEEP);
+  const [tolCustom, setTolCustom] = useState<string>("2.5");
   const [delayMode, setDelayMode] = useState<string>(KEEP);
   const [delayCustom, setDelayCustom] = useState<string>("0");
   const [excludeVal, setExcludeVal] = useState<string>(KEEP);
@@ -58,6 +61,7 @@ export function BulkChannelEditBar({
     setTierVal(KEEP);
     setCanvasVal(KEEP);
     setLufsMode(KEEP);
+    setTolMode(KEEP);
     setDelayMode(KEEP);
     setExcludeVal(KEEP);
     setLiveOnlyVal(KEEP);
@@ -77,6 +81,17 @@ export function BulkChannelEditBar({
         const parsed = Number(trimmed);
         if (Number.isFinite(parsed)) {
           patch.target_lufs = Math.max(-36, Math.min(-5, parsed));
+        }
+      }
+    }
+    if (tolMode === "auto") {
+      patch.lufs_tolerance = null;
+    } else if (tolMode === "custom") {
+      const trimmed = tolCustom.trim();
+      if (trimmed !== "") {
+        const parsed = Number(trimmed);
+        if (Number.isFinite(parsed)) {
+          patch.lufs_tolerance = Math.max(0.5, Math.min(10, parsed));
         }
       }
     }
@@ -234,6 +249,34 @@ export function BulkChannelEditBar({
                   max={-5}
                   value={lufsCustom}
                   onChange={(e) => setLufsCustom(e.target.value)}
+                  className="h-7 w-16 rounded border border-[var(--border-hairline)] bg-[var(--bg-raised)] px-2 font-mono-tabular text-xs text-[var(--text-primary)]"
+                />
+              )}
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-1">
+            <span className="text-[11px] text-[var(--text-muted)]">LUFS Range (± LU)</span>
+            <div className="flex items-center gap-1">
+              <select
+                aria-label="Bulk LUFS range mode"
+                value={tolMode}
+                onChange={(e) => setTolMode(e.target.value)}
+                className={selectCls}
+              >
+                <option value={KEEP}>— Keep —</option>
+                <option value="auto">Auto</option>
+                <option value="custom">Custom</option>
+              </select>
+              {tolMode === "custom" && (
+                <input
+                  aria-label="Bulk custom LUFS tolerance range"
+                  type="number"
+                  step="0.5"
+                  min={0.5}
+                  max={10}
+                  value={tolCustom}
+                  onChange={(e) => setTolCustom(e.target.value)}
                   className="h-7 w-16 rounded border border-[var(--border-hairline)] bg-[var(--bg-raised)] px-2 font-mono-tabular text-xs text-[var(--text-primary)]"
                 />
               )}

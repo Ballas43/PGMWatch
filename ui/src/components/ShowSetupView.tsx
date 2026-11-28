@@ -115,7 +115,7 @@ export function ShowSetupView({ snapshot, onRefresh }: ShowSetupViewProps) {
   const channelsSig = showChannels
     .map(
       (c) =>
-        `${c.id}\0${c.name}\0${c.group_id}\0${c.url}\0${c.tier}\0${c.orientation_vertical}\0${c.enabled}\0${c.target_lufs ?? ""}\0${c.broadcast_delay_secs ?? 0}\0${Boolean(c.exclude_from_accounting)}\0${c.live_streams_only ?? true}`
+        `${c.id}\0${c.name}\0${c.group_id}\0${c.url}\0${c.tier}\0${c.orientation_vertical}\0${c.enabled}\0${c.target_lufs ?? ""}\0${c.lufs_tolerance ?? ""}\0${c.broadcast_delay_secs ?? 0}\0${Boolean(c.exclude_from_accounting)}\0${c.live_streams_only ?? true}`
     )
     .join("\n");
 
