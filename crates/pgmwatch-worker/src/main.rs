@@ -104,16 +104,20 @@ async fn main() -> anyhow::Result<()> {
     let mut pfl_enabled = false;
     let mut thumb_fps = 1.5f32;
     let mut group_ref_lufs: Option<f32> = None;
+    let mut stream_gen: u64 = 0;
     let mut live_reader = if !current_url.starts_with("sim://") {
-        LiveMediaReader::start(
-            &current_url,
-            current_audio_url.as_deref(),
-            &headers,
-            args.vertical,
-            tier == FeedTier::Light || force_cpu_light,
-            &media_opts,
-        )
+        let u = current_url.clone();
+        let au = current_audio_url.clone();
+        let h = headers.clone();
+        let vertical = args.vertical;
+        let light = tier == FeedTier::Light || force_cpu_light;
+        let opts = media_opts.clone();
+        tokio::task::spawn_blocking(move || {
+            LiveMediaReader::start(&u, au.as_deref(), &h, vertical, light, &opts).ok()
+        })
+        .await
         .ok()
+        .flatten()
     } else {
         None
     };
@@ -136,9 +140,9 @@ async fn main() -> anyhow::Result<()> {
         Some(args.bind_ip.as_str())
     })?;
     let (probe_target_tx, mut probe_target_rx) =
-        tokio::sync::watch::channel((current_url.clone(), headers.clone()));
+        tokio::sync::watch::channel((stream_gen, current_url.clone(), headers.clone()));
     let (probe_outcome_tx, probe_outcome_rx) =
-        tokio::sync::watch::channel::<Option<ProbeOutcome>>(None);
+        tokio::sync::watch::channel::<Option<(u64, ProbeOutcome)>>(None);
     let probe_outcome_clear_tx = probe_outcome_tx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -156,11 +160,11 @@ async fn main() -> anyhow::Result<()> {
                 probe.reset();
                 let _ = probe_outcome_tx.send(None);
             }
-            let (u, h) = probe_target_rx.borrow().clone();
+            let (target_gen, u, h) = probe_target_rx.borrow().clone();
             let outcome = probe.probe(&u, &h).await;
-            // Only publish if the target hasn't changed again while the HTTP request was in flight.
-            if probe_target_rx.borrow().0 == outcome.url {
-                let _ = probe_outcome_tx.send(Some(outcome));
+            // Only publish if the stream generation hasn't advanced while the HTTP request was in flight.
+            if probe_target_rx.borrow().0 == target_gen {
+                let _ = probe_outcome_tx.send(Some((target_gen, outcome)));
             }
         }
     });
@@ -209,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
                         if let Ok(cmd) = serde_json::from_str::<SupervisorToWorker>(&raw) {
                             match cmd {
                                 SupervisorToWorker::UpdateStream { resolved_url, audio_url, tier: new_tier, headers: new_headers } => {
+                                    stream_gen = stream_gen.wrapping_add(1);
                                     current_url = resolved_url;
                                     current_audio_url = audio_url;
                                     tier = new_tier;
@@ -216,19 +221,37 @@ async fn main() -> anyhow::Result<()> {
                                     last_reacquire_emit = None;
                                     has_media_packet = current_url.starts_with("sim://");
                                     let _ = probe_outcome_clear_tx.send(None);
-                                    let _ = probe_target_tx.send((current_url.clone(), headers.clone()));
+                                    let _ = probe_target_tx.send((
+                                        stream_gen,
+                                        current_url.clone(),
+                                        headers.clone(),
+                                    ));
                                     // Drop & close the previous socket/threads BEFORE opening the new URL
-                                    // so tier changes don't double-download two streams simultaneously.
-                                    drop(live_reader.take());
+                                    // on a blocking thread so the current_thread runtime stays responsive.
+                                    if let Some(old_reader) = live_reader.take() {
+                                        let _ = tokio::task::spawn_blocking(move || drop(old_reader)).await;
+                                    }
                                     live_reader = if !current_url.starts_with("sim://") {
-                                        LiveMediaReader::start(
-                                            &current_url,
-                                            current_audio_url.as_deref(),
-                                            &headers,
-                                            args.vertical,
-                                            tier == FeedTier::Light || force_cpu_light,
-                                            &media_opts,
-                                        ).ok()
+                                        let u = current_url.clone();
+                                        let au = current_audio_url.clone();
+                                        let h = headers.clone();
+                                        let vertical = args.vertical;
+                                        let light = tier == FeedTier::Light || force_cpu_light;
+                                        let opts = media_opts.clone();
+                                        tokio::task::spawn_blocking(move || {
+                                            LiveMediaReader::start(
+                                                &u,
+                                                au.as_deref(),
+                                                &h,
+                                                vertical,
+                                                light,
+                                                &opts,
+                                            )
+                                            .ok()
+                                        })
+                                        .await
+                                        .ok()
+                                        .flatten()
                                     } else {
                                         None
                                     };
@@ -325,7 +348,8 @@ async fn main() -> anyhow::Result<()> {
                 let last_probe_outcome = probe_outcome_rx
                     .borrow()
                     .clone()
-                    .filter(|p| p.url == current_url);
+                    .filter(|(g, p)| *g == stream_gen && p.url == current_url)
+                    .map(|(_, p)| p);
                 let reacquire_ready = last_reacquire_emit
                     .map(|t| t.elapsed() >= REACQUIRE_COOLDOWN)
                     .unwrap_or(true);

@@ -412,14 +412,26 @@ impl SupervisorState {
                 }
             }
 
-            if self.active_pfl_channel.read().await.as_deref() == Some(ch.id.as_str()) {
+            {
+                let target_fps = {
+                    let last = self.last_thumb_fps.lock().await;
+                    last.unwrap_or_else(|| cfg_snap.media.thumbnail_fps)
+                };
+                let is_pfl = self.active_pfl_channel.read().await.as_deref() == Some(ch.id.as_str());
                 let mut workers = self.workers.lock().await;
                 if let Some(w) = workers.get_mut(&ch.id) {
                     let _ = send_worker_cmd(
                         &mut w.stdin,
-                        &SupervisorToWorker::SetPfl { enabled: true },
+                        &SupervisorToWorker::SetThumbnailFps { fps: target_fps },
                     )
                     .await;
+                    if is_pfl {
+                        let _ = send_worker_cmd(
+                            &mut w.stdin,
+                            &SupervisorToWorker::SetPfl { enabled: true },
+                        )
+                        .await;
+                    }
                 }
             }
 
@@ -651,10 +663,10 @@ impl SupervisorState {
                                         return;
                                     }
                                     st.mse_hubs.invalidate(&ch.id).await;
-                                    {
+                                    let sent = {
                                         let mut workers = st.workers.lock().await;
                                         if let Some(w) = workers.get_mut(&ch.id) {
-                                            let _ = send_worker_cmd(
+                                            send_worker_cmd(
                                                 &mut w.stdin,
                                                 &SupervisorToWorker::UpdateStream {
                                                     resolved_url: resolved.stream_url.clone(),
@@ -663,15 +675,24 @@ impl SupervisorState {
                                                     tier: eff_tier,
                                                 },
                                             )
-                                            .await;
+                                            .await
+                                            .is_ok()
+                                        } else {
+                                            false
                                         }
-                                    }
+                                    };
                                     st.resolved_media
                                         .write()
                                         .await
                                         .insert(ch.id.clone(), resolved);
-                                    if let Some(m) = st.channels.write().await.get_mut(&ch.id) {
-                                        m.tracker.clear_external_state();
+                                    if sent {
+                                        if let Some(m) = st.channels.write().await.get_mut(&ch.id) {
+                                            m.tracker.clear_external_state();
+                                        }
+                                    } else {
+                                        // Worker exited while re-resolve was in flight; respawn cleanly
+                                        // so the channel is never orphaned without a worker.
+                                        st.start_or_restart_worker(ch).await;
                                     }
                                 }
                                 Err(err) => {

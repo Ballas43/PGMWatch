@@ -6,6 +6,14 @@ export interface PflPacketHandler {
   (channelId: string, sampleRate: number, channels: number, pcmB64: string): void;
 }
 
+function seedThumbsFromSnapshot(snap: DashboardSnapshot) {
+  for (const ch of snap.channels) {
+    if (ch.thumbnail_b64) {
+      liveTelemetryStore.setThumb(ch.config.id, ch.thumbnail_b64);
+    }
+  }
+}
+
 export function usePgmWatchSocket(onPflAudio: PflPacketHandler) {
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
   const [connected, setConnected] = useState(false);
@@ -23,6 +31,7 @@ export function usePgmWatchSocket(onPflAudio: PflPacketHandler) {
         const res = await fetch("/api/snapshot");
         if (res.ok && alive) {
           const data: DashboardSnapshot = await res.json();
+          seedThumbsFromSnapshot(data);
           setSnapshot(data);
           setError(null);
         }
@@ -49,6 +58,7 @@ export function usePgmWatchSocket(onPflAudio: PflPacketHandler) {
             const snap: DashboardSnapshot = msg.snapshot;
             const validIds = new Set(snap.channels.map((c) => c.config.id));
             liveTelemetryStore.pruneChannels(validIds);
+            seedThumbsFromSnapshot(snap);
             setSnapshot(snap);
           } else if (msg.event === "thumbnail" && msg.channel_id && msg.jpeg_b64) {
             liveTelemetryStore.setThumb(msg.channel_id, msg.jpeg_b64);
@@ -87,7 +97,9 @@ export function usePgmWatchSocket(onPflAudio: PflPacketHandler) {
   const refresh = useCallback(async () => {
     const res = await fetch("/api/snapshot");
     if (res.ok) {
-      setSnapshot(await res.json());
+      const data: DashboardSnapshot = await res.json();
+      seedThumbsFromSnapshot(data);
+      setSnapshot(data);
     }
   }, []);
 

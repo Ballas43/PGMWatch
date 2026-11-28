@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from "react";
+import { useCallback, useSyncExternalStore } from "react";
 import { AudioTelemetry } from "../types";
 import { StereoMeterSample } from "./audioAnalyser";
 
@@ -110,22 +110,37 @@ const noopUnsub = () => {};
 const getNull = () => null;
 
 export function useChannelThumb(channelId: string): string | undefined {
-  return useSyncExternalStore(
-    (cb) => liveTelemetryStore.subscribeThumb(channelId, cb),
-    () => liveTelemetryStore.getThumb(channelId)
+  const subscribe = useCallback(
+    (cb: Listener) => liveTelemetryStore.subscribeThumb(channelId, cb),
+    [channelId]
   );
+  const getSnapshot = useCallback(
+    () => liveTelemetryStore.getThumb(channelId),
+    [channelId]
+  );
+  return useSyncExternalStore(subscribe, getSnapshot);
 }
 
 export function useChannelMeter(channelId: string): AudioTelemetry | undefined {
-  return useSyncExternalStore(
-    (cb) => liveTelemetryStore.subscribeMeter(channelId, cb),
-    () => liveTelemetryStore.getMeter(channelId)
+  const subscribe = useCallback(
+    (cb: Listener) => liveTelemetryStore.subscribeMeter(channelId, cb),
+    [channelId]
   );
+  const getSnapshot = useCallback(
+    () => liveTelemetryStore.getMeter(channelId),
+    [channelId]
+  );
+  return useSyncExternalStore(subscribe, getSnapshot);
 }
 
 export function usePflMeter(active: boolean): StereoMeterSample | null {
-  return useSyncExternalStore(
-    (cb) => (active ? liveTelemetryStore.subscribePflMeter(cb) : noopUnsub),
-    () => (active ? liveTelemetryStore.getPflMeter() : getNull())
+  const subscribe = useCallback(
+    (cb: Listener) => (active ? liveTelemetryStore.subscribePflMeter(cb) : noopUnsub),
+    [active]
   );
+  const getSnapshot = useCallback(
+    () => (active ? liveTelemetryStore.getPflMeter() : getNull()),
+    [active]
+  );
+  return useSyncExternalStore(subscribe, getSnapshot);
 }
