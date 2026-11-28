@@ -658,16 +658,21 @@ impl SupervisorState {
             mode_b: &mode_b_map,
             facebook_cookie: fb_cookie_header.as_deref(),
         };
-        let scrape_heavy_html = force_refresh || tick % 3 == 1;
+        // Sort deterministically by channel ID so each YouTube/Facebook channel gets a stable
+        // stagger slot across the 60-second accounting cycle (6 x 10s ticks).
+        let mut configs = configs;
+        configs.sort_by(|a, b| a.id.cmp(&b.id));
 
-        // Scrape channels concurrently (bounded to 6 in-flight requests) so 37+ channels finish
-        // within a single 10s stats tick instead of blocking sequentially for 40-90s.
+        // Stagger heavy HTML scrapes across 6 ticks (once per 60s per channel, matching 1-min
+        // accounting buckets) with max 2 concurrent fetches so 28+ YT/FB channels never create
+        // synchronized 100+ Mbps burst spikes on the NIC or trigger false Governor shedding.
         use futures_util::stream::{self, StreamExt};
         let stat_caches_ref = &stat_caches;
         let chat_rates_ref = &chat_rates;
-        let updates: Vec<(ChannelConfig, ChannelStatsUpdate)> = stream::iter(configs)
-            .map(|ch| async move {
-                let cached_heavy = if !scrape_heavy_html
+        let updates: Vec<(ChannelConfig, ChannelStatsUpdate)> = stream::iter(configs.into_iter().enumerate())
+            .map(|(idx, ch)| async move {
+                let channel_html_due = force_refresh || (tick % 6 == (idx as u64 % 6));
+                let cached_heavy = if !channel_html_due
                     && !ch.url.starts_with("sim://")
                     && matches!(ch.platform, Platform::Youtube | Platform::Facebook)
                 {
@@ -711,7 +716,7 @@ impl SupervisorState {
                 };
                 (ch, update)
             })
-            .buffer_unordered(6)
+            .buffer_unordered(2)
             .collect()
             .await;
 
