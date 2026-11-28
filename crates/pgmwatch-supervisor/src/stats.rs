@@ -573,7 +573,104 @@ fn extract_direct_count_in_object(window: &str) -> Option<f64> {
     None
 }
 
-fn parse_facebook_html_stats(channel_id: &str, html: &str) -> Option<ChannelStatsUpdate> {
+fn extract_facebook_video_id(url: &str) -> Option<&str> {
+    let lower = url.to_ascii_lowercase();
+    if lower.contains("/events/") {
+        return None;
+    }
+    if let Some(pos) = lower.find("/videos/") {
+        let rest = &url[pos + "/videos/".len()..];
+        let digits = rest
+            .split(['/', '?', '#', '&'])
+            .find(|seg| seg.len() >= 6 && seg.chars().all(|c| c.is_ascii_digit()));
+        if digits.is_some() {
+            return digits;
+        }
+    }
+    if let Some(qpos) = url.find('?') {
+        for pair in url[qpos + 1..].split('&') {
+            if let Some(val) = pair.strip_prefix("v=") {
+                let clean = val.split('#').next().unwrap_or("");
+                if clean.len() >= 6 && clean.chars().all(|c| c.is_ascii_digit()) {
+                    return Some(clean);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn window_belongs_to_other_video(window: &str, target_video_id: &str) -> bool {
+    for pat in ["\"id\":\"", "\\\"id\\\":\\\""] {
+        let mut off = 0;
+        while let Some(rel) = window[off..].find(pat) {
+            let start = off + rel + pat.len();
+            let rest = &window[start..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.len() >= 8 && digits != target_video_id {
+                return true;
+            }
+            off = start;
+        }
+    }
+    false
+}
+
+fn extract_facebook_field_number(
+    haystack: &str,
+    key: &str,
+    target_video_id: Option<&str>,
+) -> Option<f64> {
+    let Some(tid) = target_video_id else {
+        return extract_json_field_number(haystack, key);
+    };
+
+    let mut fallback: Option<f64> = None;
+    for pattern in [format!("\"{key}\""), format!("\\\"{key}\\\"")] {
+        let mut offset = 0;
+        while let Some(rel) = haystack[offset..].find(&pattern) {
+            let abs_pos = offset + rel;
+            let after_key = abs_pos + pattern.len();
+            let rest = &haystack[after_key..];
+            let trimmed_ws = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+            if let Some(after_colon) = trimmed_ws.strip_prefix(':') {
+                let val_part = after_colon.trim_start_matches(|c: char| c.is_ascii_whitespace());
+                let parsed = if let Some(inner) = val_part.strip_prefix('{') {
+                    let obj_win = &inner[..inner.len().min(96)];
+                    extract_direct_count_in_object(obj_win)
+                } else {
+                    let digits: String = val_part
+                        .trim_start_matches('"')
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit() || *c == ',')
+                        .filter(|c| c.is_ascii_digit())
+                        .collect();
+                    if digits.is_empty() {
+                        None
+                    } else {
+                        digits.parse::<f64>().ok()
+                    }
+                };
+                if let Some(num) = parsed {
+                    let w_start = haystack.floor_char_boundary(abs_pos.saturating_sub(250));
+                    let w_end = haystack.ceil_char_boundary((after_key + 350).min(haystack.len()));
+                    let ctx = &haystack[w_start..w_end];
+                    if ctx.contains(tid) {
+                        return Some(num);
+                    }
+                    if !window_belongs_to_other_video(ctx, tid) && fallback.is_none() {
+                        fallback = Some(num);
+                    }
+                }
+            }
+            offset = after_key;
+        }
+    }
+    fallback
+}
+
+fn parse_facebook_html_stats(channel_id: &str, url: &str, html: &str) -> Option<ChannelStatsUpdate> {
+    let target_vid = extract_facebook_video_id(url);
     let ccv = [
         "live_viewer_count_read_only",
         "live_viewer_count",
@@ -581,30 +678,30 @@ fn parse_facebook_html_stats(channel_id: &str, html: &str) -> Option<ChannelStat
         "viewer_count",
     ]
     .iter()
-    .find_map(|key| extract_json_field_number(html, key))?;
+    .find_map(|key| extract_facebook_field_number(html, key, target_vid))?;
 
     let total_views = ["play_count", "video_view_count", "views"]
         .iter()
-        .find_map(|key| extract_json_field_number(html, key))
+        .find_map(|key| extract_facebook_field_number(html, key, target_vid))
         .map(|v| TriStateMetric::value(v, 90.0))
         .unwrap_or_else(TriStateMetric::na);
 
     let likes = ["reaction_count", "like_count", "likers_count"]
         .iter()
-        .find_map(|key| extract_json_field_number(html, key))
+        .find_map(|key| extract_facebook_field_number(html, key, target_vid))
         .map(|v| TriStateMetric::value(v, 90.0))
         .unwrap_or_else(TriStateMetric::na);
 
     let shares = ["share_count"]
         .iter()
-        .find_map(|key| extract_json_field_number(html, key))
+        .find_map(|key| extract_facebook_field_number(html, key, target_vid))
         .map(|v| TriStateMetric::value(v, 90.0))
         .unwrap_or_else(TriStateMetric::na);
 
     let mut extras = HashMap::new();
     if let Some(comments) = ["comment_count"]
         .iter()
-        .find_map(|key| extract_json_field_number(html, key))
+        .find_map(|key| extract_facebook_field_number(html, key, target_vid))
     {
         extras.insert("comment_count".into(), serde_json::json!(comments.round() as i64));
     }
@@ -682,7 +779,7 @@ async fn fetch_facebook_public_stats(
     for cookie_opt in attempts {
         match fetch_facebook_html_once(client, url, cookie_opt).await {
             Ok(html) => {
-                if let Some(parsed) = parse_facebook_html_stats(channel_id, &html) {
+                if let Some(parsed) = parse_facebook_html_stats(channel_id, url, &html) {
                     return parsed;
                 }
                 last_err = Some(
@@ -867,7 +964,12 @@ mod tests {
     #[test]
     fn parses_facebook_public_viewer_and_play_count() {
         let html = r#"<script>{"live_viewer_count":null,"live_viewer_count_read_only":2,"play_count":154,"reaction_count":33,"share_count":7,"comment_count":19}</script>"#;
-        let parsed = parse_facebook_html_stats("ch-fb-main", html).expect("FB ccv should parse");
+        let parsed = parse_facebook_html_stats(
+            "ch-fb-main",
+            "https://www.facebook.com/events/1702525898135304/",
+            html,
+        )
+        .expect("FB ccv should parse");
         assert_eq!(parsed.ccv.status, MetricStatus::Value);
         assert_eq!(parsed.ccv.value, Some(2.0));
         assert_eq!(parsed.total_views.status, MetricStatus::Value);
@@ -878,11 +980,27 @@ mod tests {
         assert_eq!(parsed.extras.get("comment_count"), Some(&serde_json::json!(19)));
 
         let escaped = r#"{\"viewer_count\": 42, \"video_view_count\": 901, \"reaction_count\": {\"count\": 128}, \"share_count\": {\"count\": 14}}"#;
-        let parsed_escaped = parse_facebook_html_stats("ch-fb-2", escaped).expect("escaped FB JSON should parse");
+        let parsed_escaped = parse_facebook_html_stats(
+            "ch-fb-2",
+            "https://www.facebook.com/events/1702525898135304/",
+            escaped,
+        )
+        .expect("escaped FB JSON should parse");
         assert_eq!(parsed_escaped.ccv.value, Some(42.0));
         assert_eq!(parsed_escaped.total_views.value, Some(901.0));
         assert_eq!(parsed_escaped.likes.value, Some(128.0));
         assert_eq!(parsed_escaped.shares.value, Some(14.0));
+
+        // Sidebar recommended video belonging to a different video ID must NOT be attributed to target /videos/<id>
+        let sidebar_only = r#"{"video":{"is_live_streaming":true,"live_viewer_count_read_only":3,"id":"1013575908466414"}}"#;
+        assert!(
+            parse_facebook_html_stats(
+                "ch-fb-my",
+                "https://www.facebook.com/hokmyofficial/videos/1880057129693239",
+                sidebar_only,
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -496,6 +496,89 @@ fn format_hls_v7_playlist(parsed: &ParsedDashPlaylist, media_sequence: u64, ad_b
     out
 }
 
+/// Picks the best `(video_rep_id, audio_rep_id)` directly from a DASH MPD XML document
+/// for fallback resolvers (such as Facebook Comet SSR `dash_manifest_urls`) that bypass yt-dlp.
+pub fn pick_dash_video_audio_rep_ids(
+    xml: &str,
+    max_video_height: Option<u32>,
+    audio_only: bool,
+) -> (Option<String>, Option<String>) {
+    let Some(root) = parse_xml_root(xml) else {
+        return (None, None);
+    };
+    let Ok(dummy_base) = Url::parse("https://dash.local/manifest.mpd") else {
+        return (None, None);
+    };
+    let mut candidates: Vec<RepEntry<'_>> = Vec::new();
+    let periods = root.children_named("Period");
+    if periods.is_empty() {
+        let _ = collect_representations(&root, None, &dummy_base, &mut candidates);
+    } else {
+        for period in periods {
+            let _ = collect_representations(period, None, &dummy_base, &mut candidates);
+        }
+    }
+
+    let mut videos: Vec<(&str, u32, u64)> = Vec::new();
+    let mut audios: Vec<(&str, u64)> = Vec::new();
+
+    for c in &candidates {
+        if c.rep_id.is_empty() {
+            continue;
+        }
+        let mime = c
+            .rep
+            .attrs
+            .get("mimeType")
+            .or_else(|| c.adapt.and_then(|a| a.attrs.get("mimeType")))
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        let bw: u64 = c
+            .rep
+            .attrs
+            .get("bandwidth")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let height: u32 = c
+            .rep
+            .attrs
+            .get("height")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        if mime.starts_with("audio/") || (height == 0 && c.rep_id.contains("-a")) {
+            audios.push((c.rep_id, bw));
+        } else if mime.starts_with("video/") || height > 0 {
+            videos.push((c.rep_id, height, bw));
+        }
+    }
+
+    let best_audio = audios
+        .iter()
+        .max_by_key(|(_, bw)| *bw)
+        .map(|(id, _)| (*id).to_string());
+
+    if audio_only {
+        return (best_audio, None);
+    }
+
+    let best_video = if let Some(cap_h) = max_video_height {
+        videos
+            .iter()
+            .filter(|(_, h, _)| *h > 0 && *h <= cap_h)
+            .max_by_key(|(_, h, bw)| (*h, *bw))
+            .or_else(|| videos.iter().min_by_key(|(_, h, bw)| (*h, *bw)))
+            .map(|(id, _, _)| (*id).to_string())
+    } else {
+        videos
+            .iter()
+            .max_by_key(|(_, h, bw)| (*h, *bw))
+            .map(|(id, _, _)| (*id).to_string())
+    };
+
+    (best_video, best_audio)
+}
+
 fn parse_dash_representation_to_segments(
     xml: &str,
     mpd_url: &str,

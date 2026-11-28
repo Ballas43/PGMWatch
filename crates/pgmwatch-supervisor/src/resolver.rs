@@ -581,6 +581,18 @@ impl UrlResolver {
             if let Some(msg) = confirmed_vod_offline {
                 return Err(ResolveError::Offline(msg));
             }
+
+            // Facebook Comet SSR fallback: newer Facebook Live pages set `videoDeliveryLegacyFields: null`
+            // and place the live `.mpd` in `videoDeliveryResponseFragment.videoDeliveryResponseResult.dash_manifest_urls`,
+            // which yt-dlp currently misses ("No video found"). Extract and relay it directly.
+            if platform == Platform::Facebook
+                && let Some(fb_res) = self
+                    .try_resolve_facebook_dash_ssr(url, tier, live_streams_only)
+                    .await
+            {
+                return fb_res;
+            }
+
             if let Some(msg) = login_err {
                 return Err(ResolveError::LoginGated(msg));
             }
@@ -657,6 +669,108 @@ impl UrlResolver {
         } else {
             None
         }
+    }
+
+    async fn try_resolve_facebook_dash_ssr(
+        &self,
+        url: &str,
+        tier: FeedTier,
+        live_streams_only: bool,
+    ) -> Option<Result<ResolvedMedia, ResolveError>> {
+        let fb_cookies_path = self.profiles_dir.join(auth_cookies_slug(Platform::Facebook));
+        let cookie_hdr = crate::stats::load_cookie_header_for_domain(&fb_cookies_path, "facebook.com");
+        let attempts: Vec<Option<&str>> = if cookie_hdr.as_deref().is_some_and(|s| !s.is_empty()) {
+            vec![cookie_hdr.as_deref(), None]
+        } else {
+            vec![None]
+        };
+
+        let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+        let mut mpd_url: Option<String> = None;
+        for cookie_opt in attempts {
+            let mut req = self
+                .http
+                .get(url)
+                .header("User-Agent", ua)
+                .header(
+                    "Accept",
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                )
+                .header("Accept-Language", "en-US,en;q=0.9")
+                .header("Sec-Fetch-Mode", "navigate");
+            if let Some(c) = cookie_opt {
+                req = req.header("Cookie", c);
+            }
+            let Ok(resp) = req.send().await else { continue };
+            if !resp.status().is_success() {
+                continue;
+            }
+            let Ok(html) = resp.text().await else { continue };
+            if let Some(found) = extract_facebook_dash_manifest_url(&html) {
+                mpd_url = Some(found);
+                break;
+            }
+        }
+
+        let mpd_url = mpd_url?;
+        let headers = vec![("User-Agent".to_string(), ua.to_string())];
+        let xml = fetch_manifest_text(&self.http, &mpd_url, &headers).await?;
+        if live_streams_only
+            && let Some(reason) = classify_dash_manifest_vod(&xml)
+        {
+            return Some(Err(ResolveError::Offline(format!(
+                "Stream offline ({reason} — live-only mode active)"
+            ))));
+        }
+
+        let (max_h, audio_only) = match tier {
+            FeedTier::Master => (None, false),
+            FeedTier::Simulcast => (Some(480), false),
+            FeedTier::Light => (None, true),
+        };
+        let (vid_id, aud_id) =
+            crate::dash_relay::pick_dash_video_audio_rep_ids(&xml, max_h, audio_only);
+        let primary_id = vid_id?;
+
+        self.dash_relay.clear_source(url).await;
+        let stream_url = self
+            .dash_relay
+            .register(url, mpd_url.clone(), primary_id, headers.clone())
+            .await;
+        let audio_url = match aud_id {
+            Some(aid) if !audio_only => Some(
+                self.dash_relay
+                    .register(url, mpd_url, aid, headers.clone())
+                    .await,
+            ),
+            _ => None,
+        };
+
+        Some(Ok(ResolvedMedia {
+            stream_url,
+            audio_url,
+            headers,
+            via: "fb-dash-ssr".to_string(),
+        }))
+    }
+}
+
+fn extract_facebook_dash_manifest_url(html: &str) -> Option<String> {
+    let anchor = html.find("\"dash_manifest_urls\"")?;
+    let window = &html[anchor..html.len().min(anchor + 4096)];
+    let key = "\"manifest_url\":\"";
+    let start = window.find(key)? + key.len();
+    let rest = &window[start..];
+    let end = rest.find('"')?;
+    let raw = &rest[..end];
+    let unescaped = raw
+        .replace("\\/", "/")
+        .replace("\\u0026", "&")
+        .replace("&amp;", "&");
+    if unescaped.starts_with("http") && unescaped.contains(".mpd") {
+        Some(unescaped)
+    } else {
+        None
     }
 }
 
@@ -1168,6 +1282,11 @@ mod tests {
             ),
             ResolveError::LoginGated(_)
         ));
+        let sample_ssr = r#"{"videoDeliveryLegacyFields":null,"videoDeliveryResponseFragment":{"videoDeliveryResponseResult":{"dash_manifest_urls":[{"manifest_url":"https:\/\/scontent.fpen3-1.fna.fbcdn.net\/live-dash\/1168362549283504.mpd?_nc_zt=28\u0026ccb=2-4"}]}}}"#;
+        assert_eq!(
+            extract_facebook_dash_manifest_url(sample_ssr).as_deref(),
+            Some("https://scontent.fpen3-1.fna.fbcdn.net/live-dash/1168362549283504.mpd?_nc_zt=28&ccb=2-4")
+        );
     }
 
     #[tokio::test]
