@@ -859,10 +859,13 @@ pub(super) async fn get_dash_hls_playlist(
                 StatusCode::UNAUTHORIZED
             } else if msg.contains("HTTP 403") {
                 StatusCode::FORBIDDEN
-            } else if msg.contains("HTTP 410") {
+            } else if msg.contains("HTTP 410")
+                || msg.contains("HTTP 404")
+                || msg.contains("Unknown or expired DASH relay token")
+            {
                 StatusCode::GONE
             } else {
-                StatusCode::NOT_FOUND
+                StatusCode::BAD_GATEWAY
             };
             (status, format!("Manifest relay unavailable: {msg}")).into_response()
         }

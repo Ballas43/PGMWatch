@@ -527,6 +527,22 @@ async fn main() -> anyhow::Result<()> {
 
                     if last_rx_time.elapsed() >= stall_threshold {
                         faults.push(FaultKind::StreamStall);
+                        // Self-heal prolonged stalls (>30s with zero packets, e.g. expired Facebook/CDN
+                        // edge URL or stuck HLS demux socket) by asking supervisor to re-resolve once.
+                        if last_rx_time.elapsed() >= Duration::from_secs(30)
+                            && !current_url.starts_with("sim://")
+                            && token_expired_sent_for.as_deref() != Some(current_url.as_str())
+                        {
+                            token_expired_sent_for = Some(current_url.clone());
+                            let _ = emit(&WorkerToSupervisor::StreamError {
+                                channel_id: args.channel_id.clone(),
+                                code: "STALL_REACQUIRE".into(),
+                                message: "No media packets for 30s; re-resolving stream URL".into(),
+                                token_expired: true,
+                                gpu_fault: false,
+                            })
+                            .await;
+                        }
                     } else if let Some(ref p) = last_probe_outcome {
                         if p.stalled && last_rx_time.elapsed() >= Duration::from_secs(12) {
                             faults.push(FaultKind::StreamStall);

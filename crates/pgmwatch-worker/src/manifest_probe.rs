@@ -82,7 +82,7 @@ impl ManifestProbe {
             Ok(resp) => {
                 self.consecutive_errors = 0;
                 let status = resp.status();
-                if status.as_u16() == 401 || status.as_u16() == 403 || status.as_u16() == 410 {
+                if matches!(status.as_u16(), 401 | 403 | 404 | 410) {
                     return ProbeOutcome {
                         ad_break: false,
                         stalled: false,
