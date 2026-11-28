@@ -176,10 +176,13 @@ impl AvSyncTracker {
             -(t_v.duration_since(t_a).as_secs_f32() * 1000.0)
         };
 
-        // If one track has stalled for >1.5s while the other keeps advancing, do not mask it
+        // If one track has stalled while the other keeps advancing, do not mask it
         // with wall-clock compensation so true track starvation surfaces as A/V sync drift.
-        let stalled = wall_delta_ms.abs() > 1_500.0;
-        let max_comp_ms = if self.split_av_pair { 1_200.0 } else { 600.0 };
+        // Split A/V DASH streams download independent 2s HTTP chunks on separate threads,
+        // so one thread can legitimately lead/lag the other by 1-2 segments (~2-4s).
+        let stall_threshold_ms = if self.split_av_pair { 4_500.0 } else { 1_500.0 };
+        let stalled = wall_delta_ms.abs() > stall_threshold_ms;
+        let max_comp_ms = if self.split_av_pair { 3_000.0 } else { 600.0 };
         let comp_ms = if stalled {
             0.0
         } else {
@@ -191,10 +194,9 @@ impl AvSyncTracker {
             return self.smoothed_drift_ms;
         }
 
-        // HLS/DASH muxers and split A/V HTTP threads can legitimately carry a steady 200-800ms
-        // interleave/buffer offset without any playback lip-sync error. Only genuine large
-        // container PTS mismatches (>600ms muxed, >900ms split) bypass baseline calibration.
-        let max_normal_interleave_ms = if self.split_av_pair { 900.0 } else { 600.0 };
+        // Muxed HLS/RTMP streams carry up to ~600ms interleave offset; split A/V DASH threads
+        // can start 1 full 2s segment apart without any real playback lip-sync error.
+        let max_normal_interleave_ms = if self.split_av_pair { 3_000.0 } else { 600.0 };
 
         if self.baseline_offset_ms.is_none() {
             let started = *self.cal_started_at.get_or_insert(now);
@@ -235,10 +237,14 @@ impl AvSyncTracker {
         let baseline = self.baseline_offset_ms.unwrap_or(0.0);
         let raw_drift = (raw_offset_ms - baseline).clamp(-5_000.0, 5_000.0);
 
-        // Sliding 2-second median filter rejects transient HLS/DASH segment-reload bursts
+        // Sliding median filter rejects transient HLS/DASH segment-reload bursts
         // while preserving 100% of sustained encoder clock drift and real lip-sync offsets.
         self.recent_drifts.push_back((now, raw_drift));
-        let median_window = Duration::from_secs(2);
+        let median_window = if self.split_av_pair {
+            Duration::from_secs(4)
+        } else {
+            Duration::from_secs(2)
+        };
         while let Some(&(ts, _)) = self.recent_drifts.front() {
             if now.saturating_duration_since(ts) > median_window || self.recent_drifts.len() > 240 {
                 self.recent_drifts.pop_front();

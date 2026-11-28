@@ -574,7 +574,7 @@ fn encode_s16le_b64(pcm_f32: &[f32]) -> String {
 }
 
 const BITRATE_WARMUP_MS: u64 = 5_000;
-const BITRATE_COLLAPSE_HOLD_MS: u64 = 6_000;
+const BITRATE_COLLAPSE_HOLD_MS: u64 = 8_000;
 
 #[derive(Default)]
 struct BitrateCollapseTracker {
@@ -640,11 +640,15 @@ impl BitrateCollapseTracker {
             tier == FeedTier::Simulcast || video.width.min(video.height) <= 480;
         let below_threshold = if is_stepped_down_sd {
             // Stepped-down / <=480p feeds legitimately vary down to ~200 kbps on talking-head scenes;
-            // only flag collapse when bitrate is severely starved (<180 kbps) or visual quality degrades.
-            let severe_quality_drop = video.avg_qp > 42.0 || video.blockiness_score > 3.0;
-            base > 350.0 && kbps < base * 0.30 && (kbps < 180.0 || severe_quality_drop)
+            // only flag collapse when bitrate is severely starved (<150 kbps) or visual quality degrades.
+            let severe_quality_drop = video.avg_qp >= 42.0 || video.blockiness_score >= 3.0;
+            base > 350.0 && kbps < base * 0.25 && (kbps < 150.0 || severe_quality_drop)
         } else {
-            base > 400.0 && kbps < base * 0.35
+            // HD VBR/CRF feeds routinely dip to ~900-1500 kbps on clean animated overlays/draft screens;
+            // only flag collapse when bitrate drops below 25% of baseline AND either hits an objectively
+            // starved floor (<450 kbps) or shows actual compression degradation (QP >= 40 / blockiness >= 2.8).
+            let severe_quality_drop = video.avg_qp >= 40.0 || video.blockiness_score >= 2.8;
+            base > 600.0 && kbps < base * 0.25 && (kbps < 450.0 || severe_quality_drop)
         };
 
         if below_threshold {
@@ -762,21 +766,26 @@ mod tests {
         for _ in 0..30 {
             assert!(!t.update(&static_slide, FeedTier::Master, 500));
         }
-        // Transient 4s drop below 35% with active motion must not trigger before 6s hysteresis
-        let motion_collapse = mk_video(300.0, 12.0, 4.5, 39.0);
+        // Clean HD VBR overlay/bumper scene (1,100 kbps with normal QP 37 & clean blockiness) must NOT false-alarm
+        let clean_hd_vbr = mk_video(1_100.0, 6.5, 2.2, 37.3);
+        for _ in 0..30 {
+            assert!(!t.update(&clean_hd_vbr, FeedTier::Master, 500));
+        }
+        // Transient 4s drop below 25% with active motion must not trigger before 8s hysteresis
+        let motion_collapse = mk_video(300.0, 12.0, 4.5, 41.0);
         for _ in 0..8 {
             assert!(!t.update(&motion_collapse, FeedTier::Master, 500));
         }
         // Recovery resets timer
         assert!(!t.update(&mk_video(4_000.0, 9.0, 2.8, 30.0), FeedTier::Master, 500));
-        // Sustained severe collapse (<35%) with active motion triggers once >= 6s elapses
+        // Sustained severe collapse (<25% and <450k) with active motion triggers once >= 8s elapses
         let severe = mk_video(200.0, 11.0, 4.0, 40.0);
-        for i in 0..12 {
+        for i in 0..16 {
             let tripped = t.update(&severe, FeedTier::Master, 500);
-            if i < 11 {
+            if i < 15 {
                 assert!(!tripped, "tripped too early at step {i}");
             } else {
-                assert!(tripped, "expected collapse at 6s");
+                assert!(tripped, "expected collapse at 8s");
             }
         }
         // Static low-motion scene with severe macroblocking/QP degradation MUST still alert
@@ -786,12 +795,12 @@ mod tests {
         }
         assert!(!t.update(&nominal, FeedTier::Master, 500));
         let crushed_static = mk_video(180.0, 0.5, 0.3, 48.0);
-        for i in 0..12 {
+        for i in 0..16 {
             let tripped = t.update(&crushed_static, FeedTier::Master, 500);
-            if i < 11 {
+            if i < 15 {
                 assert!(!tripped, "tripped too early at crushed step {i}");
             } else {
-                assert!(tripped, "expected crushed low-motion collapse at 6s");
+                assert!(tripped, "expected crushed low-motion collapse at 8s");
             }
         }
     }
@@ -827,14 +836,14 @@ mod tests {
             assert!(!t.update(&sd_clean_dip, FeedTier::Simulcast, 500));
         }
 
-        // Severe 480p collapse (90 kbps) MUST still trigger after 6s
+        // Severe 480p collapse (90 kbps) MUST still trigger after 8s
         let sd_collapse = mk_res(854, 480, 90.0, 44.0);
-        for i in 0..12 {
+        for i in 0..16 {
             let tripped = t.update(&sd_collapse, FeedTier::Simulcast, 500);
-            if i < 11 {
+            if i < 15 {
                 assert!(!tripped, "tripped too early at sd collapse step {i}");
             } else {
-                assert!(tripped, "expected sd collapse at 6s");
+                assert!(tripped, "expected sd collapse at 8s");
             }
         }
 
