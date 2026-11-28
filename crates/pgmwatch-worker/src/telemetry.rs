@@ -176,13 +176,26 @@ impl AvSyncTracker {
             -(t_v.duration_since(t_a).as_secs_f32() * 1000.0)
         };
 
-        // If one track has stalled while the other keeps advancing, do not mask it
+        // Split A/V DASH streams (e.g. Facebook) download video and audio over two independent
+        // HTTP connections. Segment-offset differences between the two download threads (even 6s+)
+        // are NOT broadcast lip-sync drift; only actual track starvation (>6s gap where one track
+        // stops arriving while the other advances) is a real A/V sync failure, and it must recover
+        // immediately once both tracks resume delivering frames.
+        if self.split_av_pair {
+            let stalled = wall_delta_ms.abs() > 6_000.0;
+            if stalled {
+                let clamped = wall_delta_ms.clamp(-5_000.0, 5_000.0);
+                self.smoothed_drift_ms = smooth_av_sync(self.smoothed_drift_ms, clamped);
+            } else {
+                self.smoothed_drift_ms = 0.0;
+            }
+            return self.smoothed_drift_ms;
+        }
+
+        // If one track has stalled for >1.5s while the other keeps advancing, do not mask it
         // with wall-clock compensation so true track starvation surfaces as A/V sync drift.
-        // Split A/V DASH streams download independent 2s HTTP chunks on separate threads,
-        // so one thread can legitimately lead/lag the other by 1-2 segments (~2-4s).
-        let stall_threshold_ms = if self.split_av_pair { 6_000.0 } else { 1_500.0 };
-        let stalled = wall_delta_ms.abs() > stall_threshold_ms;
-        let max_comp_ms = if self.split_av_pair { 4_000.0 } else { 600.0 };
+        let stalled = wall_delta_ms.abs() > 1_500.0;
+        let max_comp_ms = 600.0;
         let comp_ms = if stalled {
             0.0
         } else {
@@ -194,10 +207,9 @@ impl AvSyncTracker {
             return self.smoothed_drift_ms;
         }
 
-        // Muxed HLS/RTMP streams carry up to ~600ms interleave offset; split A/V DASH threads
-        // download separate HTTP playlists and can legitimately differ by 1-2 segments (<=4s)
-        // without any playback lip-sync error in the actual broadcast.
-        let max_normal_interleave_ms = if self.split_av_pair { 4_000.0 } else { 600.0 };
+        // Muxed HLS/RTMP streams can legitimately carry up to ~600ms interleave offset
+        // without any playback lip-sync error.
+        let max_normal_interleave_ms = 600.0;
 
         if self.baseline_offset_ms.is_none() {
             let started = *self.cal_started_at.get_or_insert(now);
@@ -238,14 +250,10 @@ impl AvSyncTracker {
         let baseline = self.baseline_offset_ms.unwrap_or(0.0);
         let raw_drift = (raw_offset_ms - baseline).clamp(-5_000.0, 5_000.0);
 
-        // Sliding median filter rejects transient HLS/DASH segment-reload bursts
+        // Sliding 2-second median filter rejects transient HLS segment-reload bursts
         // while preserving 100% of sustained encoder clock drift and real lip-sync offsets.
         self.recent_drifts.push_back((now, raw_drift));
-        let median_window = if self.split_av_pair {
-            Duration::from_secs(4)
-        } else {
-            Duration::from_secs(2)
-        };
+        let median_window = Duration::from_secs(2);
         while let Some(&(ts, _)) = self.recent_drifts.front() {
             if now.saturating_duration_since(ts) > median_window || self.recent_drifts.len() > 240 {
                 self.recent_drifts.pop_front();
@@ -261,28 +269,19 @@ impl AvSyncTracker {
             vals[vals.len() / 2]
         };
 
-        // Slowly adapt baseline for normal interleave shifts. For split A/V DASH pairs
-        // (two independent HTTP downloader threads), socket fetch jitter can shift one thread's
-        // arrival position by 0.5-4s permanently even when PTS timelines remain aligned, so only
-        // genuine track stalls (>6s) or gross PTS divergence (>4s) should report drift.
-        let adapt_band_ms = if self.split_av_pair { 4_000.0 } else { 40.0 };
+        // Slowly adapt baseline only for tiny steady-state interleave shifts inside the normal band
+        // so gradual CDN playlist phase shifts don't accumulate, while never absorbing real drift.
+        let adapt_band_ms = 40.0;
         if !stalled && filtered_drift.abs() <= adapt_band_ms {
-            let adapt_tau = if self.split_av_pair { 15.0 } else { 60.0 };
-            let adapt_alpha = 1.0 - (-dt_s / adapt_tau).exp();
+            let adapt_alpha = 1.0 - (-dt_s / 60.0).exp();
             let next_base = (baseline + filtered_drift * adapt_alpha)
                 .clamp(-max_normal_interleave_ms, max_normal_interleave_ms);
             self.baseline_offset_ms = Some(next_base);
         }
 
-        // Soft deadband for normal HLS segment-burst / split-HTTP thread scheduling jitter
-        // while keeping track stalls and sustained muxed encoder clock drift completely visible.
-        let deadband_ms = if stalled {
-            0.0
-        } else if self.split_av_pair {
-            4_000.0
-        } else {
-            35.0
-        };
+        // Soft deadband for normal HLS segment-burst jitter while keeping track stalls
+        // and sustained encoder clock drift completely visible.
+        let deadband_ms = if stalled { 0.0 } else { 35.0 };
         let effective_drift = if filtered_drift.abs() <= deadband_ms {
             0.0
         } else {
@@ -290,13 +289,7 @@ impl AvSyncTracker {
         };
 
         // True wall-clock time-constant EMA (frame-rate independent across 30p/60p/48kHz audio).
-        let tau_s = if stalled {
-            1.0
-        } else if self.split_av_pair {
-            3.5
-        } else {
-            2.0
-        };
+        let tau_s = if stalled { 1.0 } else { 2.0 };
         let alpha = 1.0 - (-dt_s / tau_s).exp();
         self.smoothed_drift_ms = self.smoothed_drift_ms * (1.0 - alpha) + effective_drift * alpha;
         self.smoothed_drift_ms
@@ -488,15 +481,15 @@ mod tests {
             assert!(tracker.push_audio(pts, now).abs() < 1.0);
         }
 
-        // Simulate a 1,200ms HTTP chunk fetch delay on the video socket shifting arrival phase
+        // Simulate a 6,000ms (3-segment) HTTP playlist offset between separate video/audio sockets
         for i in 80..200 {
             let now = t0 + Duration::from_millis(i * 40);
             let pts = 20_000 + (i as i64) * 40;
-            tracker.push_video(pts - 1_200, now);
+            tracker.push_video(pts + 6_000, now);
             let drift = tracker.push_audio(pts, now);
             assert!(
-                drift.abs() < 5.0,
-                "split-DASH HTTP socket phase shift must not false-alarm: {drift}"
+                drift.abs() < 1.0,
+                "split-DASH HTTP socket segment offset must not false-alarm: {drift}"
             );
         }
 
@@ -510,6 +503,14 @@ mod tests {
         assert!(
             stall_drift > 500.0,
             "split-DASH real track stall (>6s) must surface as A/V sync drift, got {stall_drift}"
+        );
+
+        // As soon as video resumes delivering frames (even 6s ahead in playlist), must recover to 0ms
+        let t_rec = t0 + Duration::from_millis(381 * 40);
+        let recovered = tracker.push_video(20_000 + 381 * 40 + 6_000, t_rec);
+        assert!(
+            recovered.abs() < 1.0,
+            "split-DASH must recover to 0ms once both tracks resume, got {recovered}"
         );
     }
 }

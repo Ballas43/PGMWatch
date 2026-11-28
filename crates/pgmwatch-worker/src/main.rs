@@ -182,6 +182,7 @@ async fn main() -> anyhow::Result<()> {
     let mut last_batch_ad_break = false;
     let mut last_rx_kbps = 0.0f32;
     let mut last_rx_time = Instant::now();
+    let mut last_audio_rx_time = Instant::now();
     let mut last_video_time = Instant::now();
     let mut last_thumb_time = Instant::now();
     let mut last_telemetry_emit = Instant::now() - Duration::from_secs(2);
@@ -227,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
                                     ring.clear();
                                     av_sync_bad_ms = 0;
                                     last_rx_time = Instant::now();
+                                    last_audio_rx_time = Instant::now();
                                     last_video_time = Instant::now();
                                 }
                                 SupervisorToWorker::SetThumbnailFps { fps } => {
@@ -396,6 +398,7 @@ async fn main() -> anyhow::Result<()> {
                     }
 
                     if !batch.pcm_f32.is_empty() {
+                        last_audio_rx_time = Instant::now();
                         let (audio_tel, a_faults) =
                             dsp.process_f32_interleaved(&batch.pcm_f32, group_ref_lufs);
                         last_audio_tel = audio_tel.clone();
@@ -550,6 +553,36 @@ async fn main() -> anyhow::Result<()> {
                         if p.cdn_starvation {
                             faults.push(FaultKind::CdnStarvation);
                         }
+                    }
+
+                    // If audio stops arriving for >3s while video continues, drop the VU/peak meters
+                    // instead of leaving frozen green bars on screen.
+                    if has_media_packet && last_audio_rx_time.elapsed() >= Duration::from_secs(3) {
+                        last_audio_tel.left_rms_dbfs = -96.0;
+                        last_audio_tel.right_rms_dbfs = -96.0;
+                        last_audio_tel.true_peak_dbtp = -96.0;
+                    }
+
+                    // Self-heal split-A/V single-track stalls (e.g. Facebook audio socket hung while
+                    // video keeps decoding): if audio is missing for 20s or A/V sync drift persists
+                    // for 20s, ask supervisor to re-resolve and restart both tracks cleanly.
+                    let split_track_stalled = current_audio_url.is_some()
+                        && has_media_packet
+                        && (last_audio_rx_time.elapsed() >= Duration::from_secs(20)
+                            || av_sync_bad_ms >= 20_000);
+                    if split_track_stalled
+                        && !current_url.starts_with("sim://")
+                        && token_expired_sent_for.as_deref() != Some(current_url.as_str())
+                    {
+                        token_expired_sent_for = Some(current_url.clone());
+                        let _ = emit(&WorkerToSupervisor::StreamError {
+                            channel_id: args.channel_id.clone(),
+                            code: "TRACK_STALL_REACQUIRE".into(),
+                            message: "Split A/V audio or video track stalled for 20s; re-acquiring stream".into(),
+                            token_expired: true,
+                            gpu_fault: false,
+                        })
+                        .await;
                     }
 
                     let light_only = tier == FeedTier::Light || force_cpu_light;
