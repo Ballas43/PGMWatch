@@ -508,9 +508,9 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 let stall_threshold = if has_media_packet {
-                    Duration::from_secs(8)
-                } else {
                     Duration::from_secs(15)
+                } else {
+                    Duration::from_secs(20)
                 };
                 // Emit full state telemetry immediately on first decoded batch, then every 500ms
                 if (has_media_packet || last_rx_time.elapsed() >= stall_threshold)
@@ -528,7 +528,7 @@ async fn main() -> anyhow::Result<()> {
                     if last_rx_time.elapsed() >= stall_threshold {
                         faults.push(FaultKind::StreamStall);
                     } else if let Some(ref p) = last_probe_outcome {
-                        if p.stalled && last_rx_time.elapsed() >= Duration::from_secs(6) {
+                        if p.stalled && last_rx_time.elapsed() >= Duration::from_secs(12) {
                             faults.push(FaultKind::StreamStall);
                         }
                         if p.cdn_starvation {
