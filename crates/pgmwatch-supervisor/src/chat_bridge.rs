@@ -440,10 +440,12 @@ async fn run_youtube_chat_loop(
             tokio::time::sleep(Duration::from_secs(10)).await;
             continue;
         };
+        let content_len = resp.content_length();
         let Ok(html) = resp.text().await else {
             tokio::time::sleep(Duration::from_secs(10)).await;
             continue;
         };
+        crate::stats::record_http_rx_bytes(content_len, html.len());
         let Some((api_key, mut continuation)) = extract_youtube_chat_bootstrap(&html) else {
             tokio::time::sleep(Duration::from_secs(15)).await;
             continue;
@@ -468,7 +470,12 @@ async fn run_youtube_chat_loop(
             let Ok(res) = client.post(&endpoint).json(&body).send().await else {
                 break;
             };
-            let Ok(val) = res.json::<serde_json::Value>().await else {
+            let res_len = res.content_length();
+            let Ok(raw_bytes) = res.bytes().await else {
+                break;
+            };
+            crate::stats::record_http_rx_bytes(res_len, raw_bytes.len());
+            let Ok(val) = serde_json::from_slice::<serde_json::Value>(&raw_bytes) else {
                 break;
             };
             let (msgs, next_tok, wait_ms) = parse_youtube_live_chat_response(&val);

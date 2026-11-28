@@ -4,8 +4,26 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+
+static SUPERVISOR_HTTP_RX_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Records wire-level HTTP receive bytes from supervisor background tasks (DashRelay manifests,
+/// YouTube/Facebook/TikTok HTML scrapes, and live chat polling) into the governor's WAN counter.
+pub fn record_http_rx_bytes(content_length: Option<u64>, body_len: usize) {
+    let wire_bytes = match content_length {
+        Some(n) if n > 0 => n,
+        // Chunked gzip responses omit Content-Length; HTML/JSON/HLS typically compress ~4:1.
+        _ => (body_len as u64 / 4).max(body_len.min(512) as u64),
+    };
+    SUPERVISOR_HTTP_RX_BYTES.fetch_add(wire_bytes, Ordering::Relaxed);
+}
+
+pub fn take_http_rx_bytes() -> u64 {
+    SUPERVISOR_HTTP_RX_BYTES.swap(0, Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone)]
 pub struct ChannelStatsUpdate {
@@ -302,9 +320,11 @@ async fn fetch_youtube_public_stats(
     else {
         return unavailable_stats(channel_id, "YouTube page fetch failed");
     };
+    let content_len = resp.content_length();
     let Ok(html) = resp.text().await else {
         return unavailable_stats(channel_id, "YouTube response unreadable");
     };
+    record_http_rx_bytes(content_len, html.len());
 
     let ccv = extract_json_number_near(&html, "\"concurrentViewers\":\"")
         .or_else(|| extract_json_number_near(&html, "\"viewCount\":{\"runs\":[{\"text\":\""));
@@ -782,9 +802,13 @@ async fn fetch_facebook_html_once(
         ));
     }
 
-    resp.text()
+    let content_len = resp.content_length();
+    let html = resp
+        .text()
         .await
-        .map_err(|_| "Facebook HTML read failed".to_string())
+        .map_err(|_| "Facebook HTML read failed".to_string())?;
+    record_http_rx_bytes(content_len, html.len());
+    Ok(html)
 }
 
 async fn fetch_facebook_public_stats(

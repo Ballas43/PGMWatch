@@ -256,7 +256,9 @@ impl DashRelayState {
             return Err(anyhow!("Manifest fetch returned HTTP {}", resp.status()));
         }
 
+        let content_len = resp.content_length();
         let body = resp.text().await.context("Failed reading manifest body")?;
+        crate::stats::record_http_rx_bytes(content_len, body.len());
         {
             let mut cache = self.mpd_cache.lock().await;
             if cache.len() > 128 {

@@ -287,7 +287,13 @@ impl SupervisorState {
             let mut max_lat = 0.0f32;
             let mut shed = 0usize;
             for c in map.values() {
-                wan += c.rx_kbps;
+                // Account for wire-level container/TLS/TCP-IP framing on top of demuxed AVPacket bytes:
+                // MPEG-TS HLS (YouTube/Twitch) adds ~14% overhead; fMP4/FLV/RTMP adds ~8%.
+                let wire_overhead = match c.config.platform {
+                    Platform::Youtube | Platform::Twitch => 1.14,
+                    _ => 1.08,
+                };
+                wan += c.rx_kbps * wire_overhead;
                 let frame_ms = if c.video.fps > 1.0 { 1000.0 / c.video.fps } else { 33.3 };
                 let lat = (c.video.decode_ms / frame_ms) * 100.0;
                 max_lat = max_lat.max(lat);
@@ -299,8 +305,10 @@ impl SupervisorState {
             (worker_count, shed, wan, max_lat)
         };
 
-        let mse_rx_mbps = {
-            let bytes = self.mse_hubs.take_rx_bytes();
+        let aux_rx_mbps = {
+            let mse_bytes = ((self.mse_hubs.take_rx_bytes() as f64) * 1.08) as u64;
+            let http_bytes = crate::stats::take_http_rx_bytes();
+            let bytes = mse_bytes.saturating_add(http_bytes);
             let now = std::time::Instant::now();
             let mut sample = self.mse_rx_sample.lock().await;
             let elapsed = now.duration_since(sample.0).as_secs_f64();
@@ -333,7 +341,7 @@ impl SupervisorState {
             gov.evaluate(
                 active_workers,
                 shed_channels,
-                (wan_kbps / 1000.0) + mse_rx_mbps,
+                (wan_kbps / 1000.0) + aux_rx_mbps,
                 max_lat_pct,
                 thumb_fps,
             )
