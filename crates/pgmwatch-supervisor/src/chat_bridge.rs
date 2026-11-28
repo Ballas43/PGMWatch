@@ -303,8 +303,8 @@ impl SupervisorState {
         let state = Arc::clone(self);
         tokio::spawn(async move {
             let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(8))
-                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                .timeout(Duration::from_secs(15))
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36")
                 .build()
                 .unwrap_or_default();
             let mut active: HashMap<String, (Platform, String, AbortHandle)> = HashMap::new();
@@ -477,9 +477,8 @@ async fn run_youtube_chat_loop(
                 tracker.record(&channel_id, now);
                 state.ingest_chat_complaint_message(&channel_id, &viewer, &text).await;
             }
-            if let Some(rate) = tracker.rate_per_min(&channel_id, Instant::now()) {
-                state.chat_rates.write().await.insert(channel_id.clone(), rate);
-            }
+            let rate = tracker.rate_per_min(&channel_id, Instant::now()).unwrap_or(0.0);
+            state.chat_rates.write().await.insert(channel_id.clone(), rate);
             match next_tok {
                 Some(tok) => continuation = tok,
                 None => break,

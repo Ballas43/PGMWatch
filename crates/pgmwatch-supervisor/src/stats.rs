@@ -262,6 +262,32 @@ fn unavailable_stats(channel_id: &str, reason: &str) -> ChannelStatsUpdate {
     }
 }
 
+fn parse_youtube_html_likes(html: &str) -> Option<f64> {
+    if let Some(v) = extract_json_number_near(html, "\"likeCount\":\"")
+        .or_else(|| extract_json_field_number(html, "likeCount"))
+    {
+        return Some(v);
+    }
+    if let Some(v) = extract_json_number_near(html, "like this video along with ") {
+        return Some(v);
+    }
+    if let Some(v) = extract_json_number_near(
+        html,
+        "\"defaultText\":{\"accessibility\":{\"accessibilityData\":{\"label\":\"",
+    ) {
+        return Some(v);
+    }
+    // When a YouTube livestream has 0 likes, YouTube renders the like button ViewModel /
+    // `unset_like_count_entity_key` without a "like this video along with N other" label.
+    if html.contains("\"likeCountEntity\"")
+        || html.contains("\"likeButtonViewModel\"")
+        || html.contains("\"segmentedLikeDislikeButtonViewModel\"")
+    {
+        return Some(0.0);
+    }
+    None
+}
+
 async fn fetch_youtube_public_stats(
     client: &reqwest::Client,
     channel_id: &str,
@@ -283,8 +309,8 @@ async fn fetch_youtube_public_stats(
     let ccv = extract_json_number_near(&html, "\"concurrentViewers\":\"")
         .or_else(|| extract_json_number_near(&html, "\"viewCount\":{\"runs\":[{\"text\":\""));
     let views = extract_json_number_near(&html, "\"viewCount\":\"");
-    let likes = extract_json_number_near(&html, "\"likeCount\":\"")
-        .or_else(|| extract_json_field_number(&html, "likeCount"));
+    let likes = parse_youtube_html_likes(&html);
+    let has_live_chat = html.contains("\"liveChatRenderer\"");
 
     ChannelStatsUpdate {
         channel_id: channel_id.to_string(),
@@ -300,9 +326,11 @@ async fn fetch_youtube_public_stats(
             Some(v) => TriStateMetric::value(v, 100.0),
             None => TriStateMetric::unavailable("YouTube likes unavailable"),
         },
-        chat_rate_per_min: chat_rate
-            .map(|v| TriStateMetric::value(v, 100.0))
-            .unwrap_or_else(|| TriStateMetric::unavailable("Live chat stream connecting")),
+        chat_rate_per_min: match chat_rate {
+            Some(v) => TriStateMetric::value(v, 100.0),
+            None if has_live_chat => TriStateMetric::value(0.0, 100.0),
+            None => TriStateMetric::na(),
+        },
         shares: TriStateMetric::na(),
         gifts_count: TriStateMetric::na(),
         extras: HashMap::new(),
@@ -1016,6 +1044,17 @@ mod tests {
         .expect("Comet liveViewerCount should parse");
         assert_eq!(parsed_comet.ccv.value, Some(157.0));
         assert_eq!(parsed_comet.likes.value, Some(12.0));
+    }
+
+    #[test]
+    fn parses_youtube_accessibility_likes_and_zero_likes() {
+        let with_likes = r#"{"likeCountEntity":{"key":"unset_like_count_entity_key"},"accessibilityText":"like this video along with 1,272 other people"}"#;
+        assert_eq!(parse_youtube_html_likes(with_likes), Some(1272.0));
+
+        let zero_likes = r#"{"likeCountEntity":{"key":"unset_like_count_entity_key"}}"#;
+        assert_eq!(parse_youtube_html_likes(zero_likes), Some(0.0));
+
+        assert_eq!(parse_youtube_html_likes("<html>no player</html>"), None);
     }
 
     #[test]
