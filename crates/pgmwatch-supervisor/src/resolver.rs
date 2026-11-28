@@ -415,8 +415,8 @@ impl UrlResolver {
             None
         };
 
-        // For YouTube, prefer yt-dlp first (handles both live HLS and DASH/VOD with HTTP headers);
-        // for Twitch/TikTok/Facebook/etc., prefer Streamlink primary then yt-dlp.
+        // For YouTube and Facebook, prefer yt-dlp first (handles live HLS and dynamic DASH MPDs via DashRelay);
+        // for Twitch/TikTok/Bigo/etc., prefer Streamlink primary then yt-dlp.
         let mut last_offline: Option<String> = None;
         let mut confirmed_vod_offline: Option<String> = None;
         let mut login_err: Option<String> = None;
@@ -545,7 +545,7 @@ impl UrlResolver {
         };
 
         let result: Result<ResolvedMedia, ResolveError> = async {
-            let order = if platform == Platform::Youtube {
+            let order = if matches!(platform, Platform::Youtube | Platform::Facebook) {
                 [true, false] // yt-dlp first, then Streamlink
             } else {
                 [false, true] // Streamlink first, then yt-dlp
@@ -759,6 +759,12 @@ async fn run_streamlink(
     if output.status.success() {
         let stream_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if stream_url.starts_with("http") {
+            let path_no_query = stream_url.split(['?', '#']).next().unwrap_or("");
+            if path_no_query.to_ascii_lowercase().ends_with(".mpd") {
+                return Err(ResolveError::ExtractorFailed(
+                    "Streamlink returned raw DASH .mpd; falling back to yt-dlp DASH relay".into(),
+                ));
+            }
             return Ok(ResolvedMedia {
                 stream_url,
                 audio_url: None,
