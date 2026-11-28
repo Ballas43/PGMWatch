@@ -1100,24 +1100,75 @@ async fn run_yt_dlp_once(
     }
 
     let err = String::from_utf8_lossy(&output.stderr).to_string();
+    Err(classify_ytdlp_stderr(url, err))
+}
+
+fn classify_ytdlp_stderr(url: &str, err: String) -> ResolveError {
     let lower = err.to_ascii_lowercase();
-    if lower.contains("sign in") || lower.contains("login") || lower.contains("age") || lower.contains("cookies") {
-        Err(ResolveError::LoginGated(err))
-    } else if lower.contains("offline")
+    let is_fb_event =
+        url.to_ascii_lowercase().contains("facebook.com") && url.to_ascii_lowercase().contains("/events/");
+
+    // Facebook /events/ pages return "No video found ... Use --cookies-from-browser" before
+    // the broadcast starts or after it ends. Check offline/not-started indicators BEFORE
+    // generic yt-dlp `--cookies` footer hints so pre-live events show Offline (auto-polling)
+    // instead of a misleading "Login Required" prompt.
+    let explicit_offline = lower.contains("offline")
         || lower.contains("not currently live")
         || lower.contains("premieres in")
         || lower.contains("live event will begin")
+        || lower.contains("this live event has ended")
         || lower.contains("video unavailable")
-    {
-        Err(ResolveError::Offline(err))
+        || (lower.contains("no video found")
+            && (is_fb_event
+                || (!lower.contains("must be logged in")
+                    && !lower.contains("log in to view")
+                    && !lower.contains("this video is private"))));
+
+    if explicit_offline {
+        return ResolveError::Offline(err);
+    }
+
+    let explicit_login = lower.contains("sign in")
+        || lower.contains("must be logged in")
+        || lower.contains("login required")
+        || lower.contains("log in to view")
+        || lower.contains("age-restricted")
+        || lower.contains("confirm your age")
+        || lower.contains("members-only")
+        || lower.contains("subscribers-only")
+        || lower.contains("private video")
+        || lower.contains("this video is private")
+        || lower.contains("confirm you're not a bot")
+        || lower.contains("confirm you\u{2019}re not a bot");
+
+    if explicit_login {
+        ResolveError::LoginGated(err)
     } else {
-        Err(ResolveError::ExtractorFailed(err))
+        ResolveError::ExtractorFailed(err)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_classify_ytdlp_stderr_facebook_event_offline() {
+        assert!(matches!(
+            classify_ytdlp_stderr(
+                "https://www.facebook.com/events/29203231515964504/",
+                "ERROR: [facebook] 29203231515964504: No video found. Check if the video is private. Use --cookies-from-browser or --cookies for authentication.".into()
+            ),
+            ResolveError::Offline(_)
+        ));
+        assert!(matches!(
+            classify_ytdlp_stderr(
+                "https://www.youtube.com/watch?v=abc",
+                "ERROR: [youtube] abc: Sign in to confirm you're not a bot. Use --cookies-from-browser".into()
+            ),
+            ResolveError::LoginGated(_)
+        ));
+    }
 
     #[tokio::test]
     async fn test_url_resolver_cache_and_invalidate() {

@@ -1,4 +1,7 @@
-use crate::win32::{is_on_battery, query_dxgi_adapters, resolve_dxgi_adapter_index_for_luid, DxgiAdapterInfo};
+use crate::win32::{
+    is_on_battery, query_dxgi_adapters, resolve_dxgi_adapter_index_for_luid, DxgiAdapterInfo,
+    WindowsCpuUtilitySampler,
+};
 use chrono::Utc;
 use pgmwatch_core::config::GovernorConfig;
 use pgmwatch_core::models::GovernorTelemetry;
@@ -6,6 +9,7 @@ use sysinfo::System;
 
 pub struct ResourceGovernor {
     sys: System,
+    cpu_utility: Option<WindowsCpuUtilitySampler>,
     cfg: GovernorConfig,
     last_wan_rx_mbps: f32,
     preferred_gpu_luid: String,
@@ -39,6 +43,7 @@ impl ResourceGovernor {
         sys.refresh_all();
         Self {
             sys,
+            cpu_utility: WindowsCpuUtilitySampler::new(),
             cfg,
             last_wan_rx_mbps: 0.0,
             preferred_gpu_luid: String::new(),
@@ -110,7 +115,11 @@ impl ResourceGovernor {
         let ram_used_mb = self.sys.used_memory() / (1024 * 1024);
         let ram_total_mb = (self.sys.total_memory() / (1024 * 1024)).max(1);
         let ram_pct = (ram_used_mb as f32 / ram_total_mb as f32) * 100.0;
-        let cpu_pct = self.sys.global_cpu_usage();
+        let cpu_pct = self
+            .cpu_utility
+            .as_mut()
+            .and_then(|s| s.sample())
+            .unwrap_or_else(|| self.sys.global_cpu_usage());
         let wan_pct = (wan_rx_mbps / self.cfg.wan_cap_mbps.max(1.0)) * 100.0;
 
         let adapters = query_dxgi_adapters();

@@ -269,6 +269,110 @@ mod imp {
         }
         out
     }
+
+    #[repr(C)]
+    struct PdhFmtCounterValueDouble {
+        c_status: u32,
+        _pad: u32,
+        double_value: f64,
+    }
+
+    #[link(name = "pdh")]
+    unsafe extern "system" {
+        fn PdhOpenQueryW(data_source: *const u16, user_data: usize, query: *mut isize) -> u32;
+        fn PdhAddEnglishCounterW(
+            query: isize,
+            full_path: *const u16,
+            user_data: usize,
+            counter: *mut isize,
+        ) -> u32;
+        fn PdhCollectQueryData(query: isize) -> u32;
+        fn PdhGetFormattedCounterValue(
+            counter: isize,
+            format: u32,
+            counter_type: *mut u32,
+            value: *mut PdhFmtCounterValueDouble,
+        ) -> u32;
+        fn PdhCloseQuery(query: isize) -> u32;
+    }
+
+    const PDH_FMT_DOUBLE: u32 = 0x0000_0200;
+
+    /// Samples Windows Task Manager's exact CPU utilization counter
+    /// (`\Processor Information(_Total)\% Processor Utility`), which scales by
+    /// actual CPU frequency vs base clock rather than raw non-idle ticks.
+    pub struct WindowsCpuUtilitySampler {
+        query: isize,
+        counter: isize,
+    }
+
+    unsafe impl Send for WindowsCpuUtilitySampler {}
+
+    impl WindowsCpuUtilitySampler {
+        pub fn new() -> Option<Self> {
+            unsafe {
+                let mut query: isize = 0;
+                if PdhOpenQueryW(std::ptr::null(), 0, &mut query) != 0 || query == 0 {
+                    return None;
+                }
+                let paths = [
+                    "\\Processor Information(_Total)\\% Processor Utility\0",
+                    "\\Processor(_Total)\\% Processor Time\0",
+                ];
+                let mut counter: isize = 0;
+                for p in paths {
+                    let wide: Vec<u16> = p.encode_utf16().collect();
+                    if PdhAddEnglishCounterW(query, wide.as_ptr(), 0, &mut counter) == 0
+                        && counter != 0
+                    {
+                        break;
+                    }
+                    counter = 0;
+                }
+                if counter == 0 {
+                    PdhCloseQuery(query);
+                    return None;
+                }
+                // Prime baseline sample (rate counters require two samples).
+                let _ = PdhCollectQueryData(query);
+                Some(Self { query, counter })
+            }
+        }
+
+        pub fn sample(&mut self) -> Option<f32> {
+            unsafe {
+                if PdhCollectQueryData(self.query) != 0 {
+                    return None;
+                }
+                let mut val = PdhFmtCounterValueDouble {
+                    c_status: 0,
+                    _pad: 0,
+                    double_value: 0.0,
+                };
+                let status = PdhGetFormattedCounterValue(
+                    self.counter,
+                    PDH_FMT_DOUBLE,
+                    std::ptr::null_mut(),
+                    &mut val,
+                );
+                if status == 0 && val.c_status == 0 && val.double_value.is_finite() {
+                    Some((val.double_value as f32).clamp(0.0, 100.0))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    impl Drop for WindowsCpuUtilitySampler {
+        fn drop(&mut self) {
+            unsafe {
+                if self.query != 0 {
+                    PdhCloseQuery(self.query);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -283,6 +387,15 @@ mod imp {
             Ok(())
         }
     }
+    pub struct WindowsCpuUtilitySampler;
+    impl WindowsCpuUtilitySampler {
+        pub fn new() -> Option<Self> {
+            None
+        }
+        pub fn sample(&mut self) -> Option<f32> {
+            None
+        }
+    }
     pub fn prevent_sleep_and_eco_qos() {}
     pub fn is_on_battery() -> bool {
         false
@@ -293,7 +406,8 @@ mod imp {
 }
 
 pub use imp::{
-    is_on_battery, prevent_sleep_and_eco_qos, query_dxgi_adapters, WindowsJobGuard,
+    is_on_battery, prevent_sleep_and_eco_qos, query_dxgi_adapters, WindowsCpuUtilitySampler,
+    WindowsJobGuard,
 };
 
 pub fn resolve_dxgi_adapter_index_for_luid(
@@ -377,6 +491,19 @@ mod tests {
                 "expected non-zero system-wide VRAM usage on hardware adapter {}",
                 first.name
             );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_cpu_utility_sampler_reads_bounded_pct() {
+        // PDH Perflib registry access may be restricted inside AppContainer sandboxes;
+        // when available on a normal desktop session, verify the reading is finite and in 0..=100.
+        if let Some(mut sampler) = WindowsCpuUtilitySampler::new() {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            if let Some(pct) = sampler.sample() {
+                assert!((0.0..=100.0).contains(&pct), "unexpected CPU utility {pct}");
+            }
         }
     }
 }
