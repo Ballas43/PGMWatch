@@ -783,39 +783,47 @@ fn extract_fb_video_id_from_url(url: &str) -> Option<&str> {
 
 fn extract_facebook_dash_manifest_url(html: &str, page_url: &str) -> Option<String> {
     let target_vid = extract_fb_video_id_from_url(page_url);
-    let key = "\"manifest_url\":\"";
     let mut first_valid: Option<String> = None;
-    let mut offset = 0usize;
-    while let Some(rel) = html[offset..].find("\"dash_manifest_urls\"") {
-        let anchor = offset + rel;
-        let win_end = html.ceil_char_boundary((anchor + 4096).min(html.len()));
-        let window = &html[anchor..win_end];
-        if let Some(kpos) = window.find(key) {
-            let start = kpos + key.len();
-            let rest = &window[start..];
-            if let Some(end) = rest.find('"') {
-                let raw = &rest[..end];
-                let unescaped = raw
-                    .replace("\\/", "/")
-                    .replace("\\u0026", "&")
-                    .replace("&amp;", "&");
-                if unescaped.starts_with("http") && unescaped.contains(".mpd") {
-                    if let Some(vid) = target_vid {
-                        let ctx_start = html.floor_char_boundary(anchor.saturating_sub(2048));
-                        let ctx = &html[ctx_start..win_end];
-                        if ctx.contains(vid) || unescaped.contains(vid) {
+
+    // Facebook A/B-serves two SSR JSON layouts:
+    // 1. Comet: `"dash_manifest_urls":[{"manifest_url":"https:\/\/...mpd..."}]`
+    // 2. Legacy: `"dash_manifest_url":"https:\/\/...mpd..."`
+    for (anchor_pat, val_key) in [
+        ("\"dash_manifest_urls\"", "\"manifest_url\":\""),
+        ("\"dash_manifest_url\":\"", "\"dash_manifest_url\":\""),
+    ] {
+        let mut offset = 0usize;
+        while let Some(rel) = html[offset..].find(anchor_pat) {
+            let anchor = offset + rel;
+            let win_end = html.ceil_char_boundary((anchor + 4096).min(html.len()));
+            let window = &html[anchor..win_end];
+            if let Some(kpos) = window.find(val_key) {
+                let start = kpos + val_key.len();
+                let rest = &window[start..];
+                if let Some(end) = rest.find('"') {
+                    let raw = &rest[..end];
+                    let unescaped = raw
+                        .replace("\\/", "/")
+                        .replace("\\u0026", "&")
+                        .replace("&amp;", "&");
+                    if unescaped.starts_with("http") && unescaped.contains(".mpd") {
+                        if let Some(vid) = target_vid {
+                            let ctx_start = html.floor_char_boundary(anchor.saturating_sub(2048));
+                            let ctx = &html[ctx_start..win_end];
+                            if ctx.contains(vid) || unescaped.contains(vid) {
+                                return Some(unescaped);
+                            }
+                        } else {
                             return Some(unescaped);
                         }
-                    } else {
-                        return Some(unescaped);
-                    }
-                    if first_valid.is_none() {
-                        first_valid = Some(unescaped);
+                        if first_valid.is_none() {
+                            first_valid = Some(unescaped);
+                        }
                     }
                 }
             }
+            offset = anchor + anchor_pat.len();
         }
-        offset = anchor + "\"dash_manifest_urls\"".len();
     }
     first_valid
 }
@@ -1336,6 +1344,15 @@ mod tests {
             )
             .as_deref(),
             Some("https://scontent.fpen3-1.fna.fbcdn.net/live-dash/1168362549283504.mpd?_nc_zt=28&ccb=2-4")
+        );
+        let sample_legacy = r#"{"videoDeliveryLegacyFields":{"dash_manifest_url":"https:\/\/video.fkul8-5.fna.fbcdn.net\/live-dash\/1169385292514563.mpd?_nc_zt=28&amp;ccb=2-4"}}"#;
+        assert_eq!(
+            extract_facebook_dash_manifest_url(
+                sample_legacy,
+                "https://www.facebook.com/HonorofKingsGlobal/videos/1422178356342896"
+            )
+            .as_deref(),
+            Some("https://video.fkul8-5.fna.fbcdn.net/live-dash/1169385292514563.mpd?_nc_zt=28&ccb=2-4")
         );
     }
 
