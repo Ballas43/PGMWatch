@@ -15,12 +15,19 @@ impl SupervisorState {
                 m.tracker.acknowledge();
             }
         }
-        let mut incidents = self.incidents.write().await;
-        for inc in incidents.iter_mut() {
-            if inc.channel_id == channel_id && !inc.acknowledged {
-                inc.acknowledged = true;
-                self.db.enqueue(DbCommand::AcknowledgeIncident(inc.id.clone())).await;
+        let acked_ids: Vec<String> = {
+            let mut incidents = self.incidents.write().await;
+            let mut ids = Vec::new();
+            for inc in incidents.iter_mut() {
+                if inc.channel_id == channel_id && !inc.acknowledged {
+                    inc.acknowledged = true;
+                    ids.push(inc.id.clone());
+                }
             }
+            ids
+        };
+        for id in acked_ids {
+            self.db.enqueue(DbCommand::AcknowledgeIncident(id)).await;
         }
     }
 
@@ -36,16 +43,20 @@ impl SupervisorState {
                 m.tracker.acknowledge();
             }
         }
-        let mut incidents = self.incidents.write().await;
-        for inc in incidents.iter_mut() {
-            if !inc.acknowledged {
-                inc.acknowledged = true;
-                self.db
-                    .enqueue(DbCommand::AcknowledgeIncident(inc.id.clone()))
-                    .await;
+        let acked_ids: Vec<String> = {
+            let mut incidents = self.incidents.write().await;
+            let mut ids = Vec::new();
+            for inc in incidents.iter_mut() {
+                if !inc.acknowledged {
+                    inc.acknowledged = true;
+                    ids.push(inc.id.clone());
+                }
             }
+            ids
+        };
+        for id in acked_ids {
+            self.db.enqueue(DbCommand::AcknowledgeIncident(id)).await;
         }
-        drop(incidents);
         self.broadcast_snapshot().await;
         acked_channels
     }
@@ -146,11 +157,7 @@ impl SupervisorState {
             acknowledged: true,
             detail: note,
         };
-        self.incidents.write().await.insert(0, inc.clone());
-        self.db.enqueue(DbCommand::UpsertIncident(inc.clone())).await;
-        let _ = self.ws_tx.send(WsBroadcast::Incident {
-            incident: inc.clone(),
-        });
+        self.push_incident(inc.clone()).await;
         self.broadcast_snapshot().await;
         inc
     }

@@ -153,19 +153,30 @@ impl SupervisorState {
                     let workers = offline_state.workers.lock().await;
                     workers.keys().cloned().collect()
                 };
+                let now_utc = Utc::now();
                 let candidates: Vec<(ChannelConfig, FeedTier)> = {
-                    let map = offline_state.channels.read().await;
-                    map.values()
-                        .filter(|m| {
-                            m.config.enabled
-                                && !active_worker_ids.contains(&m.config.id)
-                                && matches!(
-                                    m.tracker.state,
-                                    AlertState::Offline | AlertState::ExtractorErr
-                                )
-                        })
-                        .map(|m| (m.config.clone(), m.effective_tier))
-                        .collect()
+                    let mut map = offline_state.channels.write().await;
+                    let mut out = Vec::new();
+                    for m in map.values_mut() {
+                        if !m.config.enabled || active_worker_ids.contains(&m.config.id) {
+                            continue;
+                        }
+                        let stuck_reacquiring = m.tracker.state == AlertState::Reacquiring
+                            && (now_utc - m.updated_at).num_seconds() >= 90;
+                        if stuck_reacquiring {
+                            m.tracker.set_external_state(
+                                AlertState::ExtractorErr,
+                                "Reconnection timed out; retrying automatically",
+                            );
+                        }
+                        if matches!(
+                            m.tracker.state,
+                            AlertState::Offline | AlertState::ExtractorErr
+                        ) {
+                            out.push((m.config.clone(), m.effective_tier));
+                        }
+                    }
+                    out
                 };
 
                 for (ch, eff_tier) in candidates {
@@ -755,33 +766,35 @@ impl SupervisorState {
             self.db.enqueue(DbCommand::UpsertGridSample(sample)).await;
         }
 
-        let samples: Vec<GridSample> = {
+        {
             let mut cache = self.grid_samples.write().await;
             for sample in new_samples {
                 cache.insert((sample.bucket_utc, sample.channel_id.clone()), sample);
             }
-            cache.values().cloned().collect()
-        };
-        self.recompute_live_accounting_from_samples(&samples).await;
+        }
+        self.recompute_live_accounting_totals().await;
     }
 
     pub async fn recompute_live_accounting_totals(&self) {
-        let samples: Vec<GridSample> = {
-            let cache = self.grid_samples.read().await;
-            cache.values().cloned().collect()
-        };
-        self.recompute_live_accounting_from_samples(&samples).await;
-    }
-
-    async fn recompute_live_accounting_from_samples(&self, samples: &[GridSample]) {
-        let overrides = self.overrides.read().await.clone();
         let (show_channels, sched_start, sched_end) = {
             let s = self.show.read().await;
             (s.channels.clone(), s.scheduled_start_at, s.scheduled_end_at)
         };
+        let samples: Vec<GridSample> = {
+            let cache = self.grid_samples.read().await;
+            cache
+                .values()
+                .filter(|s| {
+                    sched_start.is_none_or(|st| s.bucket_utc >= st)
+                        && sched_end.is_none_or(|en| s.bucket_utc <= en)
+                })
+                .cloned()
+                .collect()
+        };
+        let overrides = self.overrides.read().await.clone();
         let merged = filter_samples_by_window(
             prepare_accounting_samples(
-                &apply_overrides_to_samples(samples, &overrides),
+                &apply_overrides_to_samples(&samples, &overrides),
                 &show_channels,
             ),
             sched_start,

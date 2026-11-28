@@ -1,8 +1,7 @@
 use crate::stats::extract_twitch_login;
-use crate::supervisor::{SupervisorState, WsBroadcast};
+use crate::supervisor::SupervisorState;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use pgmwatch_core::db::DbCommand;
 use pgmwatch_core::models::{AlertState, FaultKind, IncidentRecord, Platform};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -269,9 +268,7 @@ impl SupervisorState {
                 alerts_cfg.chat_spike_unique_viewers
             ),
         };
-        self.incidents.write().await.insert(0, inc.clone());
-        self.db.enqueue(DbCommand::UpsertIncident(inc.clone())).await;
-        let _ = self.ws_tx.send(WsBroadcast::Incident { incident: inc });
+        self.push_incident(inc).await;
     }
 
     pub async fn sync_chat_subscriptions(&self) {

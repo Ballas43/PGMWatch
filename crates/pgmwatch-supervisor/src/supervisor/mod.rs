@@ -190,7 +190,7 @@ impl SupervisorState {
         ));
         resolver.set_bind_ip(&cfg.server.outbound_bind_ip).await;
         let governor = ResourceGovernor::new(cfg.governor.clone());
-        let (ws_tx, _) = broadcast::channel(512);
+        let (ws_tx, _) = broadcast::channel(2048);
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
         let mut ch_map = HashMap::new();
@@ -369,6 +369,27 @@ impl SupervisorState {
 
     pub fn subscribe_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
         self.shutdown_tx.subscribe()
+    }
+
+    /// Inserts an incident into the bounded in-memory log (max 500 entries), then persists to SQLite
+    /// and broadcasts over WebSocket without ever holding a write lock across async I/O.
+    pub(crate) async fn push_incident(&self, inc: IncidentRecord) {
+        const MAX_INCIDENTS_IN_MEMORY: usize = 500;
+        {
+            let mut incidents = self.incidents.write().await;
+            incidents.insert(0, inc.clone());
+            if incidents.len() > MAX_INCIDENTS_IN_MEMORY {
+                if let Some(pos) = incidents.iter().rposition(|i| i.resolved_at.is_some()) {
+                    incidents.remove(pos);
+                } else {
+                    incidents.truncate(MAX_INCIDENTS_IN_MEMORY);
+                }
+            }
+        }
+        self.db
+            .enqueue(pgmwatch_core::db::DbCommand::UpsertIncident(inc.clone()))
+            .await;
+        let _ = self.ws_tx.send(WsBroadcast::Incident { incident: inc });
     }
 
     pub async fn stop_all_workers(&self) {

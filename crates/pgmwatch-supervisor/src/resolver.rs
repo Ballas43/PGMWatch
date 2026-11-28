@@ -449,6 +449,7 @@ impl UrlResolver {
                     ext_cfg.bgutil_pot_port,
                     bind_ip,
                     &self.dash_relay,
+                    &self.job_guard,
                     live_streams_only,
                 )
                 .await
@@ -485,6 +486,7 @@ impl UrlResolver {
                                 ext_cfg.bgutil_pot_port,
                                 bind_ip,
                                 &self.dash_relay,
+                                &self.job_guard,
                                 live_streams_only,
                             )
                             .await
@@ -525,7 +527,7 @@ impl UrlResolver {
                 return TierTry::Next;
             };
             let quality = select_streamlink_quality(platform, tier);
-            match run_streamlink(&sl_exe, url, quality, bind_ip).await {
+            match run_streamlink(&sl_exe, url, quality, bind_ip, &self.job_guard).await {
                 Ok(resolved) => match verify_resolved_is_live(
                     &self.http,
                     &resolved,
@@ -906,23 +908,43 @@ fn build_streamlink_args(url: &str, quality: &str, bind_ip: Option<&str>) -> Vec
     args
 }
 
+const EXTRACTOR_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn run_cmd_with_timeout(
+    cmd: &mut Command,
+    job_guard: &WindowsJobGuard,
+    label: &str,
+) -> Result<std::process::Output, ResolveError> {
+    cmd.kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd
+        .spawn()
+        .map_err(|e| ResolveError::ExtractorFailed(format!("{label} spawn failed: {e}")))?;
+    if let Some(pid) = child.id() {
+        let _ = job_guard.assign_pid(pid);
+    }
+    match tokio::time::timeout(EXTRACTOR_SUBPROCESS_TIMEOUT, child.wait_with_output()).await {
+        Ok(res) => res.map_err(|e| ResolveError::ExtractorFailed(e.to_string())),
+        Err(_) => Err(ResolveError::ExtractorFailed(format!(
+            "{label} timed out after {}s",
+            EXTRACTOR_SUBPROCESS_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
 async fn run_streamlink(
     exe: &Path,
     url: &str,
     quality: &str,
     bind_ip: Option<&str>,
+    job_guard: &WindowsJobGuard,
 ) -> Result<ResolvedMedia, ResolveError> {
     let args = build_streamlink_args(url, quality, bind_ip);
     use pgmwatch_core::process::BackgroundCommandExt;
     let mut cmd = Command::new(exe);
-    cmd.no_window()
-        .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| ResolveError::ExtractorFailed(e.to_string()))?;
+    cmd.no_window().args(&args);
+    let output = run_cmd_with_timeout(&mut cmd, job_guard, "streamlink").await?;
 
     if output.status.success() {
         let stream_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1003,6 +1025,7 @@ async fn run_yt_dlp(
     bgutil_pot_port: u16,
     bind_ip: Option<&str>,
     dash_relay: &DashRelayState,
+    job_guard: &WindowsJobGuard,
     live_streams_only: bool,
 ) -> Result<(ResolvedMedia, bool), ResolveError> {
     let lower_url = url.to_ascii_lowercase();
@@ -1024,6 +1047,7 @@ async fn run_yt_dlp(
             None,
             bind_ip,
             dash_relay,
+            job_guard,
             live_streams_only,
         )
         .await
@@ -1054,6 +1078,7 @@ async fn run_yt_dlp(
         cookies_file,
         bind_ip,
         dash_relay,
+        job_guard,
         live_streams_only,
     )
     .await
@@ -1176,6 +1201,7 @@ async fn run_yt_dlp_once(
     cookies_file: Option<&Path>,
     bind_ip: Option<&str>,
     dash_relay: &DashRelayState,
+    job_guard: &WindowsJobGuard,
     live_streams_only: bool,
 ) -> Result<(ResolvedMedia, bool), ResolveError> {
     let args = build_yt_dlp_args(
@@ -1188,15 +1214,9 @@ async fn run_yt_dlp_once(
     );
     use pgmwatch_core::process::BackgroundCommandExt;
     let mut cmd = Command::new(exe);
-    cmd.no_window()
-        .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.no_window().args(&args);
 
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| ResolveError::ExtractorFailed(e.to_string()))?;
+    let output = run_cmd_with_timeout(&mut cmd, job_guard, "yt-dlp").await?;
 
     if output.status.success() {
         let raw = String::from_utf8_lossy(&output.stdout);

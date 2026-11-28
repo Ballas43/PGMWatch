@@ -58,7 +58,16 @@ async fn handle_ws_client(mut socket: WebSocket, st: Arc<SupervisorState>) {
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::debug!(skipped, "WebSocket client lagged; resyncing snapshot");
+                        let snap = st.snapshot_for_periodic_ws().await;
+                        if let Ok(txt) = serde_json::to_string(&WsBroadcast::Snapshot {
+                            snapshot: Box::new(snap),
+                        }) && socket.send(Message::Text(txt.into())).await.is_err()
+                        {
+                            break;
+                        }
+                    }
                     Err(_) => break,
                 }
             }

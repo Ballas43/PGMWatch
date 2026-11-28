@@ -401,6 +401,7 @@ export function AccountingView({ snapshot, onRefresh }: AccountingViewProps) {
             timeline={sum?.timeline ?? []}
             matches={snapshot?.matches ?? []}
             channels={snapshot?.channels ?? []}
+            groups={snapshot?.show.groups ?? []}
           />
         </div>
 

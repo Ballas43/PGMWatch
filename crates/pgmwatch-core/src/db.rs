@@ -509,6 +509,9 @@ async fn db_writer_actor(
                         if !pending.is_empty() {
                             flush_batch(&pool, &mut pending).await;
                         }
+                        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+                            .execute(&pool)
+                            .await;
                         break;
                     }
                 }
@@ -523,26 +526,45 @@ async fn db_writer_actor(
 }
 
 async fn flush_batch(pool: &SqlitePool, pending: &mut Vec<DbCommand>) {
-    let mut tx = match pool.begin().await {
-        Ok(tx) => tx,
-        Err(err) => {
-            tracing::error!("Failed to begin SQLite WAL batch commit: {err}");
-            return;
-        }
-    };
-
-    for cmd in pending.drain(..) {
-        if let Err(err) = apply_command(&mut tx, cmd).await {
-            tracing::warn!("SQLite batch command error: {err}");
-        }
+    let batch = std::mem::take(pending);
+    if batch.is_empty() {
+        return;
     }
+    let backoffs_ms = [50u64, 150, 300];
+    for attempt in 0..=backoffs_ms.len() {
+        let mut tx = match pool.begin().await {
+            Ok(tx) => tx,
+            Err(err) => {
+                if attempt < backoffs_ms.len() {
+                    tokio::time::sleep(std::time::Duration::from_millis(backoffs_ms[attempt])).await;
+                    continue;
+                }
+                tracing::error!("Failed to begin SQLite WAL batch commit after retries: {err}");
+                return;
+            }
+        };
 
-    if let Err(err) = tx.commit().await {
-        tracing::error!("Failed to commit SQLite WAL batch: {err}");
+        for cmd in &batch {
+            if let Err(err) = apply_command(&mut tx, cmd).await {
+                tracing::warn!("SQLite batch command error: {err}");
+            }
+        }
+
+        match tx.commit().await {
+            Ok(()) => return,
+            Err(err) => {
+                if attempt < backoffs_ms.len() {
+                    tracing::warn!("SQLite WAL commit failed (attempt {}); retrying: {err}", attempt + 1);
+                    tokio::time::sleep(std::time::Duration::from_millis(backoffs_ms[attempt])).await;
+                } else {
+                    tracing::error!("Failed to commit SQLite WAL batch after retries: {err}");
+                }
+            }
+        }
     }
 }
 
-async fn apply_command(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, cmd: DbCommand) -> anyhow::Result<()> {
+async fn apply_command(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, cmd: &DbCommand) -> anyhow::Result<()> {
     match cmd {
         DbCommand::UpsertGridSample(s) => {
             let platform_str = serde_json::to_string(&s.platform)?.trim_matches('"').to_string();
@@ -643,7 +665,7 @@ async fn apply_command(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, cmd: DbComm
                 "INSERT INTO app_state (key, value) VALUES ('global_intermission', ?1)
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             )
-            .bind(if active { "true" } else { "false" })
+            .bind(if *active { "true" } else { "false" })
             .execute(&mut **tx)
             .await?;
         }
@@ -653,7 +675,7 @@ async fn apply_command(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, cmd: DbComm
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             )
             .bind(format!("group_intermission:{group_id}"))
-            .bind(if active { "true" } else { "false" })
+            .bind(if *active { "true" } else { "false" })
             .execute(&mut **tx)
             .await?;
         }

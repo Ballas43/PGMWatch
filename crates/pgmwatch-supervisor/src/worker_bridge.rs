@@ -571,21 +571,35 @@ impl SupervisorState {
                 duration_secs: _,
                 saved_at,
             } => {
-                let mut incidents = self.incidents.write().await;
-                let inc_to_emit = if let Some(inc) = incidents
-                    .iter_mut()
-                    .find(|i| i.channel_id == channel_id && i.resolved_at.is_none())
-                {
-                    inc.clip_filename = Some(filename.clone());
-                    inc.clone()
+                // Read channel metadata BEFORE locking `incidents` to preserve lock ordering
+                // (`channels` -> `incidents`) and eliminate AB-BA deadlocks.
+                let ch_name = self
+                    .channels
+                    .read()
+                    .await
+                    .get(&channel_id)
+                    .map(|c| (c.config.name.clone(), c.config.group_id.clone()))
+                    .unwrap_or_else(|| (channel_id.clone(), "default".into()));
+
+                let updated_existing = {
+                    let mut incidents = self.incidents.write().await;
+                    if let Some(inc) = incidents
+                        .iter_mut()
+                        .find(|i| i.channel_id == channel_id && i.resolved_at.is_none())
+                    {
+                        inc.clip_filename = Some(filename.clone());
+                        Some(inc.clone())
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(inc) = updated_existing {
+                    self.db
+                        .enqueue(DbCommand::UpsertIncident(inc.clone()))
+                        .await;
+                    let _ = self.ws_tx.send(WsBroadcast::Incident { incident: inc });
                 } else {
-                    let ch_name = self
-                        .channels
-                        .read()
-                        .await
-                        .get(&channel_id)
-                        .map(|c| (c.config.name.clone(), c.config.group_id.clone()))
-                        .unwrap_or_else(|| (channel_id.clone(), "default".into()));
                     let manual_inc = IncidentRecord {
                         id: Uuid::new_v4().to_string(),
                         channel_id,
@@ -608,15 +622,8 @@ impl SupervisorState {
                             "Operator instant replay clip".into()
                         },
                     };
-                    incidents.insert(0, manual_inc.clone());
-                    manual_inc
-                };
-                self.db
-                    .enqueue(DbCommand::UpsertIncident(inc_to_emit.clone()))
-                    .await;
-                let _ = self
-                    .ws_tx
-                    .send(WsBroadcast::Incident { incident: inc_to_emit });
+                    self.push_incident(manual_inc).await;
+                }
             }
             WorkerToSupervisor::StreamError {
                 channel_id,
@@ -785,6 +792,8 @@ impl SupervisorState {
                     .effective_intermission_for(&group_id_for_ch, delay_secs_for_ch, timestamp)
                     .await;
 
+                let mut resolve_inc_id: Option<String> = None;
+                let mut escalate_inc_id: Option<String> = None;
                 {
                     let mut map = self.channels.write().await;
                     if let Some(m) = map.get_mut(&channel_id) {
@@ -827,27 +836,30 @@ impl SupervisorState {
                                 detail: fault.label().to_string(),
                             });
                         } else if tr.resolved_incident {
-                            if let Some(inc_id) = m.active_incident_id.take() {
-                                let mut incidents = self.incidents.write().await;
-                                if let Some(inc) = incidents.iter_mut().find(|i| i.id == inc_id) {
-                                    inc.resolved_at = Some(timestamp);
-                                    inc.duration_secs =
-                                        (timestamp - inc.started_at).num_milliseconds() as f64
-                                            / 1000.0;
-                                    resolved_inc = Some(inc.clone());
-                                }
-                            }
+                            resolve_inc_id = m.active_incident_id.take();
                         } else if matches!(tr.new_state, AlertState::Critical)
                             && let Some(ref inc_id) = m.active_incident_id
                         {
-                            let mut incidents = self.incidents.write().await;
-                            if let Some(inc) = incidents.iter_mut().find(|i| i.id == *inc_id) {
-                                inc.severity = AlertState::Critical;
-                                inc.duration_secs =
-                                    (timestamp - inc.started_at).num_milliseconds() as f64
-                                        / 1000.0;
-                            }
+                            escalate_inc_id = Some(inc_id.clone());
                         }
+                    }
+                }
+
+                // Update `incidents` AFTER releasing `channels.write()` so locks are never nested.
+                if let Some(inc_id) = resolve_inc_id {
+                    let mut incidents = self.incidents.write().await;
+                    if let Some(inc) = incidents.iter_mut().find(|i| i.id == inc_id) {
+                        inc.resolved_at = Some(timestamp);
+                        inc.duration_secs =
+                            (timestamp - inc.started_at).num_milliseconds() as f64 / 1000.0;
+                        resolved_inc = Some(inc.clone());
+                    }
+                } else if let Some(inc_id) = escalate_inc_id {
+                    let mut incidents = self.incidents.write().await;
+                    if let Some(inc) = incidents.iter_mut().find(|i| i.id == inc_id) {
+                        inc.severity = AlertState::Critical;
+                        inc.duration_secs =
+                            (timestamp - inc.started_at).num_milliseconds() as f64 / 1000.0;
                     }
                 }
 
@@ -866,9 +878,7 @@ impl SupervisorState {
                 }
 
                 if let Some(inc) = new_incident {
-                    self.incidents.write().await.insert(0, inc.clone());
-                    self.db.enqueue(DbCommand::UpsertIncident(inc.clone())).await;
-                    let _ = self.ws_tx.send(WsBroadcast::Incident { incident: inc });
+                    self.push_incident(inc).await;
                 }
                 if let Some(inc) = resolved_inc {
                     self.db.enqueue(DbCommand::UpsertIncident(inc.clone())).await;

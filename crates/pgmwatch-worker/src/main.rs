@@ -105,22 +105,16 @@ async fn main() -> anyhow::Result<()> {
     let mut thumb_fps = 1.5f32;
     let mut group_ref_lufs: Option<f32> = None;
     let mut stream_gen: u64 = 0;
-    let mut live_reader = if !current_url.starts_with("sim://") {
-        let u = current_url.clone();
-        let au = current_audio_url.clone();
-        let h = headers.clone();
-        let vertical = args.vertical;
-        let light = tier == FeedTier::Light || force_cpu_light;
-        let opts = media_opts.clone();
-        tokio::task::spawn_blocking(move || {
-            LiveMediaReader::start(&u, au.as_deref(), &h, vertical, light, &opts).ok()
-        })
-        .await
-        .ok()
-        .flatten()
-    } else {
-        None
-    };
+    let mut live_reader = open_live_reader(
+        &args.channel_id,
+        &current_url,
+        current_audio_url.as_deref(),
+        &headers,
+        args.vertical,
+        tier == FeedTier::Light || force_cpu_light,
+        &media_opts,
+    )
+    .await;
 
     let mut dsp = AudioDspAnalyzer::new(platform)?;
     if args.target_lufs.is_some() || args.lufs_tolerance.is_some() {
@@ -231,30 +225,17 @@ async fn main() -> anyhow::Result<()> {
                                     if let Some(old_reader) = live_reader.take() {
                                         let _ = tokio::task::spawn_blocking(move || drop(old_reader)).await;
                                     }
-                                    live_reader = if !current_url.starts_with("sim://") {
-                                        let u = current_url.clone();
-                                        let au = current_audio_url.clone();
-                                        let h = headers.clone();
-                                        let vertical = args.vertical;
-                                        let light = tier == FeedTier::Light || force_cpu_light;
-                                        let opts = media_opts.clone();
-                                        tokio::task::spawn_blocking(move || {
-                                            LiveMediaReader::start(
-                                                &u,
-                                                au.as_deref(),
-                                                &h,
-                                                vertical,
-                                                light,
-                                                &opts,
-                                            )
-                                            .ok()
-                                        })
-                                        .await
-                                        .ok()
-                                        .flatten()
-                                    } else {
-                                        None
-                                    };
+                                    live_reader = open_live_reader(
+                                        &args.channel_id,
+                                        &current_url,
+                                        current_audio_url.as_deref(),
+                                        &headers,
+                                        args.vertical,
+                                        tier == FeedTier::Light || force_cpu_light,
+                                        &media_opts,
+                                    )
+                                    .await;
+                                    last_rx_kbps = 0.0;
                                     bitrate_tracker.reset();
                                     simd.reset();
                                     last_video_tel = VideoTelemetry::default();
@@ -374,6 +355,7 @@ async fn main() -> anyhow::Result<()> {
 
                 let maybe_batch = if let Some(ref reader) = live_reader {
                     if reader.has_ended() {
+                        last_rx_kbps = 0.0;
                         let _ = emit(&WorkerToSupervisor::StreamError {
                             channel_id: args.channel_id.clone(),
                             code: "STREAM_EOF".into(),
@@ -822,6 +804,47 @@ fn spawn_clip_save(
             });
         }
     });
+}
+
+async fn open_live_reader(
+    channel_id: &str,
+    url: &str,
+    audio_url: Option<&str>,
+    headers: &[(String, String)],
+    vertical: bool,
+    light_mode: bool,
+    media_opts: &MediaOpenOptions,
+) -> Option<LiveMediaReader> {
+    if url.starts_with("sim://") {
+        return None;
+    }
+    let u = url.to_string();
+    let au = audio_url.map(ToString::to_string);
+    let h = headers.to_vec();
+    let opts = media_opts.clone();
+    match tokio::task::spawn_blocking(move || {
+        LiveMediaReader::start(&u, au.as_deref(), &h, vertical, light_mode, &opts)
+    })
+    .await
+    {
+        Ok(Ok(reader)) => Some(reader),
+        Ok(Err(err)) => {
+            tracing::warn!(%channel_id, "LiveMediaReader::start failed: {err}");
+            let _ = emit(&WorkerToSupervisor::StreamError {
+                channel_id: channel_id.to_string(),
+                code: "MEDIA_OPEN_FAILED".into(),
+                message: format!("FFmpeg failed to open stream: {err}"),
+                token_expired: true,
+                gpu_fault: false,
+            })
+            .await;
+            None
+        }
+        Err(err) => {
+            tracing::warn!(%channel_id, "LiveMediaReader::start join error: {err}");
+            None
+        }
+    }
 }
 
 async fn emit(msg: &WorkerToSupervisor) -> anyhow::Result<()> {
