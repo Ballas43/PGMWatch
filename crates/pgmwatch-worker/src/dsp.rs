@@ -1,22 +1,25 @@
 use ebur128::{EbuR128, Mode};
 use pgmwatch_core::models::{AudioTelemetry, FaultKind, Platform};
-use rustfft::{num_complex::Complex, FftPlanner};
 use std::collections::VecDeque;
-use std::sync::Arc;
 
 pub const CANONICAL_SAMPLE_RATE: u32 = 48_000;
 pub const CANONICAL_CHANNELS: u32 = 2;
-const FFT_SIZE: usize = 8192;
+/// 16x boxcar decimation (48 kHz -> 3 kHz) gives 1.0 Hz resolution over a 1.0-second (3000-sample)
+/// Goertzel window, sharp enough to separate exact 50/60/100/120 Hz AC mains hum from musical bass notes.
+const HUM_DECIM_FACTOR: usize = 16;
+const HUM_SAMPLE_RATE: f32 = (CANONICAL_SAMPLE_RATE as f32) / (HUM_DECIM_FACTOR as f32);
+const HUM_WIN_SAMPLES: usize = 3_000;
+const HUM_PERSIST_MS: u64 = 5_000;
 
 pub struct AudioDspAnalyzer {
     target_lufs: f32,
     lufs_tolerance: f32,
     ebur: EbuR128,
-    fft: Arc<dyn rustfft::Fft<f32>>,
-    hann_window: Vec<f32>,
-    fft_buf: Vec<Complex<f32>>,
-    fft_scratch: Vec<Complex<f32>>,
-    mono_ring: VecDeque<f32>,
+    hum_hann: Vec<f32>,
+    hum_win_buf: Vec<f32>,
+    hum_decim_ring: VecDeque<f32>,
+    hum_decim_acc: f32,
+    hum_decim_cnt: usize,
     master_lufs_history: VecDeque<f32>,
     self_lufs_history: VecDeque<f32>,
     lufs_bad_ms: u64,
@@ -31,6 +34,7 @@ pub struct AudioDspAnalyzer {
     last_wrong_bus_corr: f32,
     consecutive_clip_samples: u32,
     hum_candidate_hz: Option<f32>,
+    hum_ref_dbfs: Option<f32>,
     last_hum_freq: Option<f32>,
     last_hum_peak_db: f32,
     decayed_true_peak_dbtp: f32,
@@ -43,13 +47,11 @@ impl AudioDspAnalyzer {
             CANONICAL_SAMPLE_RATE,
             Mode::I | Mode::S | Mode::TRUE_PEAK,
         )?;
-        let mut planner = FftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(FFT_SIZE);
-        let fft_scratch_len = fft.get_inplace_scratch_len();
-        let hann_window: Vec<f32> = (0..FFT_SIZE)
+        let hum_hann: Vec<f32> = (0..HUM_WIN_SAMPLES)
             .map(|i| {
                 0.5 * (1.0
-                    - ((2.0 * std::f32::consts::PI * i as f32) / (FFT_SIZE as f32 - 1.0)).cos())
+                    - ((2.0 * std::f32::consts::PI * i as f32) / (HUM_WIN_SAMPLES as f32 - 1.0))
+                        .cos())
             })
             .collect();
 
@@ -57,11 +59,11 @@ impl AudioDspAnalyzer {
             target_lufs: platform.target_lufs(),
             lufs_tolerance: platform.lufs_tolerance(),
             ebur,
-            fft,
-            hann_window,
-            fft_buf: vec![Complex::new(0.0, 0.0); FFT_SIZE],
-            fft_scratch: vec![Complex::new(0.0, 0.0); fft_scratch_len],
-            mono_ring: VecDeque::with_capacity(FFT_SIZE * 2),
+            hum_hann,
+            hum_win_buf: vec![0.0; HUM_WIN_SAMPLES],
+            hum_decim_ring: VecDeque::with_capacity(HUM_WIN_SAMPLES + 64),
+            hum_decim_acc: 0.0,
+            hum_decim_cnt: 0,
             master_lufs_history: VecDeque::with_capacity(180),
             self_lufs_history: VecDeque::with_capacity(180),
             lufs_bad_ms: 0,
@@ -76,6 +78,7 @@ impl AudioDspAnalyzer {
             last_wrong_bus_corr: 1.0,
             consecutive_clip_samples: 0,
             hum_candidate_hz: None,
+            hum_ref_dbfs: None,
             last_hum_freq: None,
             last_hum_peak_db: 0.0,
             decayed_true_peak_dbtp: -96.0,
@@ -102,7 +105,9 @@ impl AudioDspAnalyzer {
         ) {
             self.ebur = fresh;
         }
-        self.mono_ring.clear();
+        self.hum_decim_ring.clear();
+        self.hum_decim_acc = 0.0;
+        self.hum_decim_cnt = 0;
         self.master_lufs_history.clear();
         self.self_lufs_history.clear();
         self.lufs_bad_ms = 0;
@@ -117,6 +122,7 @@ impl AudioDspAnalyzer {
         self.last_wrong_bus_corr = 1.0;
         self.consecutive_clip_samples = 0;
         self.hum_candidate_hz = None;
+        self.hum_ref_dbfs = None;
         self.last_hum_freq = None;
         self.last_hum_peak_db = 0.0;
         self.decayed_true_peak_dbtp = -96.0;
@@ -155,10 +161,17 @@ impl AudioDspAnalyzer {
                 self.consecutive_clip_samples = 0;
             }
 
-            if self.mono_ring.len() >= FFT_SIZE {
-                self.mono_ring.pop_front();
+            self.hum_decim_acc += 0.5 * (l + r);
+            self.hum_decim_cnt += 1;
+            if self.hum_decim_cnt == HUM_DECIM_FACTOR {
+                if self.hum_decim_ring.len() >= HUM_WIN_SAMPLES {
+                    self.hum_decim_ring.pop_front();
+                }
+                self.hum_decim_ring
+                    .push_back(self.hum_decim_acc / (HUM_DECIM_FACTOR as f32));
+                self.hum_decim_acc = 0.0;
+                self.hum_decim_cnt = 0;
             }
-            self.mono_ring.push_back(0.5 * (l + r));
         }
 
         let n = frame_count as f64;
@@ -189,42 +202,46 @@ impl AudioDspAnalyzer {
             instant_true_peak_dbtp.max((self.decayed_true_peak_dbtp - decay_db).max(-96.0));
         let true_peak_dbtp = self.decayed_true_peak_dbtp;
 
-        // 8192-pt FFT stationary AC mains hum detector (50/60 Hz fundamental & 100/120 Hz harmonic)
-        // Throttled to 2 Hz (every 500ms) since persistence gate is 2000ms.
-        if self.mono_ring.len() == FFT_SIZE {
+        // Grid-locked 1.0 Hz Goertzel AC mains hum detector (exact 50/60/100/120 Hz)
+        // Requires razor-sharp frequency lock, constant amplitude (+-3.5 dB), and 5s persistence
+        // so waiting-screen BGM, synth pads, and bass drones never false-alarm.
+        if self.hum_decim_ring.len() == HUM_WIN_SAMPLES {
             self.hum_sample_ms += block_ms;
             if self.hum_sample_ms >= 500 {
                 let hum_step_ms = self.hum_sample_ms;
                 self.hum_sample_ms = 0;
-                let (freq, peak_db) = self.detect_narrowband_hum();
-                if peak_db > 20.0 {
-                    if let Some(f) = freq {
-                        let stationary = self
-                            .hum_candidate_hz
-                            .map(|prev| (prev - f).abs() <= 12.0)
-                            .unwrap_or(true);
-                        if stationary {
-                            self.hum_ms += hum_step_ms;
-                        } else {
-                            self.hum_ms = hum_step_ms;
-                        }
-                        self.hum_candidate_hz = Some(f);
-                        if self.hum_ms >= 2000 {
-                            self.last_hum_freq = Some(f);
-                            self.last_hum_peak_db = peak_db;
-                        } else {
-                            self.last_hum_freq = None;
-                            self.last_hum_peak_db = 0.0;
-                        }
+                if let Some((f, peak_db, level_dbfs)) = self.detect_narrowband_hum() {
+                    let same_freq = self
+                        .hum_candidate_hz
+                        .map(|prev| (prev - f).abs() < 1.0)
+                        .unwrap_or(true);
+                    let stable_level = self
+                        .hum_ref_dbfs
+                        .map(|prev| (prev - level_dbfs).abs() <= 3.5)
+                        .unwrap_or(true);
+                    if same_freq && stable_level {
+                        self.hum_ms += hum_step_ms;
+                        // Slowly track reference level while staying locked
+                        self.hum_ref_dbfs = Some(match self.hum_ref_dbfs {
+                            Some(prev) => prev * 0.8 + level_dbfs * 0.2,
+                            None => level_dbfs,
+                        });
                     } else {
-                        self.hum_ms = 0;
-                        self.hum_candidate_hz = None;
+                        self.hum_ms = hum_step_ms;
+                        self.hum_ref_dbfs = Some(level_dbfs);
+                    }
+                    self.hum_candidate_hz = Some(f);
+                    if self.hum_ms >= HUM_PERSIST_MS {
+                        self.last_hum_freq = Some(f);
+                        self.last_hum_peak_db = peak_db;
+                    } else {
                         self.last_hum_freq = None;
                         self.last_hum_peak_db = 0.0;
                     }
                 } else {
                     self.hum_ms = 0;
                     self.hum_candidate_hz = None;
+                    self.hum_ref_dbfs = None;
                     self.last_hum_freq = None;
                     self.last_hum_peak_db = 0.0;
                 }
@@ -278,7 +295,7 @@ impl AudioDspAnalyzer {
             faults.push(FaultKind::AudioPhaseInversion);
         }
 
-        if self.hum_ms >= 2000 {
+        if self.hum_ms >= HUM_PERSIST_MS {
             faults.push(FaultKind::AudioMainsHum);
         }
 
@@ -362,52 +379,69 @@ impl AudioDspAnalyzer {
         (telemetry, faults)
     }
 
-    fn detect_narrowband_hum(&mut self) -> (Option<f32>, f32) {
-        for (i, (&sample, &w)) in self
-            .mono_ring
-            .iter()
-            .zip(self.hann_window.iter())
-            .enumerate()
+    /// Evaluates exact 50/60/100/120 Hz AC mains grid frequencies with 1.0 Hz Goertzel resolution.
+    /// Returns `Some((freq_hz, prominence_db, level_dbfs))` only when a razor-sharp tone is locked
+    /// directly onto a mains grid frequency (rejecting nearby musical bass notes like 49/55/61.7/98/123.5 Hz).
+    fn detect_narrowband_hum(&mut self) -> Option<(f32, f32, f32)> {
+        for (dst, (&sample, &w)) in self
+            .hum_win_buf
+            .iter_mut()
+            .zip(self.hum_decim_ring.iter().zip(self.hum_hann.iter()))
         {
-            self.fft_buf[i] = Complex::new(sample * w, 0.0);
-        }
-        self.fft
-            .process_with_scratch(&mut self.fft_buf, &mut self.fft_scratch);
-
-        // Only bins 0..=30 are needed: bin 30 = 175.8 Hz, covering 44-68 Hz & 94-128 Hz plus +-4 shoulder bins.
-        const HUM_BINS: usize = 31;
-        let bin_hz = CANONICAL_SAMPLE_RATE as f32 / FFT_SIZE as f32;
-        let mut mags = [0.0f32; HUM_BINS];
-        for (bin, mag) in mags.iter_mut().enumerate() {
-            *mag = 20.0 * (self.fft_buf[bin].norm() / FFT_SIZE as f32 + 1e-9).log10();
+            *dst = sample * w;
         }
 
-        let mut best_freq = None;
-        let mut best_prominence = 0.0f32;
+        const MAINS_TARGETS: [f32; 4] = [50.0, 60.0, 100.0, 120.0];
+        let mut best: Option<(f32, f32, f32)> = None;
 
-        for bin in 5..(HUM_BINS - 5) {
-            let freq = bin as f32 * bin_hz;
-            // Restrict detection to 50/60 Hz mains hum and 100/120 Hz 2nd-harmonic bands
-            // so normal vocals, music, and mid/high game SFX never masquerade as mains hum.
-            let in_mains_band = (44.0..=68.0).contains(&freq) || (94.0..=128.0).contains(&freq);
-            if !in_mains_band {
+        for f0 in MAINS_TARGETS {
+            let p0 = goertzel_dbfs(&self.hum_win_buf, f0, HUM_SAMPLE_RATE);
+            if p0 < -45.0 {
                 continue;
             }
-            if mags[bin] < -42.0 || mags[bin] < mags[bin - 1] || mags[bin] < mags[bin + 1] {
+            // Inner +-1.5 Hz selectivity guards: on a 1.0s Hann window, a true grid-locked tone at f0
+            // sits >15 dB above f0 +- 1.5 Hz, whereas musical notes (e.g. G1=49, A1=55, B1=61.7 Hz)
+            // spill into or dominate the guard bins and are immediately rejected.
+            let p_in_lo = goertzel_dbfs(&self.hum_win_buf, f0 - 1.5, HUM_SAMPLE_RATE);
+            let p_in_hi = goertzel_dbfs(&self.hum_win_buf, f0 + 1.5, HUM_SAMPLE_RATE);
+            if (p0 - p_in_lo) < 10.0 || (p0 - p_in_hi) < 10.0 {
                 continue;
             }
-            // Compare against outer shoulders (+-3..4 bins) so Hann mainlobe at +-1..2 doesn't dilute 50/60 Hz.
-            let shoulder_avg =
-                0.25 * (mags[bin - 4] + mags[bin - 3] + mags[bin + 3] + mags[bin + 4]);
-            let prom = mags[bin] - shoulder_avg;
-            if prom > 18.0 && prom > best_prominence {
-                best_prominence = prom;
-                best_freq = Some(freq);
+
+            // Outer shoulders (+-3.5 / +-5.0 Hz) measure the local low-frequency noise/music floor.
+            let shoulder_avg = 0.25
+                * (goertzel_dbfs(&self.hum_win_buf, f0 - 5.0, HUM_SAMPLE_RATE)
+                    + goertzel_dbfs(&self.hum_win_buf, f0 - 3.5, HUM_SAMPLE_RATE)
+                    + goertzel_dbfs(&self.hum_win_buf, f0 + 3.5, HUM_SAMPLE_RATE)
+                    + goertzel_dbfs(&self.hum_win_buf, f0 + 5.0, HUM_SAMPLE_RATE));
+            let prom = p0 - shoulder_avg;
+            if prom >= 24.0 && best.map(|(_, bp, _)| prom > bp).unwrap_or(true) {
+                best = Some((f0, prom, p0));
             }
         }
 
-        (best_freq, best_prominence)
+        best
     }
+}
+
+fn goertzel_dbfs(windowed: &[f32], freq_hz: f32, sample_rate: f32) -> f32 {
+    let omega = 2.0 * std::f32::consts::PI * freq_hz / sample_rate;
+    let cos_w = omega.cos();
+    let sin_w = omega.sin();
+    let coeff = 2.0 * cos_w;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    for &x in windowed {
+        let s0 = x + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    let real = s1 - s2 * cos_w;
+    let imag = s2 * sin_w;
+    let mag = (real * real + imag * imag).sqrt();
+    // Normalize by N * 0.5 (Hann coherent gain = 0.5, single-sided sine factor = 2) -> peak amplitude.
+    let amp = (4.0 * mag) / (windowed.len().max(1) as f32);
+    20.0 * (amp + 1e-9).log10()
 }
 
 fn sanitize_lufs(val: Result<f64, ebur128::Error>) -> f32 {
@@ -502,12 +536,39 @@ mod tests {
             tone.push(s);
             tone.push(s);
         }
-        let _ = dsp.process_f32_interleaved(&tone, None);
-        let _ = dsp.process_f32_interleaved(&tone, None);
-        let (tel, faults) = dsp.process_f32_interleaved(&tone, None);
-        assert!(tel.hum_peak_db > 20.0);
-        assert!(tel.hum_freq_hz.is_some());
+        // 5 continuous seconds of constant-amplitude 50.0 Hz hum must trigger AudioMainsHum
+        let mut last = (AudioTelemetry::default(), Vec::new());
+        for _ in 0..5 {
+            last = dsp.process_f32_interleaved(&tone, None);
+        }
+        let (tel, faults) = last;
+        assert!(tel.hum_peak_db >= 24.0, "got {}", tel.hum_peak_db);
+        assert_eq!(tel.hum_freq_hz, Some(50.0));
         assert!(faults.contains(&FaultKind::AudioMainsHum));
+    }
+
+    #[test]
+    fn test_waiting_screen_bgm_bass_drones_do_not_trigger_hum() {
+        // Musical bass notes near 50/60/100/120 Hz (G1=49, A1=55, B1=61.74, G2=98, B2=123.47 Hz)
+        // sustained for 7 seconds must NEVER false-alarm as AC mains hum.
+        for &note_hz in &[49.0f32, 55.0, 61.74, 98.0, 123.47] {
+            let mut dsp = AudioDspAnalyzer::new(Platform::Youtube).unwrap();
+            let mut tone = Vec::with_capacity(48_000 * 2);
+            for i in 0..48_000 {
+                let s = 0.25
+                    * (2.0 * std::f32::consts::PI * note_hz * (i as f32 / 48_000.0)).sin();
+                tone.push(s);
+                tone.push(s);
+            }
+            for _ in 0..7 {
+                let (tel, faults) = dsp.process_f32_interleaved(&tone, None);
+                assert!(
+                    !faults.contains(&FaultKind::AudioMainsHum),
+                    "Musical bass note {note_hz} Hz false-flagged AudioMainsHum ({:?})",
+                    tel.hum_freq_hz
+                );
+            }
+        }
     }
 
     #[test]
