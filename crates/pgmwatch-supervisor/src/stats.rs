@@ -652,13 +652,16 @@ fn extract_facebook_field_number(
                     }
                 };
                 if let Some(num) = parsed {
-                    let w_start = haystack.floor_char_boundary(abs_pos.saturating_sub(250));
-                    let w_end = haystack.ceil_char_boundary((after_key + 350).min(haystack.len()));
+                    let w_start = haystack.floor_char_boundary(abs_pos.saturating_sub(800));
+                    let w_end = haystack.ceil_char_boundary((after_key + 800).min(haystack.len()));
                     let ctx = &haystack[w_start..w_end];
                     if ctx.contains(tid) {
                         return Some(num);
                     }
-                    if !window_belongs_to_other_video(ctx, tid) && fallback.is_none() {
+                    let tight_start = haystack.floor_char_boundary(abs_pos.saturating_sub(250));
+                    let tight_end = haystack.ceil_char_boundary((after_key + 350).min(haystack.len()));
+                    let tight_ctx = &haystack[tight_start..tight_end];
+                    if !window_belongs_to_other_video(tight_ctx, tid) && fallback.is_none() {
                         fallback = Some(num);
                     }
                 }
@@ -672,6 +675,7 @@ fn extract_facebook_field_number(
 fn parse_facebook_html_stats(channel_id: &str, url: &str, html: &str) -> Option<ChannelStatsUpdate> {
     let target_vid = extract_facebook_video_id(url);
     let ccv = [
+        "liveViewerCount",
         "live_viewer_count_read_only",
         "live_viewer_count",
         "concurrent_view_count",
@@ -1001,6 +1005,17 @@ mod tests {
             )
             .is_none()
         );
+
+        // Comet /videos/ pages expose live viewers under camelCase `liveViewerCount` near the target video ID
+        let comet_video = r#"{"video":{"id":"1880057129693239","liveViewerCount":157,"reaction_count":{"count":12}}}"#;
+        let parsed_comet = parse_facebook_html_stats(
+            "ch-fb-my",
+            "https://www.facebook.com/hokmyofficial/videos/1880057129693239",
+            comet_video,
+        )
+        .expect("Comet liveViewerCount should parse");
+        assert_eq!(parsed_comet.ccv.value, Some(157.0));
+        assert_eq!(parsed_comet.likes.value, Some(12.0));
     }
 
     #[test]
