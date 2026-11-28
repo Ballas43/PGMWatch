@@ -12,6 +12,7 @@ const HLS_PROXY_CACHE_TTL: Duration = Duration::from_millis(1800);
 const HLS_DVR_TRIM_THRESHOLD: usize = 16;
 const HLS_DVR_KEEP_SEGMENTS: usize = 12;
 const MAX_SEGMENTS_PER_REPRESENTATION: usize = 256;
+const RELAY_IDLE_EVICT_TTL: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone)]
 enum RelayKind {
@@ -30,6 +31,7 @@ enum RelayKind {
 struct RelayEntry {
     kind: RelayKind,
     headers: Vec<(String, String)>,
+    last_accessed: Instant,
 }
 
 /// Returns true for large live DVR HLS manifests (such as YouTube's 3600s DVR `index.m3u8`,
@@ -83,11 +85,37 @@ impl DashRelayState {
         }
     }
 
+    /// Prunes idle relay tokens (unused for >120s) for `source_url` without evicting active tokens
+    /// still being polled by another channel that shares the same stream URL.
     pub async fn clear_source(&self, source_url: &str) {
-        let old_tokens = self.by_source.lock().await.remove(source_url);
-        if let Some(tokens) = old_tokens {
+        let mut by_src = self.by_source.lock().await;
+        let Some(tokens) = by_src.get_mut(source_url) else {
+            return;
+        };
+        let mut keep = Vec::with_capacity(tokens.len());
+        let mut evict = Vec::new();
+        {
+            let entries = self.entries.read().await;
+            for tok in tokens.drain(..) {
+                if let Some(arc) = entries.get(&tok) {
+                    let idle = arc.lock().await.last_accessed.elapsed() > RELAY_IDLE_EVICT_TTL;
+                    if idle {
+                        evict.push(tok);
+                    } else {
+                        keep.push(tok);
+                    }
+                }
+            }
+        }
+        if keep.is_empty() {
+            by_src.remove(source_url);
+        } else {
+            *tokens = keep;
+        }
+        drop(by_src);
+        if !evict.is_empty() {
             let mut entries = self.entries.write().await;
-            for tok in tokens {
+            for tok in evict {
                 entries.remove(&tok);
             }
         }
@@ -109,6 +137,7 @@ impl DashRelayState {
                 media_sequence: 0,
             },
             headers,
+            last_accessed: Instant::now(),
         }));
         self.entries.write().await.insert(token.clone(), entry);
         self.by_source
@@ -133,6 +162,7 @@ impl DashRelayState {
         let entry = Arc::new(Mutex::new(RelayEntry {
             kind: RelayKind::HlsProxy { playlist_url },
             headers,
+            last_accessed: Instant::now(),
         }));
         self.entries.write().await.insert(token.clone(), entry);
         self.by_source
@@ -166,7 +196,8 @@ impl DashRelayState {
             .ok_or_else(|| anyhow!("Unknown or expired DASH relay token"))?;
 
         let (kind, headers) = {
-            let e = entry_arc.lock().await;
+            let mut e = entry_arc.lock().await;
+            e.last_accessed = Instant::now();
             (e.kind.clone(), e.headers.clone())
         };
 
@@ -1231,6 +1262,7 @@ mod tests {
                 media_sequence: 0,
             },
             headers: vec![],
+            last_accessed: Instant::now(),
         };
         assert_eq!(advance_media_sequence(&mut entry, &[100, 200, 300, 400]), 0);
         // Same window (cache hit) keeps sequence 0

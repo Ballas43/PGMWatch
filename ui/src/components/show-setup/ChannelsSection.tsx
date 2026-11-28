@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Plus, Trash2 } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { AlertTriangle, Plus, Trash2 } from "lucide-react";
 import { ANALYTICS_GLOSSARY } from "../../utils/analyticsGlossary";
 import { ChannelConfig, FeedTier, LanguageGroupConfig } from "../../types";
 import { InfoTip } from "../InfoTip";
@@ -127,6 +127,33 @@ export function ChannelsSection({
   const selectByGroup = (gid: string) => {
     setSelectedIds(new Set(showChannels.filter((c) => c.group_id === gid).map((c) => c.id)));
   };
+
+  const normalizeStreamUrl = (raw: string) => raw.trim().toLowerCase().replace(/\/+$/, "");
+
+  const { duplicateGroups, duplicateChannelIds, addUrlMatches } = useMemo(() => {
+    const byNorm = new Map<string, { url: string; names: string[]; ids: string[] }>();
+    for (const ch of showChannels) {
+      const draft = channelDrafts[ch.id] ?? ch;
+      const norm = normalizeStreamUrl(draft.url);
+      if (!norm || norm.startsWith("sim://")) continue;
+      const entry = byNorm.get(norm) ?? { url: draft.url.trim(), names: [], ids: [] };
+      entry.names.push(draft.name.trim() || ch.name);
+      entry.ids.push(ch.id);
+      byNorm.set(norm, entry);
+    }
+    const groupsList: { url: string; names: string[] }[] = [];
+    const dupIds = new Set<string>();
+    for (const entry of byNorm.values()) {
+      if (entry.ids.length > 1) {
+        groupsList.push({ url: entry.url, names: entry.names });
+        for (const id of entry.ids) dupIds.add(id);
+      }
+    }
+    const typedNorm = normalizeStreamUrl(url);
+    const matches =
+      typedNorm && !typedNorm.startsWith("sim://") ? byNorm.get(typedNorm)?.names ?? [] : [];
+    return { duplicateGroups: groupsList, duplicateChannelIds: dupIds, addUrlMatches: matches };
+  }, [showChannels, channelDrafts, url]);
 
   return (
     <>
@@ -314,9 +341,49 @@ export function ChannelsSection({
             <span>Add Feed</span>
           </button>
         </div>
+        {addUrlMatches.length > 0 && (
+          <div
+            role="alert"
+            className="md:col-span-6 flex items-center gap-2 rounded-lg border border-[var(--warning)]/50 bg-[var(--warning-soft)] px-3 py-2 text-xs text-[var(--warning-text)]"
+          >
+            <AlertTriangle size={14} strokeWidth={1.75} className="shrink-0" aria-hidden="true" />
+            <span>
+              <strong>Duplicate URL:</strong> This stream URL is already configured on{" "}
+              <span className="font-medium">{addUrlMatches.join(", ")}</span>. Adding it again will
+              double bandwidth and double-count viewers in accounting.
+            </span>
+          </div>
+        )}
       </form>
 
       <div className="overflow-x-auto rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-card)] p-4">
+        {duplicateGroups.length > 0 && (
+          <div
+            role="alert"
+            className="mb-3 rounded-lg border border-[var(--warning)]/55 bg-[var(--warning-soft)] px-3.5 py-2.5 text-xs text-[var(--warning-text)]"
+          >
+            <div className="flex items-center gap-2 font-medium">
+              <AlertTriangle size={14} strokeWidth={1.75} className="shrink-0" aria-hidden="true" />
+              <span>
+                Duplicate Stream URL{duplicateGroups.length > 1 ? "s" : ""} Detected (
+                {duplicateGroups.length})
+              </span>
+            </div>
+            <p className="mt-1 text-[11px] opacity-90">
+              Monitoring the same stream URL on multiple channels doubles bandwidth usage and
+              double-counts viewers in accounting. Remove or update the duplicate rows highlighted
+              below:
+            </p>
+            <ul className="mt-1.5 space-y-0.5 font-mono-tabular text-[11px]">
+              {duplicateGroups.map((dup) => (
+                <li key={dup.url} className="truncate">
+                  • <span className="font-sans font-medium">{dup.names.join(" & ")}</span> —{" "}
+                  {dup.url}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         <BulkChannelEditBar
           groups={groups}
           selectedCount={selectedIds.size}
@@ -416,14 +483,34 @@ export function ChannelsSection({
                     {draft.platform}
                   </td>
                   <td className="py-2 pr-2">
-                    <input
-                      aria-label={`URL for ${ch.name}`}
-                      type="text"
-                      maxLength={2048}
-                      value={draft.url}
-                      onChange={(e) => onUpdateChannelDraft(ch.id, { url: e.target.value })}
-                      className="h-7 w-64 rounded border border-[var(--border-hairline)] bg-[var(--bg-raised)] px-2 font-mono-tabular text-[var(--text-primary)]"
-                    />
+                    <div className="flex items-center gap-1.5">
+                      <input
+                        aria-label={`URL for ${ch.name}`}
+                        type="text"
+                        maxLength={2048}
+                        value={draft.url}
+                        onChange={(e) => onUpdateChannelDraft(ch.id, { url: e.target.value })}
+                        title={
+                          duplicateChannelIds.has(ch.id)
+                            ? "Duplicate stream URL — shared with another channel in this show"
+                            : undefined
+                        }
+                        className={`h-7 w-64 rounded border bg-[var(--bg-raised)] px-2 font-mono-tabular text-[var(--text-primary)] ${
+                          duplicateChannelIds.has(ch.id)
+                            ? "border-[var(--warning)] ring-1 ring-[var(--warning)]/40"
+                            : "border-[var(--border-hairline)]"
+                        }`}
+                      />
+                      {duplicateChannelIds.has(ch.id) && (
+                        <span
+                          title="This stream URL is duplicated on another channel"
+                          className="inline-flex shrink-0 items-center gap-1 rounded border border-[var(--warning)]/50 bg-[var(--warning-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--warning-text)]"
+                        >
+                          <AlertTriangle size={10} strokeWidth={2} aria-hidden="true" />
+                          <span>Dup</span>
+                        </span>
+                      )}
+                    </div>
                   </td>
                   <td className="py-2 pr-2">
                     <input
